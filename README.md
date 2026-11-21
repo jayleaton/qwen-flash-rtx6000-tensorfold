@@ -54,9 +54,10 @@ Stack D at 8 and 16 streams measured 845-855 and 791-803 tok/s (greedy code) on 
 - **Soak:** 35 minutes of mixed-length traffic (8K-32K prompts among short ones) at 1, 8 and 16 streams, greedy and
   sampled: 1,500 requests, 0 failed; 1,460 equality checks, 0 unequal; no NCCL error; memory flat
   ([QUALITY](docs/QUALITY.md#soak)).
-- **Quality:** FP8 HumanEval+ 94.5 and BFCL held-out 74.0, against 93.9 / 72.9 (NVFP4) and 92.7 / 75.8 (FP4-Local),
-  within run noise; FP8 is the fidelity reference (4-bit packs: 85-86% top-1, KL 0.10-0.13). OpenCode on stack E:
-  10/10, 215 tool calls, 0 errors ([QUALITY](docs/QUALITY.md)).
+- **Quality:** stack E scores HumanEval+ 93.3 and BFCL held-out 74.7, within run noise of the earlier FP8 binary's
+  94.5 / 74.0 by the same scorer and settings, and of NVFP4's 93.9 / 72.9 and FP4-Local's 92.7 / 75.8; FP8 is the
+  fidelity reference (4-bit packs: 85-86% top-1, KL 0.10-0.13). OpenCode on stack E at a 256K window: 9/10 with 0 tool
+  errors, against FP4-Local 10/10 and NVFP4 9/10 at the same window; 10/10 at 128K ([QUALITY](docs/QUALITY.md)).
 - **Capacity:** 16 streams at 49,152 tokens (stack E); 13 at 64K and 7 at 128K on the cards (stack D)
   ([CAPACITY](docs/CAPACITY.md)).
 
