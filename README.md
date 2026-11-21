@@ -55,8 +55,8 @@ Stack D at 8 and 16 streams measured 845-855 and 791-803 tok/s (greedy code) on 
   sampled: 1,500 requests, 0 failed; 1,460 equality checks, 0 unequal; no NCCL error; memory flat
   ([QUALITY](docs/QUALITY.md#soak)).
 - **Quality:** FP8 HumanEval+ 94.5 and BFCL held-out 74.0, against 93.9 / 72.9 (NVFP4) and 92.7 / 75.8 (FP4-Local),
-  within run noise; FP8 is the fidelity reference (4-bit packs: 85-86% top-1, KL 0.10-0.13). OpenCode is pending
-  ([QUALITY](docs/QUALITY.md)).
+  within run noise; FP8 is the fidelity reference (4-bit packs: 85-86% top-1, KL 0.10-0.13). OpenCode on stack E:
+  10/10, 215 tool calls, 0 errors ([QUALITY](docs/QUALITY.md)).
 - **Capacity:** 16 streams at 49,152 tokens (stack E); 13 at 64K and 7 at 128K on the cards (stack D)
   ([CAPACITY](docs/CAPACITY.md)).
 
@@ -130,7 +130,7 @@ More in [KNOWN-ISSUES](docs/KNOWN-ISSUES.md).
 | | |
 | --- | --- |
 | [PERFORMANCE](docs/PERFORMANCE.md) | the A-B-B-A method, every arm from stack D to stack E, each lever's share |
-| [QUALITY](docs/QUALITY.md) | soak, HumanEval+, BFCL, fidelity against the 4-bit packs, OpenCode (pending) |
+| [QUALITY](docs/QUALITY.md) | soak, HumanEval+, BFCL, fidelity against the 4-bit packs, OpenCode |
 | [CAPACITY](docs/CAPACITY.md) | streams at 64K, 128K and 256K, host overflow, the fp8 KV cache (measured, not in this series) |
 | [WEIGHTS](docs/WEIGHTS.md) | the FP8 checkpoint, its revision and hashes |
 | [ENGINE](docs/ENGINE.md) | the pin, the series and where each patch comes from |

@@ -37,6 +37,8 @@ default, for these reasons:
 
 - **Recommended only for FP4-Local at TP1**, where its KL of 0.0236 sits under the 0.025 spread between valid FP8 sum
   orders and it gives +6.3% at 128K prefill and 1.83x the slots (6 to 11 at 128K on a DGX Spark).
+- Capacity with the fp8 KV cache, FP8 at TP2 (its branch, no stack env, `--prompt-cache-gib 0`): bf16 KV serves 9
+  streams at 128K and 4 at 256K; the fp8 KV arm is pending.
 - **Not recommended with this recipe (FP8 at TP2):** KL 0.038 for +1.8% prefill. For scale, 4-bit weights against FP8
   give KL 0.10-0.13.
 - The 128K prefill rows ran without the stack env on a different runner, so their absolutes sit below stack D's
