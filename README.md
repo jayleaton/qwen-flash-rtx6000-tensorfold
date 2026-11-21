@@ -66,6 +66,7 @@ Stack D at 8 and 16 streams measured 845-855 and 791-803 tok/s (greedy code) on 
   (`nvidia-smi topo -p2p rw` shows OK). Measured on the Server Edition at its 600 W limit, Gen5 x16, both cards on one NUMA node.
 - NVIDIA driver with CUDA 13 support (measured: 620.70.06, CUDA driver API 13.5).
 - CUDA 13 toolkit for `nvcc` (measured: 13.0.2, nvcc 13.0.88) and Zig 0.17.0 (the engine's `.zig-version`).
+- Git and network access to GitHub for the pin and xgrammar v0.2.8 (or pass local checkouts; see the scripts).
 - NCCL 2.30 or later (measured: 2.32.6 from the `nvidia-nccl-cu13` wheel); set `TF_NCCL_LIB` to its `libnccl.so.2`
   when it is not on the loader path.
 - About 173 GiB of disk for the weights. Each rank's host memory stayed under 4.1 GiB in the soak.
@@ -77,7 +78,7 @@ git clone https://github.com/jayleaton/qwen-flash-rtx6000-tensorfold.git
 cd qwen-flash-rtx6000-tensorfold
 hf download Qwen/Qwen3.8-Flash-Next-FP8 --revision 7fb48d708ca6cd8eeed8f4db0433be18af96984f --local-dir flash-fp8
 scripts/verify-weights.sh flash-fp8                 # sha256 of every shard against config/weights
-scripts/build-engine.sh engine                      # pin + patches/cuda 0001-0046, tree checked, sm_120 server
+scripts/build-engine.sh engine                      # pin + patches 0001-0046, tree checked, sm_120 server + libtfgrammar
 scripts/serve.sh engine flash-fp8                   # stack E: rank 1 on GPU 1, rank 0 on GPU 0 serves port 8090
 ```
 
@@ -89,7 +90,8 @@ curl -s http://127.0.0.1:8090/v1/chat/completions -H 'Content-Type: application/
 `scripts/serve.sh` reads [`config/cuda/serve.args`](config/cuda/serve.args) (`--context 49152 --parallel 16`) and
 exports [`config/cuda/serve.env`](config/cuda/serve.env), one commented lever a line; a variable already set in your
 environment wins. `GPUS=0,1`, `PORT`, `NAME`, `NUMA_NODE` and `LOG_DIR` adjust it, and extra arguments pass through
-to both ranks. The equivalent by hand:
+to both ranks. It refuses to start without `engine/zig-out/native/lib/libtfgrammar.so`, which `tool_choice` required or
+named and `response_format` need (`NO_GRAMMAR=1` starts anyway). The equivalent by hand:
 
 ```bash
 env $(grep -v '^#' config/cuda/serve.env) CUDA_VISIBLE_DEVICES=1 engine/zig-out/native/bin/tensorfold-native serve flash-fp8 \
@@ -117,7 +119,8 @@ The patched tree is byte-identical to the tree the numbers were measured on. The
 - **`TF_FLASHNEXT_PEER_SLOTS` needs one host with peer-to-peer**; it is refused across hosts and with
   `TF_FLASHNEXT_DECODE_GRAPH=1`.
 - **Mixed lengths stall decode:** long prompts (8K-32K) arriving among short ones drop 8 streams to about 125 tok/s
-  end to end (p95 round gap 790 ms). A fix is being measured.
+  end to end (p95 round gap 790 ms). Measured, no env fix; open: smaller chunks (`TF_FLASHNEXT_CHUNK=1024`) smooth
+  the p95 but give 109 tok/s.
 - **`TF_FLASHNEXT_KEEP_LATE=1` is refused** at boot on FP8.
 
 More in [KNOWN-ISSUES](docs/KNOWN-ISSUES.md).

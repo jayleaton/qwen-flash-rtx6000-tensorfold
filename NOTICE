@@ -38,4 +38,4 @@ Qwen3.8-Flash-Next-FP8
 
 Also credited, not included:
   - NCCL (https://github.com/NVIDIA/nccl), BSD-3-Clause: installed by the user.
-  - xgrammar (https://github.com/mlc-ai/xgrammar), Apache License 2.0: built by the user as libtfgrammar when asked.
+  - xgrammar (https://github.com/mlc-ai/xgrammar), Apache License 2.0: built by the user as libtfgrammar.

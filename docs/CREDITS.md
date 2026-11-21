@@ -18,5 +18,5 @@
 - [NCCL](https://github.com/NVIDIA/nccl) (BSD-3-Clause): the collectives the ranks run, installed by the user.
 - [EvalPlus](https://github.com/evalplus/evalplus) (HumanEval+) and the
   [Berkeley Function Calling Leaderboard](https://github.com/ShishirPatil/gorilla) (BFCL): the quality checks.
-- [xgrammar](https://github.com/mlc-ai/xgrammar) v0.2.8 (Apache License 2.0): built into `libtfgrammar` only when
-  `XGRAMMAR` is set.
+- [xgrammar](https://github.com/mlc-ai/xgrammar) v0.2.8 (Apache License 2.0): the grammar engine behind `libtfgrammar`,
+  which `scripts/build-engine.sh` builds for required and named tool calls and `response_format`.

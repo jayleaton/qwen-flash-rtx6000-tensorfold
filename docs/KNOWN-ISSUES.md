@@ -17,8 +17,10 @@ collectives.
 
 When long prompts (8K-32K tokens) arrive among short requests, their prefill chunks hold up the decoding streams. On
 E0 with 16 such prompts arriving 400 ms apart, 8 streams gave 124.7 tok/s end to end (525.7 steady), with a p50 round
-gap of 51 ms and a p95 of 790 ms; 16 streams gave 157.2 (628.5), p95 811 ms. Smaller prefill chunks for this case are
-being measured. Uniform traffic is not affected.
+gap of 51 ms and a p95 of 790 ms; 16 streams gave 157.2 (628.5), p95 811 ms. Uniform traffic is not affected.
+
+**Measured, no env fix; open.** Smaller prompt chunks (`TF_FLASHNEXT_CHUNK=1024`) on the same traffic at 8 streams
+gave 109.2 tok/s end to end against 124.7: smoother at p95, but slower overall. No setting in this engine fixes it.
 
 ## `TF_FLASHNEXT_KEEP_LATE=1` is refused on FP8
 

@@ -4,7 +4,9 @@
 `scripts/fetch-engine.sh cuda DIR` fetches it, applies `patches/cuda/0001`-`0046` with `git am` (fixed committer and
 dates, the patches' own authors) and refuses any result whose tree is not `6df6ffa158e4bc157dd73e784a5d2c8ae2d2272e`,
 the tree the numbers were measured on. `scripts/build-engine.sh DIR` then runs `zig build -Dgpu=sm_120`, one stripped
-server with every model family and the kernel images for sm_120.
+server with every model family and the kernel images for sm_120, and `zig build grammar` from xgrammar v0.2.8, which
+puts `libtfgrammar.so` in `zig-out/native/lib`, where the server loads it from. The grammar step takes under a minute
+and needs no GPU; upstream's `zig build test-grammar-tools` passes with it, walking the tool-call grammars through it.
 
 ## The series
 
