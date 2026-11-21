@@ -35,7 +35,7 @@ peer-to-peer read and write OK, 38.9 GiB/s each way), 2x Xeon 6520P, driver 620.
 | E0 = D + `TF_FLASHNEXT_SPLIT_ROWS=16` (A-B-B-A) | 297.8 | 894 / 846 | +4.4% / +4.7% at width |
 | E1 = E0 + `TF_FLASHNEXT_WINDOW_GRAPH=0` (A-B-B-A) | 297.4 | 901 / 854 | +0.8% / +1.0% |
 | E1 + `TF_QMMF_HALF_BELOW=400` | 298.4 | 901 / 847 | +0.4% at 1 stream |
-| E1 + `TF_FLASHNEXT_ATTN_LANES=1` | 296.9 | 910.5 / 866.3 | one arm, against E1 controls at 898-901 / 850-855 |
+| E1 + `TF_FLASHNEXT_ATTN_LANES=1` | 296.9 | 910.5 / 866.3 | single run (against E1 controls at 898-901 / 850-855), in both arms of the stack E A-B-B-A and the soak |
 | E0 + `TF_FLASHNEXT_PEER_SLOTS=1` (A-B-B-A) | 312.4 / 313.8 | 958 / 903, 962 / 904 | +5% / +7% / +7%; prefill -2.5% |
 | stack E without the split `fn_row_best` | 314.2 / 314.6 | 982 / 926, 981 / 926 | full env |
 | **stack E** | **319.2 / 319.5** | **1,015 / 966, 1,017 / 967** | split `fn_row_best`: +1.6% / +3.6% / +4.3% |

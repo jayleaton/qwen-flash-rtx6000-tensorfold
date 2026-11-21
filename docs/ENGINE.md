@@ -53,3 +53,7 @@ Every lever keeps the tokens: with each one on or off, the greedy hashes and the
   the new kernels' register and launch-bound records matching their builds.
 - `zig fmt --check`, `zig build test-cuda-host` and `zig build test-host` pass; the tree's `pr_check` and lean checks
   add no findings against the base.
+- On a CPU-only build host (no GPU): `zig build -Dgpu=sm_120` builds the server (449 s), `zig build grammar` from
+  xgrammar v0.2.8 builds `libtfgrammar.so` beside it (41 s), and `zig build test-grammar-tools` passes with that library.
+  `scripts/serve.sh` refuses to start when the library is missing (checked with a stand-in server), since
+  `tool_choice: "required"` would otherwise fail at request time.

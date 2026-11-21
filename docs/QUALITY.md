@@ -36,5 +36,5 @@ K-split, which changes FP8's sum order and so its hashes); stack E's rows are pe
 
 | pack | run | result |
 | --- | --- | --- |
-| FP8, stack E (this profile at `--context 131072 --parallel 5`) | OpenCode core waves, thinking 4096, the same waves and grading as the 4-bit runs | **10/10** (python 6/6, games 4/4); waves of 437 s and 1,033 s; 215 tool calls, 0 errors, 0 output-limit hits; no errors in either rank's log |
+| FP8, stack E (this profile at `--context 131072 --parallel 5`) | OpenCode core waves, thinking 4096, the same waves and grading as the 4-bit runs | **10/10** (python 6/6, games 4/4); waves of 437 s and 1,033 s (1,470 s); 215 tool calls, 0 errors, 0 output-limit hits; no errors in either rank's log |
 | NVFP4 / FP4-Local | the same waves and grading | pending |

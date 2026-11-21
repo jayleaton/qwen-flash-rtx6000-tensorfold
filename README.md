@@ -120,7 +120,7 @@ The patched tree is byte-identical to the tree the numbers were measured on. The
   `TF_FLASHNEXT_DECODE_GRAPH=1`.
 - **Mixed lengths stall decode:** long prompts (8K-32K) arriving among short ones drop 8 streams to about 125 tok/s
   end to end (p95 round gap 790 ms). Measured, no env fix; open: smaller chunks (`TF_FLASHNEXT_CHUNK=1024`) smooth
-  the p95 but give 109 tok/s.
+  the p95 but cost 12% on stack E (112 against 127 tok/s at 8 streams).
 - **`TF_FLASHNEXT_KEEP_LATE=1` is refused** at boot on FP8.
 
 More in [KNOWN-ISSUES](docs/KNOWN-ISSUES.md).
