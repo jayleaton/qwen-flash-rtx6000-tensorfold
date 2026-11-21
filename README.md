@@ -35,31 +35,34 @@ More in [CREDITS](docs/CREDITS.md); license terms in [LICENSING](docs/LICENSING.
 
 ## Numbers
 
-Two RTX PRO 6000 Blackwell Server Edition (97,887 MiB each, PCIe Gen5 x16, peer-to-peer read and write), one host,
-`--context 49152 --parallel 16`, 256-token replies, greedy unless marked. Each column is the mean of an A-B-B-A pair
-of runs; every arm returned the same token hashes ([PERFORMANCE](docs/PERFORMANCE.md)).
+Stack E, the profile in `config/cuda/`, on two RTX PRO 6000 Blackwell Server Edition (97,887 MiB each, PCIe Gen5
+x16, peer-to-peer read and write) in one host: `--context 49152 --parallel 16`, 256-token replies. Each figure is the
+mean of the two stack E runs of an A-B-B-A pair ([PERFORMANCE](docs/PERFORMANCE.md)).
 
-| tok/s | stack D | E0 (D + split rows) | **stack E** | E vs E0 |
-| --- | --- | --- | --- | --- |
-| 1 stream, code / chat | 296.7 / 204.5 | 297.8 / 205.5 | **319.4 / 219.0** | +7.3% / +6.6% |
-| 1 stream sampled, code / chat | 236.2 / 169.9 | 236 / 169 | 251.1 / 178.0 | +6.4% / +5.3% |
-| code, 4 / 8 / 16 streams (aggregate) | | 671 / 894 / 846 | **750 / 1,016 / 966** | +12% / +14% / +14% |
-| chat, 4 / 8 / 16 streams (aggregate) | | 487 / 659 / 781 | 541 / 746 / 896 | +11% / +13% / +15% |
-| cold prefill 8K / 32K | 4,394 / 4,424 | 4,487 / 4,550 | 4,409 / 4,440 | -1.7% / -2.4% |
+| tok/s | code | chat |
+| --- | --- | --- |
+| 1 stream, greedy | **319.4** | **219.0** |
+| 1 stream, sampled (temperature 0.7) | 251.1 | 178.0 |
+| 4 / 8 / 16 streams, greedy (aggregate) | **750 / 1,016 / 966** | 541 / 746 / 896 |
+| cold prefill, 8K / 32K prompt | 4,409 / 4,440 | |
 
-Stack D at 8 and 16 streams measured 845-855 and 791-803 tok/s (greedy code) on the same binary line.
++7.3% / +6.6% at one stream (greedy code / chat) and +11-15% at 4-16 streams over the previous build, token-identical;
+cold prefill is 1.7-2.4% slower ([Known issues](#known-issues)). History in [PERFORMANCE](docs/PERFORMANCE.md).
 
-- **Exact:** every arm gives E0's token hashes, every concurrent reply equals its alone run, and every drafted reply
-  equals its `"draft": false` reply.
+- **Exact:** greedy replies are token-identical to the previous builds', every concurrent reply equals its alone run,
+  and every drafted reply equals its `"draft": false` reply.
 - **Soak:** 35 minutes of mixed-length traffic (8K-32K prompts among short ones) at 1, 8 and 16 streams, greedy and
   sampled: 1,500 requests, 0 failed; 1,460 equality checks, 0 unequal; no NCCL error; memory flat
   ([QUALITY](docs/QUALITY.md#soak)).
 - **Quality:** stack E scores HumanEval+ 93.3 and BFCL held-out 74.7, within run noise of the earlier FP8 binary's
   94.5 / 74.0 by the same scorer and settings, and of NVFP4's 93.9 / 72.9 and FP4-Local's 92.7 / 75.8; FP8 is the
-  fidelity reference (4-bit packs: 85-86% top-1, KL 0.10-0.13). OpenCode on stack E at a 256K window: 9/10 with 0 tool
-  errors, against FP4-Local 10/10 and NVFP4 9/10 at the same window; 10/10 at 128K ([QUALITY](docs/QUALITY.md)).
-- **Capacity:** 16 streams at 49,152 tokens (stack E); 13 at 64K and 7 at 128K on the cards (stack D)
-  ([CAPACITY](docs/CAPACITY.md)).
+  fidelity reference (4-bit packs: 85-86% top-1, KL 0.10-0.13). OpenCode on stack E: 10/10 at a 128K window and 9/10
+  at 256K with 0 tool errors, against FP4-Local 10/10 and NVFP4 9/10 at 256K ([QUALITY](docs/QUALITY.md)).
+- **Capacity:** stack E serves 16 streams at 49,152 tokens on the cards. For longer windows,
+  `TF_FLASHNEXT_KV_HOST=overflow` (in this engine) keeps the K/V rows that do not fit in pinned host memory: 27 streams
+  at 64K, 17 at 128K and 10 at 256K, measured on an earlier build of this line. Stack E ran OpenCode at 256K x 5
+  streams with it (9/10, 0 tool errors). The opt-in fp8 KV cache, measured on a later branch and not in this series,
+  fits 13 streams at 128K and 7 at 256K against bf16 KV's 9 / 4 ([CAPACITY](docs/CAPACITY.md)).
 
 ## Requirements
 
@@ -119,9 +122,9 @@ The patched tree is byte-identical to the tree the numbers were measured on. The
 - **Cold prefill is 2.4% slower** with `TF_FLASHNEXT_PEER_SLOTS=1`; unset it for prefill-heavy work.
 - **`TF_FLASHNEXT_PEER_SLOTS` needs one host with peer-to-peer**; it is refused across hosts and with
   `TF_FLASHNEXT_DECODE_GRAPH=1`.
-- **Mixed lengths stall decode:** long prompts (8K-32K) arriving among short ones drop 8 streams to about 125 tok/s
-  end to end (p95 round gap 790 ms). Measured, no env fix; open: smaller chunks (`TF_FLASHNEXT_CHUNK=1024`) smooth
-  the p95 but cost 12% on stack E (112 against 127 tok/s at 8 streams).
+- **Mixed lengths stall decode:** long prompts (8K-32K) arriving among short ones bring 8 streams to 127.0 tok/s end
+  to end (p95 round gap 785 ms). Measured, no env fix; open: smaller chunks (`TF_FLASHNEXT_CHUNK=1024`) smooth the p95
+  but cost 12% (112.2 against 127.0 tok/s at 8 streams).
 - **`TF_FLASHNEXT_KEEP_LATE=1` is refused** at boot on FP8.
 
 More in [KNOWN-ISSUES](docs/KNOWN-ISSUES.md).

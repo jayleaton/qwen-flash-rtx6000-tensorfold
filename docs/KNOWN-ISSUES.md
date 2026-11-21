@@ -16,12 +16,14 @@ collectives.
 ## Mixed lengths stall decode
 
 When long prompts (8K-32K tokens) arrive among short requests, their prefill chunks hold up the decoding streams. On
-E0 with 16 such prompts arriving 400 ms apart, 8 streams gave 124.7 tok/s end to end (525.7 steady), with a p50 round
-gap of 51 ms and a p95 of 790 ms; 16 streams gave 157.2 (628.5), p95 811 ms. Uniform traffic is not affected.
+stack E with 16 such prompts arriving 400 ms apart, 8 streams gave 127.0 tok/s end to end, with a p50 round gap of
+44 ms and a p95 of 785 ms; 16 streams gave 162.4, p95 806 ms. Most of the low end-to-end figure is the long prompts'
+own prefill (a 32K prompt takes 7.4 s), not the stall. Uniform traffic is not affected.
 
-**Measured, no env fix; open.** Smaller prompt chunks (`TF_FLASHNEXT_CHUNK=1024`) smooth the p95 round gap but cost
-throughput: on E0 at 8 streams 109.2 tok/s end to end against 124.7, and on stack E 112.2 against 127.0 at 8 streams
-and 143.5 against 162.4 at 16 (-12%), uniform traffic level. No setting in this engine fixes it.
+**Measured, no env fix; open.** Smaller prompt chunks (`TF_FLASHNEXT_CHUNK=1024`) even out the round gaps (p95 331 ms
+at 8 streams) but raise the p50 to 315 ms and cost throughput: 112.2 against 127.0 tok/s at 8 streams and 143.5
+against 162.4 at 16 (-12%), and the slowest first token at 8 streams goes from 11.3 to 14.3 s. Uniform traffic is
+level. No setting in this engine fixes it.
 
 ## `TF_FLASHNEXT_KEEP_LATE=1` is refused on FP8
 

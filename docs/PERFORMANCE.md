@@ -17,15 +17,19 @@ peer-to-peer read and write OK, 38.9 GiB/s each way), 2x Xeon 6520P, driver 620.
   `147305861125`, the sampled sets equal); every concurrent reply equals its alone run; every alone run equals its
   `"draft": false` reply.
 
-## Stack E against E0 (A-B-B-A, 2026-11-21)
+## Stack E against E0 and stack D (A-B-B-A, 2026-11-21)
 
-| tok/s | E0 | stack E without the split `fn_row_best` | **stack E** | E vs E0 |
-| --- | --- | --- | --- | --- |
-| 1 stream code / chat | 297.8 / 205.5 | 314.4 / 216.2 | **319.4 / 219.0** | +7.3% / +6.6% |
-| 1 stream sampled code / chat | 236 / 169 | 248.9 / 177.1 | 251.1 / 178.0 | +6.4% / +5.3% |
-| code x4 / x8 / x16 | 671 / 894 / 846 | 729 / 981 / 926 | **750 / 1,016 / 966** | +12% / +14% / +14% |
-| chat x4 / x8 / x16 | 487 / 659 / 781 | 527 / 720 / 857 | 541 / 746 / 896 | +11% / +13% / +15% |
-| cold prefill 8K / 32K | 4,487 / 4,550 | 4,411 / 4,438 | 4,409 / 4,440 | -1.7% / -2.4% |
+| tok/s | stack D | E0 (D + split rows) | stack E without the split `fn_row_best` | **stack E** | E vs E0 |
+| --- | --- | --- | --- | --- | --- |
+| 1 stream code / chat | 296.7 / 204.5 | 297.8 / 205.5 | 314.4 / 216.2 | **319.4 / 219.0** | +7.3% / +6.6% |
+| 1 stream sampled code / chat | 236.2 / 169.9 | 236 / 169 | 248.9 / 177.1 | 251.1 / 178.0 | +6.4% / +5.3% |
+| code x4 / x8 / x16 | | 671 / 894 / 846 | 729 / 981 / 926 | **750 / 1,016 / 966** | +12% / +14% / +14% |
+| chat x4 / x8 / x16 | | 487 / 659 / 781 | 527 / 720 / 857 | 541 / 746 / 896 | +11% / +13% / +15% |
+| cold prefill 8K / 32K | 4,394 / 4,424 | 4,487 / 4,550 | 4,411 / 4,438 | 4,409 / 4,440 | -1.7% / -2.4% |
+
+Stack D at 8 and 16 streams measured 845-855 and 791-803 tok/s (greedy code) on the same binary line. Stack E's split
+`fn_row_best` alone (stack E against the column before it, same env): +1.6% at one stream, +3.6% / +4.3% at 8 / 16
+streams, level prefill.
 
 ## From stack D to stack E (greedy code)
 
@@ -35,10 +39,11 @@ peer-to-peer read and write OK, 38.9 GiB/s each way), 2x Xeon 6520P, driver 620.
 | E0 = D + `TF_FLASHNEXT_SPLIT_ROWS=16` (A-B-B-A) | 297.8 | 894 / 846 | +4.4% / +4.7% at width |
 | E1 = E0 + `TF_FLASHNEXT_WINDOW_GRAPH=0` (A-B-B-A) | 297.4 | 901 / 854 | +0.8% / +1.0% |
 | E1 + `TF_QMMF_HALF_BELOW=400` | 298.4 | 901 / 847 | +0.4% at 1 stream |
-| E1 + `TF_FLASHNEXT_ATTN_LANES=1` | 296.9 | 910.5 / 866.3 | single run (against E1 controls at 898-901 / 850-855), in both arms of the stack E A-B-B-A and the soak |
+| E1 + `TF_FLASHNEXT_ATTN_LANES=1` | 296.9 | 910.5 / 866.3 | one run against E1 controls at 898-901 / 850-855; confirmed on stack E below |
 | E0 + `TF_FLASHNEXT_PEER_SLOTS=1` (A-B-B-A) | 312.4 / 313.8 | 958 / 903, 962 / 904 | +5% / +7% / +7%; prefill -2.5% |
 | stack E without the split `fn_row_best` | 314.2 / 314.6 | 982 / 926, 981 / 926 | full env |
 | **stack E** | **319.2 / 319.5** | **1,015 / 966, 1,017 / 967** | split `fn_row_best`: +1.6% / +3.6% / +4.3% |
+| stack E without `TF_FLASHNEXT_ATTN_LANES` (A-B-B-A on the stack E binary) | 318.8 / 319.0 | 1,003 / 950, 1,003 / 952 | `TF_FLASHNEXT_ATTN_LANES=1`: +1.3% / +1.6% at x8 / x16 (1,016 / 966 against 1,003 / 951), chat x16 +1.6%, level at 1 stream and in prefill; hashes equal in all four arms |
 
 Stack D itself (env `NCCL_P2P_LEVEL=SYS TF_FLASHNEXT_CHUNK_SOLO=8192 TF_FLASHNEXT_DRAFTS_GREEDY=12
 TF_FLASHNEXT_DRAFT_HEAD=affine4 TF_FLASHNEXT_SHARED_SIDE=1 TF_FLASHNEXT_SHARED_SIDE_SPLIT=1`) measured 296.7 / 204.5 tok/s

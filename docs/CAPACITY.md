@@ -13,11 +13,14 @@ FP8 weights at TP2 each rank holds 71.74 GiB of model; stack E's banner at `--co
 | 128K | **7** (2.56 GiB a stream; 8 needs 20.44 GiB) | **17** (1.06 GiB a stream) |
 | 256K | not run | **10** (1.81 GiB a stream) |
 
-- The 64K-256K rows were measured on stack D's binary and env; stack E's per-stream size at those windows was not
-  re-measured.
+- The 64K and 128K on-card rows were measured on stack D's binary and env. The overflow column was measured on an
+  earlier build of this line with stack D's first four levers (before the shared-expert side stream); the side stream
+  does not change a stream's K/V size. Stack E's per-stream size at 64K-256K was not re-measured.
 - Every served count ran its full code and chat load with 0 failures. Host RAM was not the limit at any window.
 - `TF_FLASHNEXT_KV_HOST=overflow` puts K/V rows that do not fit on the card in mapped pinned host pages: 2.1x the
-  streams at 64K and 2.4x at 128K. Its speed with stack E has not been measured.
+  streams at 64K and 2.4x at 128K. Stack E served OpenCode with it at 262,144 x 5 streams: 9/10, 190 tool calls, 0
+  errors, waves of 358 s and 548 s ([QUALITY](QUALITY.md#opencode)). Its speed in the A-B-B-A cells has not been
+  measured.
 
 To serve a longer window, edit `config/cuda/serve.args`, for example to `--context 131072 --parallel 7`. Stack E's speed
 numbers are for the shipped 49,152-token profile.
