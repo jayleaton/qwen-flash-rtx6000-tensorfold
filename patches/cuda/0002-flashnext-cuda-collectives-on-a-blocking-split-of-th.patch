@@ -1,0 +1,381 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Scott Biggart <swbiggart@users.noreply.github.com>
+Date: Tue, 10 Nov 2026 15:51:23 -0800
+Subject: [PATCH 02/46] flashnext cuda: collectives on a blocking split of the
+ nonblocking communicator
+
+Every collective on a nonblocking communicator ran its launch on a thread of NCCL's and returned in progress, so
+the engine polled it with a 50 us sleep, about 105 us a collective and 192 a decode pass. The parent stays nonblocking
+and bounds start-up under the control link and a deadline as before; a blocking communicator split from it, sharing
+its connections, carries every collective and returns once the kernel is enqueued. NCCL_RUNTIME_CONNECT=0, set when
+unset, makes NCCL connect inside the parent's init and the split's job, which the parent's poll bounds, so no
+collective waits on its peer for a connection. Abort ends the parent, which stops a split in flight, then the split.
+---
+ .../families/flashnext/cuda_collective.zig    | 209 +++++++++++++++++-
+ .../flashnext/cuda_lanes_restore_test.zig     |   1 +
+ zig/src/families/flashnext/cuda_launch.zig    |   1 +
+ .../flashnext/cuda_moe_exchange_test.zig      |   1 +
+ .../flashnext/cuda_rank_media_test.zig        |   1 +
+ .../flashnext/cuda_split_lane_test.zig        |   1 +
+ zig/tests/cuda/flashnext_rank_tests.zig       |   2 +-
+ zig/tests/fixtures/gradient-serving.tsv       |  10 +-
+ 8 files changed, 212 insertions(+), 14 deletions(-)
+
+diff --git a/zig/src/families/flashnext/cuda_collective.zig b/zig/src/families/flashnext/cuda_collective.zig
+index b24d45d31..69e86f331 100644
+--- a/zig/src/families/flashnext/cuda_collective.zig
++++ b/zig/src/families/flashnext/cuda_collective.zig
+@@ -1,11 +1,14 @@
+-//! One two-rank NCCL owner. Nonblocking initialization and collectives observe the control peer and a deadline.
++//! One two-rank NCCL owner: a nonblocking communicator bounds start-up; its blocking split carries the collectives.
+ const std = @import("std");
++const builtin = @import("builtin");
+ const cuda = @import("cuda");
++const env = @import("sys").env;
+ const wire = @import("cuda_rank_wire.zig");
+ const nccl = cuda.nccl;
+ 
+ const Advanced = struct {
+     ncclCommInitRankConfig: *const fn (*nccl.Comm, c_int, nccl.UniqueId, c_int, *nccl.Config) callconv(.c) nccl.Result,
++    ncclCommSplit: *const fn (nccl.Comm, c_int, c_int, *nccl.Comm, *nccl.Config) callconv(.c) nccl.Result,
+     ncclCommAbort: *const fn (nccl.Comm) callconv(.c) nccl.Result,
+     ncclCommGetAsyncError: *const fn (nccl.Comm, *nccl.Result) callconv(.c) nccl.Result,
+     ncclReduceScatter: @FieldType(nccl.Api, "ncclAllReduce"),
+@@ -14,7 +17,8 @@ const Advanced = struct {
+ pub const Collective = struct {
+     lib: nccl.Library,
+     api: Advanced,
+-    comm: nccl.Comm = null,
++    comm: nccl.Comm = null, // the blocking split every collective uses once init returns
++    parent: nccl.Comm = null, // the nonblocking start-up communicator, whose connections `comm` shares
+     link: wire.Link,
+     timeout_ms: u64,
+     rank: usize = 0,
+@@ -23,6 +27,8 @@ pub const Collective = struct {
+     /// `link` has completed the source/settings handshake; it stays owned by the caller.
+     pub fn init(link: wire.Link, rank: usize, timeout_ms: u64) !Collective {
+         if (rank > 1 or timeout_ms == 0) return error.BadRank;
++        // every connection is made inside the bounded init and split, none by a collective; an operator's value stands
++        _ = env.setenv("NCCL_RUNTIME_CONNECT", "0", 0);
+         var c: Collective = .{ .lib = try nccl.Library.open(), .api = undefined, .link = link, .timeout_ms = timeout_ms, .rank = rank };
+         errdefer c.lib.close();
+         try c.lib.requireSupportedVersion();
+@@ -36,20 +42,37 @@ pub const Collective = struct {
+             try c.lib.check(c.lib.api.ncclGetUniqueId(&id), "ncclGetUniqueId");
+             try link.send(std.mem.asBytes(&id), until);
+         } else try link.receive(std.mem.asBytes(&id), until);
+-        var config: nccl.Config = .{};
+         errdefer c.abort();
+-        try c.submitted(c.api.ncclCommInitRankConfig(&c.comm, 2, id, @intCast(rank), &config));
+-        try c.wait(null, until);
++        try c.connect(id, until);
+         cuda.p2p_report.afterInit(&diag, .{ .lib = &c.lib, .comm = c.comm }); // no driver here: no probe
+         return c;
+     }
+ 
++    /// The parent shares its connections, so its split, which the collectives use, connects nothing of its own.
++    fn connect(c: *Collective, id: nccl.UniqueId, until: u64) !void {
++        var config: nccl.Config = .{ .split_share = 1 };
++        try c.submitted(c.api.ncclCommInitRankConfig(&c.comm, 2, id, @intCast(c.rank), &config));
++        try c.wait(null, until);
++        var child: nccl.Comm = null;
++        errdefer {
++            c.abort(); // the parent first: it stops the split and joins it, after which NCCL has stored the child
++            if (@atomicLoad(nccl.Comm, &child, .acquire)) |comm| _ = c.api.ncclCommAbort(comm);
++        }
++        var blocking: nccl.Config = .{ .blocking = 1 };
++        try c.submitted(c.api.ncclCommSplit(c.comm, 0, @intCast(c.rank), &child, &blocking));
++        try c.wait(null, wire.deadline(c.timeout_ms)); // the split runs in NCCL's thread and reports through its parent
++        const made = @atomicLoad(nccl.Comm, &child, .acquire) orelse return error.NcclFailed;
++        c.parent = c.comm;
++        c.comm = made;
++    }
++
++    /// The parent first, which stops a split in flight, then the communicator the collectives use.
+     pub fn abort(c: *Collective) void {
+         c.failed = true;
+-        if (c.comm) |comm| {
++        inline for (.{ "parent", "comm" }) |field| if (@field(c, field)) |comm| {
+             _ = c.api.ncclCommAbort(comm);
+-            c.comm = null;
+-        }
++            @field(c, field) = null;
++        };
+     }
+ 
+     pub fn deinit(c: *Collective) void {
+@@ -155,3 +178,173 @@ pub const Collective = struct {
+         try c.wait(null, wire.deadline(c.timeout_ms));
+     }
+ };
++
++// NCCL's jobs as the tests see them: the parent's init and split end at a scripted poll or when the parent is aborted.
++const Fake = struct {
++    const parent: nccl.Comm = @ptrFromInt(0x1000);
++    const child: nccl.Comm = @ptrFromInt(0x2000);
++    var states: []const nccl.Result = &.{};
++    var polls: usize = 0;
++    var split_result: nccl.Result = 0;
++    var pending: ?*nccl.Comm = null;
++    var aborted: [4]nccl.Comm = @splat(null);
++    var aborts: usize = 0;
++    var parent_config: nccl.Config = .{};
++    var child_config: nccl.Config = .{};
++    var color: c_int = -1;
++    var key: c_int = -1;
++    var leaves: c_int = -1; // a peer link that closes as the split starts
++
++    fn initRank(comm: *nccl.Comm, _: c_int, _: nccl.UniqueId, _: c_int, config: *nccl.Config) callconv(.c) nccl.Result {
++        parent_config = config.*;
++        comm.* = parent;
++        return nccl.in_progress;
++    }
++    fn split(_: nccl.Comm, c: c_int, k: c_int, out: *nccl.Comm, config: *nccl.Config) callconv(.c) nccl.Result {
++        color = c;
++        key = k;
++        child_config = config.*;
++        out.* = null;
++        if (leaves >= 0) _ = std.c.shutdown(leaves, std.posix.SHUT.RDWR);
++        if (split_result == 0 or split_result == nccl.in_progress) pending = out;
++        return split_result;
++    }
++    /// The split's job stores the child as it exits, whether it succeeded, failed or was stopped.
++    fn exit() void {
++        if (pending) |out| out.* = child;
++        pending = null;
++    }
++    fn asyncError(comm: nccl.Comm, state: *nccl.Result) callconv(.c) nccl.Result {
++        state.* = 0;
++        if (comm != parent) return 0;
++        state.* = states[@min(polls, states.len - 1)];
++        polls += 1;
++        if (state.* != nccl.in_progress) exit();
++        return 0;
++    }
++    fn abort(comm: nccl.Comm) callconv(.c) nccl.Result {
++        if (comm == parent) exit();
++        aborted[aborts] = comm;
++        aborts += 1;
++        return 0;
++    }
++    fn reset(script: []const nccl.Result, result: nccl.Result) void {
++        states = script;
++        polls = 0;
++        split_result = result;
++        pending = null;
++        aborted = @splat(null);
++        aborts = 0;
++        color = -1;
++        key = -1;
++        leaves = -1;
++    }
++    fn expectAborts(want: []const nccl.Comm) !void {
++        try std.testing.expectEqualSlices(nccl.Comm, want, aborted[0..aborts]);
++    }
++};
++
++/// Rank 1 over one end of a socket pair; the other end is its peer's control link.
++fn rig(pair: *[2]c_int, timeout_ms: u64) !Collective {
++    if (std.c.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0, pair) != 0) return error.SocketPair;
++    const api: Advanced = .{ .ncclCommInitRankConfig = Fake.initRank, .ncclCommSplit = Fake.split, .ncclCommAbort = Fake.abort, .ncclCommGetAsyncError = Fake.asyncError, .ncclReduceScatter = undefined };
++    return .{ .lib = undefined, .api = api, .link = .{ .fd = pair[0] }, .timeout_ms = timeout_ms, .rank = 1 };
++}
++
++fn closePair(pair: [2]c_int) void {
++    for (pair) |fd| _ = std.c.close(fd);
++}
++
++test "a nonblocking parent that shares its connections hands the collectives to a blocking split" {
++    if (builtin.os.tag == .windows) return error.SkipZigTest;
++    for ([_]nccl.Result{ 0, nccl.in_progress }) |returned| {
++        var pair: [2]c_int = undefined;
++        var c = try rig(&pair, 1000);
++        defer closePair(pair);
++        Fake.reset(&.{ nccl.in_progress, 0, nccl.in_progress, nccl.in_progress, 0 }, returned);
++        try c.connect(undefined, wire.deadline(1000));
++        try std.testing.expect(Fake.parent_config.blocking == 0 and Fake.parent_config.split_share == 1);
++        try std.testing.expect(Fake.child_config.blocking == 1 and Fake.color == 0 and Fake.key == 1);
++        try std.testing.expect(c.comm == Fake.child and c.parent == Fake.parent and !c.failed);
++        try std.testing.expectEqual(@as(usize, 5), Fake.polls);
++        c.abort();
++        c.abort();
++        try Fake.expectAborts(&.{ Fake.parent, Fake.child });
++        try std.testing.expect(c.failed and c.comm == null and c.parent == null);
++    }
++}
++
++test "a split that fails through its parent's asynchronous error aborts the parent, then the child NCCL returned" {
++    if (builtin.os.tag == .windows) return error.SkipZigTest;
++    var pair: [2]c_int = undefined;
++    var c = try rig(&pair, 1000);
++    defer closePair(pair);
++    Fake.reset(&.{ 0, nccl.in_progress, 6 }, 0); // ncclRemoteError
++    try std.testing.expectError(error.NcclFailed, c.connect(undefined, wire.deadline(1000)));
++    try Fake.expectAborts(&.{ Fake.parent, Fake.child });
++    try std.testing.expect(c.failed and c.comm == null and c.parent == null);
++}
++
++test "a split still running at its deadline is stopped through the parent within the bound" {
++    if (builtin.os.tag == .windows) return error.SkipZigTest;
++    var pair: [2]c_int = undefined;
++    var c = try rig(&pair, 30);
++    defer closePair(pair);
++    Fake.reset(&.{ 0, nccl.in_progress }, 0);
++    const start = wire.now();
++    try std.testing.expectError(error.RankTimeout, c.connect(undefined, wire.deadline(1000)));
++    try std.testing.expect(wire.now() - start < std.time.ns_per_s);
++    try Fake.expectAborts(&.{ Fake.parent, Fake.child });
++    try std.testing.expect(c.failed and c.comm == null and c.parent == null);
++}
++
++test "a peer that closes its link during the split surfaces as disconnected, both communicators aborted" {
++    if (builtin.os.tag == .windows) return error.SkipZigTest;
++    var pair: [2]c_int = undefined;
++    var c = try rig(&pair, 1000);
++    defer closePair(pair);
++    Fake.reset(&.{ 0, nccl.in_progress }, 0);
++    Fake.leaves = pair[1];
++    try std.testing.expectError(error.RankDisconnected, c.connect(undefined, wire.deadline(1000)));
++    try Fake.expectAborts(&.{ Fake.parent, Fake.child });
++    try std.testing.expect(c.failed and c.comm == null and c.parent == null);
++}
++
++test "a split NCCL refuses outright aborts the parent and leaves no child" {
++    if (builtin.os.tag == .windows) return error.SkipZigTest;
++    var pair: [2]c_int = undefined;
++    var c = try rig(&pair, 1000);
++    defer closePair(pair);
++    Fake.reset(&.{0}, 4); // ncclInvalidArgument
++    try std.testing.expectError(error.NcclFailed, c.connect(undefined, wire.deadline(1000)));
++    try Fake.expectAborts(&.{Fake.parent});
++    try std.testing.expect(c.failed and c.comm == null and c.parent == null);
++}
++
++test "this file calls NCCL only to start, poll and abort, and for collectives NCCL connected at init" {
++    // a send or receive would connect lazily on the blocking split, where no deadline reaches it
++    const source = @embedFile("cuda_collective.zig");
++    try std.testing.expect(std.mem.indexOf(u8, source, "lib." ++ "group(") == null);
++    const allowed = [_][]const u8{
++        "ncclGetUniqueId",       "ncclCommInitRankConfig", "ncclCommSplit", "ncclCommAbort",
++        "ncclCommGetAsyncError", "ncclAllGather",          "ncclBroadcast", "ncclAllReduce",
++        "ncclReduceScatter",
++    };
++    inline for (@typeInfo(Advanced).@"struct".field_names) |name| {
++        var known = false;
++        for (allowed) |a| known = known or std.mem.eql(u8, a, name);
++        try std.testing.expect(known);
++    }
++    const needle = "api" ++ ".";
++    var at: usize = 0;
++    var calls: usize = 0;
++    while (std.mem.indexOfPos(u8, source, at, needle)) |i| : (calls += 1) {
++        const name = source[i + needle.len ..][0 .. std.mem.indexOfScalar(u8, source[i + needle.len ..], '(') orelse 0];
++        var known = false;
++        for (allowed) |a| known = known or std.mem.eql(u8, a, name);
++        if (!known) std.debug.print("unexpected NCCL entry point {s}\n", .{name});
++        try std.testing.expect(known);
++        at = i + needle.len;
++    }
++    try std.testing.expectEqual(@as(usize, 11), calls);
++}
+diff --git a/zig/src/families/flashnext/cuda_lanes_restore_test.zig b/zig/src/families/flashnext/cuda_lanes_restore_test.zig
+index eaefdc077..2dd40100c 100644
+--- a/zig/src/families/flashnext/cuda_lanes_restore_test.zig
++++ b/zig/src/families/flashnext/cuda_lanes_restore_test.zig
+@@ -165,6 +165,7 @@ fn follower(comptime Cuda: type, frames: []const wire.Header, setup: *const fn (
+     var rank: ranks.Session = .{ .gpa = a, .rank = 1, .link = .{ .fd = pair[0] }, .collective = undefined, .engine = &engine, .drafting = true };
+     rank.collective.failed = false;
+     rank.collective.comm = null;
++    rank.collective.parent = null;
+     defer rank.seqs.deinit(a);
+     defer rank.windows.deinit(a);
+     defer rank.saved.deinit(a);
+diff --git a/zig/src/families/flashnext/cuda_launch.zig b/zig/src/families/flashnext/cuda_launch.zig
+index 4033df76a..229d70825 100644
+--- a/zig/src/families/flashnext/cuda_launch.zig
++++ b/zig/src/families/flashnext/cuda_launch.zig
+@@ -449,6 +449,7 @@ test {
+     _ = @import("cuda_split_lane_test.zig");
+     _ = @import("cuda_cap_test.zig");
+     _ = @import("cuda_mtp_graphs_test.zig");
++    _ = collective;
+     _ = embed;
+     _ = hc;
+     _ = qmm;
+diff --git a/zig/src/families/flashnext/cuda_moe_exchange_test.zig b/zig/src/families/flashnext/cuda_moe_exchange_test.zig
+index 7af737117..54da1ea2c 100644
+--- a/zig/src/families/flashnext/cuda_moe_exchange_test.zig
++++ b/zig/src/families/flashnext/cuda_moe_exchange_test.zig
+@@ -80,6 +80,7 @@ fn collective(pair: *[2]c_int, rank: usize, timeout_ms: u64) !Collective {
+     var c: Collective = undefined;
+     c.failed = false;
+     c.comm = @ptrFromInt(0x1000);
++    c.parent = null;
+     c.link = .{ .fd = pair[0] };
+     c.timeout_ms = timeout_ms;
+     c.rank = rank;
+diff --git a/zig/src/families/flashnext/cuda_rank_media_test.zig b/zig/src/families/flashnext/cuda_rank_media_test.zig
+index 77c2d54cf..644ab32d6 100644
+--- a/zig/src/families/flashnext/cuda_rank_media_test.zig
++++ b/zig/src/families/flashnext/cuda_rank_media_test.zig
+@@ -92,6 +92,7 @@ fn session(engine: *prompt.Engine, rank: usize, pair: *[2]c_int) !ranks.Session
+     var s: ranks.Session = .{ .gpa = std.testing.allocator, .rank = rank, .link = .{ .fd = pair[0] }, .collective = undefined, .engine = engine };
+     s.collective.failed = false;
+     s.collective.comm = @ptrFromInt(0x1000);
++    s.collective.parent = null;
+     s.collective.link = .{ .fd = pair[0] };
+     s.collective.timeout_ms = 1000;
+     s.collective.lib.api.ncclBroadcast = Fake.broadcast;
+diff --git a/zig/src/families/flashnext/cuda_split_lane_test.zig b/zig/src/families/flashnext/cuda_split_lane_test.zig
+index 417a47a8c..2ffbb3b6c 100644
+--- a/zig/src/families/flashnext/cuda_split_lane_test.zig
++++ b/zig/src/families/flashnext/cuda_split_lane_test.zig
+@@ -125,6 +125,7 @@ const Rig = struct {
+         r.c.rank = 0;
+         r.c.failed = false;
+         r.c.comm = @ptrFromInt(0x1000);
++        r.c.parent = null;
+         r.c.link = .{ .fd = r.pair[0] };
+         r.c.timeout_ms = 1000;
+         r.c.lib.api.ncclAllReduce = Rec.allReduce;
+diff --git a/zig/tests/cuda/flashnext_rank_tests.zig b/zig/tests/cuda/flashnext_rank_tests.zig
+index e6b306908..d49ff2471 100644
+--- a/zig/tests/cuda/flashnext_rank_tests.zig
++++ b/zig/tests/cuda/flashnext_rank_tests.zig
+@@ -74,7 +74,7 @@ pub fn run(gpu: check.Gpu, rank: usize, port: u16, mode_arg: []const u8, master:
+         const start = wire.now();
+         completeSum(&collective, stream, values.ptr, 1, scatter) catch |err| {
+             try check.expect(err == error.RankDisconnected or err == error.RankTimeout or err == error.NcclFailed, "failure is surfaced ({s})", .{@errorName(err)});
+-            try check.expect(collective.failed and collective.comm == null, "failed communicator is aborted and cannot be reused", .{});
++            try check.expect(collective.failed and collective.comm == null and collective.parent == null, "failed communicators are aborted and cannot be reused", .{});
+             try check.expect(wire.now() - start < 3 * std.time.ns_per_s, "failed collective terminates within bound", .{});
+             try std.testing.expectError(error.RankDisconnected, collective.sum(stream, values.ptr, 1));
+             try std.testing.expectError(error.RankDisconnected, collective.sumBlock(stream, values.ptr, 1));
+diff --git a/zig/tests/fixtures/gradient-serving.tsv b/zig/tests/fixtures/gradient-serving.tsv
+index 8c49a3d42..935685b55 100644
+--- a/zig/tests/fixtures/gradient-serving.tsv
++++ b/zig/tests/fixtures/gradient-serving.tsv
+@@ -115,9 +115,9 @@ zig/src/cuda/tp_watch.zig	19ed1d12bc56f804b5d207d04226e9f6131a517aaf7aec4c4b2d0b
+ zig/src/cuda/triton.zig	256323865c6a4676b8b75aae9e32d2d9732cf2623efedb9462cf6f95302c3e83	raw
+ zig/src/cuda/vit.zig	72c4301251f50d0f25907f0d8ad03a943281b234c506a455e413627a3ffe09c0	raw
+ zig/src/families/flashnext/cuda_attn.zig	99dfe79f919a8599490f1cdba0bec20d6e73ccbeafe26d5848419a465fdfa0d0	raw
+-zig/src/families/flashnext/cuda_batch.zig	eaf08f697f93041f93d2388b345e90a788398a5cf7bfa7641c63a816c6ac5946	raw	main 42ff6c510f (disk states keyed by the resolved prompt passes; serving unchanged); #XXXX: the scratch test's ceiling restated at the 3,072-row default
+-zig/src/families/flashnext/cuda_batch_state.zig	7e940f58ec4ecba11a657983375e3cfec7492989c6246f037759b8051ce70129	raw	y and moe_f32 take one spare row for a --tp 2 prompt pass's padded rank block; replies unchanged; #XXXX: the default prompt chunk is 3,072 rows
+-zig/src/families/flashnext/cuda_collective.zig	bf475ffb46b3440fcad280f46e34de25cd22b79ed96a0b587d0869e7451d3519	raw	adds sumBlock, the in-place FP32 reduce-scatter with sum's peer check, deadline and abort; no served change on its own
++zig/src/families/flashnext/cuda_batch.zig	7fa858c564356e9cc80ee50a86602a5d1c1c3d1ef9ef6d0d69b2ac7a8a4b4e5e	raw	main 42ff6c510f (disk states keyed by the resolved prompt passes; serving unchanged)
++zig/src/families/flashnext/cuda_batch_state.zig	ae9d16a76aa56cd3448b3414140cbabd2f918bfb69a094b02be82544f371603c	raw	y and moe_f32 take one spare row for a --tp 2 prompt pass's padded rank block; replies unchanged
++zig/src/families/flashnext/cuda_collective.zig	23b4f9e5689ffc3f51dcef9aad2cd1aed7802a1d2374f68c6dd78c2c41cede87	raw	adds sumBlock, the in-place FP32 reduce-scatter with sum's peer check, deadline and abort; no served change on its own; collectives on a blocking split of the nonblocking communicator, NCCL_RUNTIME_CONNECT=0 when unset; the same collectives and sums, replies unchanged
+ zig/src/families/flashnext/cuda_compare_main.zig	ade014dfec88f0b386076cdc093ea20710d7bf36c33ff566ca2caf472064695b	raw	main dfd9ac5ef4 (#2585: the TF_FLASHNEXT_* startup check), c274b45cc1 (the check through the flashnext module)
+ zig/src/families/flashnext/cuda_config.zig	19366ee591270c719fa6f710af0efd4d5a55cfc3e30c923f5ed08771b5c14001	raw
+ zig/src/families/flashnext/cuda_draft_affine.zig	2ec22bec1a38a6d2cc7e16a65d41deeb452d1a679661351a473652b5f39f2da8	raw
+@@ -132,8 +132,8 @@ zig/src/families/flashnext/cuda_images_test.zig	df984d54d9de1bb732544785cddf82a1
+ zig/src/families/flashnext/cuda_lanes.zig	b72cee919a557e16f001d2c6a7b77602889f6d41a225e0af4736368aff01aee6	raw	main 4f6017ced (marks inside the pass), fbca90714 (shared solo-chunk rule, #2391), 80e0fd72c (#2753: non-finite draft rows refused by name; finite rows unchanged), dfd9ac5ef4 (#2585: TF_FLASHNEXT_* read through platform/environment.zig, malformed text refused at startup; valid values keep their meaning), #1953: the ladder's values through snap_intermediate, #3308 (loader host test updates the named startup-refusal expectations; no runtime edit to this pinned file); #3135 (kept_disk renamed kept_view for the shared kept image; no served change), this change (the page pool opens with the load's device and io, for its arena mapped as pages are used; a new paged stream's first prompt step waits while the arena's thread maps its pieces; paging off: unchanged)
+ zig/src/families/flashnext/cuda_lanes_admission_test.zig	4b8052db793ba81f0e73e1b9bd77b1780bbc4fd550d90976d017da47e76faaa2	raw
+ zig/src/families/flashnext/cuda_lanes_load.zig	abcfaf795d8c895ef04a01c5fd58c97ff43249a5c6cb3da460f8a23a5d5f9bf3	raw	main dfd9ac5ef4 (#2585: TF_FLASHNEXT_* read through platform/environment.zig, malformed text refused at startup; valid values keep their meaning), #3467: after load a shard drops its page cache except the n-gram ranges, and the sweep reaches nested shards; tensors and replies are unchanged, this change (the load's device and io handed to the page pool's arena; paging off: unchanged)
+-zig/src/families/flashnext/cuda_lanes_restore_test.zig	f9947521a6d9c7d7380ca1b784a93a43b364c6fa5861cad15efd3538d2b8ceff	raw
+-zig/src/families/flashnext/cuda_launch.zig	f8bebb5ed074e6c8ab8cef667cb01fa2bb1a2b2d6a4d3874a92291390278d9f7	raw	exports cuda_moe_exchange.zig for its device test; no served change; #2837 (Flash Next TP=2 graph replay)
++zig/src/families/flashnext/cuda_lanes_restore_test.zig	cf2ca3433f33a75993b7e12a24d38dd37ae0a995718758617549bc9544dc97cb	raw	its rig names the collective's parent communicator; test only
++zig/src/families/flashnext/cuda_launch.zig	803795f27570003aeac3f1ee5c40a76d83f76781d4bb676af5c56526cc409171	raw	exports cuda_moe_exchange.zig for its device test; no served change; #2837 (Flash Next TP=2 graph replay); its test block reaches cuda_collective.zig's host tests, no served change
+ zig/src/families/flashnext/cuda_media.zig	394601e8a807f5516f501efcaefa6fb3308f392ee322db7296b11c90814f8eea	raw
+ zig/src/families/flashnext/cuda_media_test.zig	4292f8f7c8f8bf4efd0dfaaa5a6c63e11568f85534127a0ce9feb0ab0be05120	raw
+ zig/src/families/flashnext/cuda_mix.zig	248a2a86b3f377531f5b713c408ba99f73604510f4afe34ffae52615d5863c2c	raw

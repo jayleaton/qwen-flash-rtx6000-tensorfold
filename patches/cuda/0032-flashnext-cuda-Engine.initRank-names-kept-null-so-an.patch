@@ -1,0 +1,24 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jay Leaton <58495321+jayleaton@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 20:08:57 +0700
+Subject: [PATCH 32/46] flashnext cuda: Engine.initRank names kept (null), so
+ an engine made without the server's load frees no garbage spares
+
+flashnext-model-rank and flashnext-fidelity-rank make their engine with initRank alone; rank 1's first kept
+state then read an undefined HostSpares (a general protection fault in HostSpares.find).
+---
+ zig/src/families/flashnext/cuda_prompt.zig | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/zig/src/families/flashnext/cuda_prompt.zig b/zig/src/families/flashnext/cuda_prompt.zig
+index 40553ad02..ad01db764 100644
+--- a/zig/src/families/flashnext/cuda_prompt.zig
++++ b/zig/src/families/flashnext/cuda_prompt.zig
+@@ -216,6 +216,7 @@ pub const Engine = struct {
+         e.batch_k = try batch.Kernels.load(driver);
+         e.batch_s = null;
+         e.scores = null;
++        e.kept = null;
+         e.chunk = chunk;
+         e.busy_chunk = busy;
+         return e;

@@ -1,0 +1,120 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jay Leaton <58495321+jayleaton@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 12:15:06 +0700
+Subject: [PATCH 28/46] flashnext cuda: flashnext-snap-host checks kept states
+ in pinned host memory on a real card
+
+---
+ zig/src/families/flashnext/cuda_launch.zig   |  1 +
+ zig/tests/cuda/flashnext_snap_host_tests.zig | 56 ++++++++++++++++++++
+ zig/tests/cuda/main.zig                      |  2 +
+ zig/tests/cuda/main_usage.zig                |  1 +
+ 4 files changed, 60 insertions(+)
+ create mode 100644 zig/tests/cuda/flashnext_snap_host_tests.zig
+
+diff --git a/zig/src/families/flashnext/cuda_launch.zig b/zig/src/families/flashnext/cuda_launch.zig
+index 229d70825..f6821c898 100644
+--- a/zig/src/families/flashnext/cuda_launch.zig
++++ b/zig/src/families/flashnext/cuda_launch.zig
+@@ -32,6 +32,7 @@ pub const ple = @import("cuda_ple.zig");
+ pub const ple_check = @import("cuda_ple_check.zig");
+ pub const mix = @import("cuda_mix.zig");
+ pub const prompt = @import("cuda_prompt.zig");
++pub const snap = @import("cuda_snap.zig");
+ /// The row-by-row reference path, for flashnext-prompt
+ pub const row_path = @import("cuda_rows.zig");
+ /// The MTP head's drafts: its forward, the chain, the verify window's rows and their rollback
+diff --git a/zig/tests/cuda/flashnext_snap_host_tests.zig b/zig/tests/cuda/flashnext_snap_host_tests.zig
+new file mode 100644
+index 000000000..0e4eb73d5
+--- /dev/null
++++ b/zig/tests/cuda/flashnext_snap_host_tests.zig
+@@ -0,0 +1,56 @@
++//! Kept states in mapped pinned host memory: the device copies reach them both ways, byte for byte, on this card.
++const std = @import("std");
++const cuda = @import("cuda");
++const flash = @import("flashnext");
++const check = @import("check.zig");
++const snap = flash.snap;
++
++pub fn run(gpu: check.Gpu) !void {
++    const chosen = try snap.onHost(gpu.ctx);
++    std.debug.print("flashnext-snap-host: this card keeps states {s}\n", .{if (chosen) "in pinned host memory" else "on the device"});
++    for ([_]usize{ 8192, 32768 }) |at| for ([_]bool{ true, false }) |host| try one(gpu, at, host);
++    check.pass("flashnext-snap-host: saved and restored states equal their source", .{});
++}
++
++fn one(gpu: check.Gpu, at: usize, host: bool) !void {
++    const d = gpu.d;
++    const n = snap.bytes(at, true, .full);
++    const want = try gpu.gpa.alloc(u8, n);
++    defer gpu.gpa.free(want);
++    for (want, 0..) |*v, i| v.* = @truncate(i *% 2654435761 >> 7);
++    var src = try cuda.DeviceBuffer.alloc(d, n);
++    defer src.free();
++    var dst = try cuda.DeviceBuffer.alloc(d, n);
++    defer dst.free();
++    try src.upload(0, want);
++    var stream = try cuda.Stream.init(d, true);
++    defer stream.deinit();
++    const t0 = check.now(gpu.io);
++    const st = try snap.prepare(gpu.gpa, d, host, at, .{ 0, 0 }, true, .full);
++    const t1 = check.now(gpu.io);
++    try check.expect((st.host != null) == host, "state at {d}: placed {s}", .{ at, if (st.host != null) "on host" else "on device" });
++    try d.check(d.api.cuMemcpyDtoDAsync_v2(st.buf.ptr, src.ptr, n, stream.handle), "save copy");
++    try stream.synchronize();
++    const t2 = check.now(gpu.io);
++    try d.check(d.api.cuMemcpyDtoDAsync_v2(dst.ptr, st.buf.ptr, n, stream.handle), "restore copy");
++    try stream.synchronize();
++    const t3 = check.now(gpu.io);
++    snap.drop(gpu.gpa, stream, st);
++    const t4 = check.now(gpu.io);
++    const got = try gpu.gpa.alloc(u8, n);
++    defer gpu.gpa.free(got);
++    try dst.download(0, got);
++    try check.sameBytes("restored state", got, want);
++    const gib = @as(f64, @floatFromInt(n)) / (1 << 30);
++    std.debug.print("  at {d} {s}: {d:.3} GiB, place {d:.1} ms, save {d:.2} GiB/s, restore {d:.2} GiB/s, drop {d:.1} ms\n", .{
++        at, if (host) "host" else "device", gib, ms(t1 - t0), gib / s(t2 - t1), gib / s(t3 - t2), ms(t4 - t3),
++    });
++}
++
++fn ms(ns: i96) f64 {
++    return @as(f64, @floatFromInt(ns)) / 1e6;
++}
++
++fn s(ns: i96) f64 {
++    return @as(f64, @floatFromInt(ns)) / 1e9;
++}
+diff --git a/zig/tests/cuda/main.zig b/zig/tests/cuda/main.zig
+index d771fe68d..93c6fbef5 100644
+--- a/zig/tests/cuda/main.zig
++++ b/zig/tests/cuda/main.zig
+@@ -89,6 +89,7 @@ const flashnext_score_tests = @import("flashnext_score_tests.zig");
+ const flashnext_rank_tests = @import("flashnext_rank_tests.zig");
+ const flashnext_draft_affine_tests = @import("flashnext_draft_affine_tests.zig");
+ const flashnext_shared_tests = @import("flashnext_shared_tests.zig");
++const flashnext_snap_host_tests = @import("flashnext_snap_host_tests.zig");
+ const flashnext_nvfp4_tp_tests = @import("flashnext_nvfp4_tp_tests.zig");
+ const flashnext_fp8_experts_tests = @import("flashnext_fp8_experts_tests.zig");
+ const nvfp4_fact_tests = @import("nvfp4_fact_tests.zig");
+@@ -368,6 +369,7 @@ fn run(gpu: check.Gpu, cmd: []const u8, rest: []const [:0]const u8) !void {
+     if (std.mem.eql(u8, cmd, "flashnext-rank")) return flashnext_rank_tests.run(gpu, try std.fmt.parseInt(usize, try arg(rest, 0), 10), try std.fmt.parseInt(u16, try arg(rest, 1), 10), if (rest.len > 2) rest[2] else "sum", if (rest.len > 3) rest[3] else "127.0.0.1");
+     if (std.mem.eql(u8, cmd, "flashnext-draft-affine")) return flashnext_draft_affine_tests.run(gpu);
+     if (std.mem.eql(u8, cmd, "flashnext-shared")) return flashnext_shared_tests.run(gpu);
++    if (std.mem.eql(u8, cmd, "flashnext-snap-host")) return flashnext_snap_host_tests.run(gpu);
+     if (std.mem.eql(u8, cmd, "flashnext-nvfp4-tp")) return flashnext_nvfp4_tp_tests.run(gpu);
+     if (std.mem.eql(u8, cmd, "flashnext-fp8-experts")) return flashnext_fp8_experts_tests.run(gpu);
+     if (std.mem.eql(u8, cmd, "moetile")) return @import("moetile_tests.zig").run(gpu);
+diff --git a/zig/tests/cuda/main_usage.zig b/zig/tests/cuda/main_usage.zig
+index a1c8fddac..f1efe057d 100644
+--- a/zig/tests/cuda/main_usage.zig
++++ b/zig/tests/cuda/main_usage.zig
+@@ -11,6 +11,7 @@ pub const usage =
+     \\  flashnext-window-rank MODEL RANK PORT IDS_FILE  two-rank serial/window and rollback parity
+     \\  flashnext-windows MODEL IDS_FILE  several streams' windows in one shared verify against each alone
+     \\  flashnext-mtp-parity MODEL IDS_FILE  several streams' MTP heads in one shared pass against each alone
++    \\  flashnext-snap-host  kept states in pinned host memory: device copies both ways, byte for byte
+     \\  flashnext-score MODEL IDS_FILE  decisions' label scores against a plain pass's last row
+     \\  flashnext-model-rank MODEL RANK PORT IDS_FILE [rounds|leave] [MASTER]  full-model rounds == eager rows; leave: the peer is stopped
+     \\  flashnext-rank RANK PORT [sum|eof|timeout|missing|eof-scatter|timeout-scatter|exchange] [MASTER]  two-process collectives, failures, the expert exchange

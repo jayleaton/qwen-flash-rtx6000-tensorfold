@@ -1,0 +1,159 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jay Leaton <58495321+jayleaton@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 22:13:41 +0700
+Subject: [PATCH 36/46] flashnext cuda: TF_FLASHNEXT_SHARED_SIDE_SPLIT, a split
+ shared expert on the side stream with its gather there
+
+With TF_FLASHNEXT_SPLIT_DENSE=1 at --tp 2 (FP8 and NVFP4) the shared expert is cut by rows and runs in line on both
+ranks with a BF16 gather. TF_FLASHNEXT_SHARED_SIDE_SPLIT=1 (off by default) forks it onto the side stream on every rank
+after y is cleared, beside the routed experts, and joins before the rank sum. The gather is enqueued host-async on the
+blocking split, and it is the only collective between fork and join on both ranks, so the ranks issue gather then sum
+in the same order; the slot columns written are the same, so the bits are too.
+
+Extends MiaAI-Lab patch 0016's side stream (Qwen3.8-Flash-Next-RTX-PRO-6000-TernsorFold 57d815c, MIT) to the split
+expert.
+---
+ docs/environment.md                           |  1 +
+ .../families/flashnext/cuda_batch_side.zig    | 24 ++++++++++++++++---
+ .../families/flashnext/cuda_shared_split.zig  | 21 +++++++++-------
+ zig/src/platform/environment.zig              |  1 +
+ .../platform/environment_flashnext_test.zig   |  4 ++--
+ 5 files changed, 38 insertions(+), 13 deletions(-)
+
+diff --git a/docs/environment.md b/docs/environment.md
+index b3426f83b..582089cbe 100644
+--- a/docs/environment.md
++++ b/docs/environment.md
+@@ -145,6 +145,7 @@ stops the start with the variable, the supplied text and the accepted forms.
+ | `TF_FLASHNEXT_SAMPLED_HEADS` | Exactly `0` or `1`; default on |
+ | `TF_FLASHNEXT_SHARED_DRAFTS` | Exactly `0` or `1`; default on |
+ | `TF_FLASHNEXT_SHARED_SIDE` | Exactly `0` or `1`; default on |
++| `TF_FLASHNEXT_SHARED_SIDE_SPLIT` | Exactly `0` or `1`; default off |
+ | `TF_FLASHNEXT_HC_FUSE` | Exactly `0` or `1`; default on |
+ | `TF_FLASHNEXT_KEEP_LATE` | Exactly `0` or `1`; unset or blank leaves the choice to the loader |
+ | `TF_FLASHNEXT_DECODE_GRAPH` | Exactly `0` or `1`; default off |
+diff --git a/zig/src/families/flashnext/cuda_batch_side.zig b/zig/src/families/flashnext/cuda_batch_side.zig
+index 0cc02a05e..8666994d4 100644
+--- a/zig/src/families/flashnext/cuda_batch_side.zig
++++ b/zig/src/families/flashnext/cuda_batch_side.zig
+@@ -13,6 +13,17 @@ pub fn on() bool {
+     return @import("sys").environment.read(bool, "TF_FLASHNEXT_SHARED_SIDE", true) catch true;
+ }
+ 
++/// TF_FLASHNEXT_SHARED_SIDE_SPLIT=1: a shared expert the dense split cuts also runs on the side stream.
++pub fn splitOn() bool {
++    return @import("sys").environment.read(bool, "TF_FLASHNEXT_SHARED_SIDE_SPLIT", false) catch false;
++}
++
++/// Whether a pass's shared expert forks: whole on rank 0, or cut on every rank with splitOn; never a prompt fill.
++pub fn forks(rank: usize, split: bool, prompt: bool, split_on: bool) bool {
++    if (prompt) return false;
++    return if (split) split_on else rank == 0;
++}
++
+ /// The shared expert's stream and the two points it forks and joins at.
+ pub const Side = struct {
+     stream: cuda.Stream,
+@@ -55,13 +66,13 @@ pub fn down(pass: anytype, st: cuda.Stream, input: u64, native: anytype, n: usiz
+     try glue.sharedScatter(st, s.shared_out, s.y, n, dims, slots);
+ }
+ 
+-/// After y is cleared: the whole shared expert forked onto rank 0's side stream (not a prompt fill), or null.
++/// After y is cleared: the shared expert on the side stream (forks), a cut one's gather the only collective till join.
+ pub fn fork(pass: anytype, native: anytype, n: usize) !?Side {
+     const x = pass.s.side orelse return null;
+-    if (native.rank != 0 or native.split_shared or pass.hooks.prompt) return null;
++    if (!forks(native.rank, native.split_shared, pass.hooks.prompt, splitOn())) return null;
+     try x.fork.record(pass.stream);
+     try x.stream.wait(x.fork);
+-    try run(pass, x.stream, native, n);
++    if (native.split_shared) try @import("cuda_shared_split.zig").runOn(pass, x.stream, native, n) else try run(pass, x.stream, native, n);
+     try x.join.record(x.stream);
+     return x;
+ }
+@@ -71,3 +82,10 @@ pub fn join(pass: anytype, side: ?Side, native: anytype, n: usize) !void {
+     if (side) |x| return pass.stream.wait(x.join);
+     if (native.rank == 0) try run(pass, pass.stream, native, n);
+ }
++
++test "the shared expert forks whole on rank 0, cut on every rank only with the split switch, never in a prompt fill" {
++    const t = std.testing;
++    try t.expect(forks(0, false, false, false) and !forks(1, false, false, true));
++    try t.expect(!forks(0, true, false, false) and forks(0, true, false, true) and forks(1, true, false, true));
++    try t.expect(!forks(0, false, true, true) and !forks(0, true, true, true));
++}
+diff --git a/zig/src/families/flashnext/cuda_shared_split.zig b/zig/src/families/flashnext/cuda_shared_split.zig
+index 33b4c1ee4..bf7a5691a 100644
+--- a/zig/src/families/flashnext/cuda_shared_split.zig
++++ b/zig/src/families/flashnext/cuda_shared_split.zig
+@@ -4,25 +4,30 @@ const ops = @import("cuda_batch_ops.zig");
+ const mixed = @import("cuda_mixed_experts.zig");
+ 
+ pub fn run(self: anytype, native: *const mixed.Owned, n: usize) !void {
++    return runOn(self, self.stream, native, n);
++}
++
++/// run on `st`: the pass's stream, or the side stream forked after y is cleared (its gather then rides on `st`).
++pub fn runOn(self: anytype, st: anytype, native: *const mixed.Owned, n: usize) !void {
+     if (!native.split_shared and native.rank != 0) return;
+     const s = self.s;
+     const dims = wt.dims;
+     const glue = self.tri.own orelse return error.NativeGlueRequired;
+     const width = if (native.split_shared) wt.moe_w / 2 else wt.moe_w;
+-    try self.k.native_lane.matmul(self.stream, s.mixed, dims, n, native.shared[0].native.?, s.shared_gate, s.native_part);
+-    try self.k.native_lane.matmul(self.stream, s.mixed, dims, n, native.shared[1].native.?, s.shared_up, s.native_part);
+-    try glue.sharedSwiGLU(self.stream, s.shared_gate, s.shared_up, s.shared_act, n, width);
++    try self.k.native_lane.matmul(st, s.mixed, dims, n, native.shared[0].native.?, s.shared_gate, s.native_part);
++    try self.k.native_lane.matmul(st, s.mixed, dims, n, native.shared[1].native.?, s.shared_up, s.native_part);
++    try glue.sharedSwiGLU(st, s.shared_gate, s.shared_up, s.shared_act, n, width);
+     var input = s.shared_act;
+     if (native.split_shared) {
+         const c = self.m.collective orelse return error.TensorParallelUnavailable;
+-        try c.gather(self.stream, input, s.rank_gather, n * width);
++        try c.gather(st, input, s.rank_gather, n * width);
+         // one row: the ranks' gathered blocks [2, 1, width] are already the row [1, moe_w] the down projection reads
+-        if (n > 1) for (0..2) |rank| try ops.copyCols(self.k, self.stream, s.rank_gather + rank * n * width * 2, width, s.rank_input + rank * width * 2, wt.moe_w, width, n);
++        if (n > 1) for (0..2) |rank| try ops.copyCols(self.k, st, s.rank_gather + rank * n * width * 2, width, s.rank_input + rank * width * 2, wt.moe_w, width, n);
+         input = if (n == 1) s.rank_gather else s.rank_input;
+     }
+     // the whole expert's down goes straight into its slot (cuda_batch_side.down), as on the side stream
+-    if (!native.split_shared) return @import("cuda_batch_side.zig").down(self, self.stream, input, native, n);
+-    try self.k.native_lane.matmulF32(self.stream, input, wt.moe_w, n, native.shared[2].native.?, s.shared_out, s.native_part);
++    if (!native.split_shared) return @import("cuda_batch_side.zig").down(self, st, input, native, n);
++    try self.k.native_lane.matmulF32(st, input, wt.moe_w, n, native.shared[2].native.?, s.shared_out, s.native_part);
+     // Every routed slot and the peer's output columns stay at the zeros set before the expert launches.
+-    try ops.copyCols(self.k, self.stream, s.shared_out, dims, s.y + (wt.slots - 1) * dims * 4 + native.rank * dims * 2, wt.slots * dims * 2, dims, n);
++    try ops.copyCols(self.k, st, s.shared_out, dims, s.y + (wt.slots - 1) * dims * 4 + native.rank * dims * 2, wt.slots * dims * 2, dims, n);
+ }
+diff --git a/zig/src/platform/environment.zig b/zig/src/platform/environment.zig
+index 8db25a784..1332f2202 100644
+--- a/zig/src/platform/environment.zig
++++ b/zig/src/platform/environment.zig
+@@ -213,6 +213,7 @@ pub const rules = [_]Rule{
+     .{ .name = "TF_FLASHNEXT_SAMPLED_HEADS", .scope = .flashnext, .kind = .flag, .forms = "0 or 1 (default 1)" },
+     .{ .name = "TF_FLASHNEXT_SHARED_DRAFTS", .scope = .flashnext, .kind = .flag, .forms = "0 or 1 (default 1)" },
+     .{ .name = "TF_FLASHNEXT_SHARED_SIDE", .scope = .flashnext, .kind = .flag, .forms = "0 or 1 (default 1)" },
++    .{ .name = "TF_FLASHNEXT_SHARED_SIDE_SPLIT", .scope = .flashnext, .kind = .flag, .forms = "0 or 1 (default 0)" },
+     .{ .name = "TF_FLASHNEXT_HC_FUSE", .scope = .flashnext, .kind = .flag, .forms = "0 or 1 (default 1)" },
+     .{ .name = "TF_FLASHNEXT_READOUT_FUSED", .scope = .flashnext, .kind = .flag, .forms = "0 or 1 (default 0)" },
+     .{ .name = "TF_FLASHNEXT_KEEP_LATE", .scope = .flashnext, .kind = .flag, .forms = "0 or 1 (unset or blank leaves it unset)" },
+diff --git a/zig/src/platform/environment_flashnext_test.zig b/zig/src/platform/environment_flashnext_test.zig
+index 5dfa0552f..b3c6bd384 100644
+--- a/zig/src/platform/environment_flashnext_test.zig
++++ b/zig/src/platform/environment_flashnext_test.zig
+@@ -33,13 +33,13 @@ fn check(name: []const u8, raw: []const u8, valid: bool) !void {
+     try t.expect(std.mem.endsWith(u8, why.?, e.rule(name).forms));
+ }
+ 
+-test "Flash Next strict env: the table holds all 35 settings: 23 switches, 9 integers, 1 real, 2 structured" {
++test "Flash Next strict env: the table holds all 36 settings: 24 switches, 9 integers, 1 real, 2 structured" {
+     var counts: [4]usize = @splat(0);
+     for (e.rules) |r| if (r.scope == .flashnext) {
+         try t.expect(std.mem.startsWith(u8, r.name, "TF_FLASHNEXT_"));
+         counts[@backingInt(group(r))] += 1;
+     };
+-    try t.expectEqual([4]usize{ 23, 9, 1, 2 }, counts);
++    try t.expectEqual([4]usize{ 24, 9, 1, 2 }, counts);
+ }
+ 
+ test "Flash Next strict env: unset and blank settings both read as the caller's default" {

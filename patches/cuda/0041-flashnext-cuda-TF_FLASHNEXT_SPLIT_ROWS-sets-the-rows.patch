@@ -1,0 +1,147 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jay Leaton <58495321+jayleaton@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 17:22:04 +0700
+Subject: [PATCH 41/46] flashnext cuda: TF_FLASHNEXT_SPLIT_ROWS sets the rows
+ past which --tp 2 splits the expert exchange by rows; one host picks its own
+ default
+
+---
+ docs/environment.md                           |  1 +
+ .../families/flashnext/cuda_moe_exchange.zig  | 21 +++++++++++++++++--
+ .../flashnext/cuda_moe_exchange_test.zig      | 13 ++++++++++++
+ .../families/flashnext/cuda_rank_engine.zig   |  5 ++++-
+ zig/src/platform/environment.zig              |  1 +
+ .../platform/environment_flashnext_test.zig   |  4 ++--
+ 6 files changed, 40 insertions(+), 5 deletions(-)
+
+diff --git a/docs/environment.md b/docs/environment.md
+index c84b4e7cb..91006c8f2 100644
+--- a/docs/environment.md
++++ b/docs/environment.md
+@@ -161,6 +161,7 @@ stops the start with the variable, the supplied text and the accepted forms.
+ | `TF_FLASHNEXT_DRAFTS_GREEDY` | Whole draft count; default 8, then clamped to 1 through 15 |
+ | `TF_FLASHNEXT_GREEDY_WIDE` | Whole round width; default 4 |
+ | `TF_FLASHNEXT_WINDOW_ROWS` | Whole row count; default the shared round's rows, capped by them |
++| `TF_FLASHNEXT_SPLIT_ROWS` | Whole row count; `0` or unset takes the link's default (64, the shared round's rows). At `--tp 2`, a pass of more rows than this reduce-scatters its experts' rows and gathers the sums instead of one all-reduce. Give every rank the same value. |
+ | `TF_FLASHNEXT_READOUT_ROWS` | Whole row count; default 64; `0` never takes the tiles |
+ | `TF_FLASHNEXT_CHUNK` | Whole prompt rows a pass, 1 through 16384; default 3072 |
+ | `TF_FLASHNEXT_CHUNK_SOLO` | Whole prompt rows a pass with no stream decoding, from the chunk `TF_FLASHNEXT_CHUNK` resolves to through 16384; unset or blank is the larger of that chunk and 8192 on a server of one stream, and that chunk elsewhere |
+diff --git a/zig/src/families/flashnext/cuda_moe_exchange.zig b/zig/src/families/flashnext/cuda_moe_exchange.zig
+index f1ca6c5e7..141e29eac 100644
+--- a/zig/src/families/flashnext/cuda_moe_exchange.zig
++++ b/zig/src/families/flashnext/cuda_moe_exchange.zig
+@@ -8,9 +8,26 @@ const dims = wt.dims;
+ const slots = wt.slots;
+ const share = cuda.rank_scatter.share;
+ 
+-/// Rows past any decode round or verify window: `world` and `n` are what both ranks' passes agree on.
++/// Rows a pass takes before it splits its exchange: past any decode round or verify window until both ranks meet.
++pub var split_rows: usize = mtp.round_rows;
++
++/// One host's threshold, where a reduce-scatter and gather of a row's halves beats its whole all-reduce.
++const one_host_rows: usize = mtp.round_rows;
++
++/// TF_FLASHNEXT_SPLIT_ROWS, 0 when unset: the ranks' identity carries it, so both pick the same threshold.
++pub fn asked() !usize {
++    return @import("sys").environment.read(usize, "TF_FLASHNEXT_SPLIT_ROWS", 0);
++}
++
++/// The threshold both ranks run: the operator's, else one host's, else the decode round's rows.
++pub fn pick(given: usize, one_host: bool) usize {
++    if (given != 0) return given;
++    return if (one_host) one_host_rows else mtp.round_rows;
++}
++
++/// Rows past the threshold: `world` and `n` are what both ranks' passes agree on.
+ pub fn rowSplit(world: usize, n: usize) bool {
+-    return world == 2 and n > mtp.round_rows;
++    return world == 2 and n > split_rows;
+ }
+ 
+ /// Rows of each rank's reduce-scatter block: rank 0's share, which rank 1's pads to (row n when n is odd).
+diff --git a/zig/src/families/flashnext/cuda_moe_exchange_test.zig b/zig/src/families/flashnext/cuda_moe_exchange_test.zig
+index 529fe90db..674455836 100644
+--- a/zig/src/families/flashnext/cuda_moe_exchange_test.zig
++++ b/zig/src/families/flashnext/cuda_moe_exchange_test.zig
+@@ -111,6 +111,19 @@ test "rounds and windows keep the all-reduce; a wider prompt pass splits, at --t
+     }
+ }
+ 
++test "the operator's threshold wins on any link, and a lowered one splits a verify window's rows" {
++    try expectEqual(@as(usize, 12), exchange.pick(12, false));
++    try expectEqual(@as(usize, 12), exchange.pick(12, true));
++    try expectEqual(@as(usize, mtp.round_rows), exchange.pick(0, false));
++    const save = exchange.split_rows;
++    defer exchange.split_rows = save;
++    exchange.split_rows = 12;
++    try expect(!exchange.rowSplit(2, 12));
++    try expect(exchange.rowSplit(2, 13));
++    try expect(!exchange.rowSplit(1, 13));
++    try expectEqual(2 * exchange.block(13), exchange.clearedRows(2, 13));
++}
++
+ test "the ranks' rows cover a split pass once, in blocks that pad at most the scratch's one spare row" {
+     var n: usize = mtp.round_rows + 1;
+     while (n <= batch.max_chunk) : (n += if (n < 600) 1 else 997) {
+diff --git a/zig/src/families/flashnext/cuda_rank_engine.zig b/zig/src/families/flashnext/cuda_rank_engine.zig
+index 5acf0b493..8fdde16ae 100644
+--- a/zig/src/families/flashnext/cuda_rank_engine.zig
++++ b/zig/src/families/flashnext/cuda_rank_engine.zig
+@@ -23,6 +23,7 @@ pub const Identity = extern struct {
+     image_tokens: u64 = 0,
+     max_images: u64 = 0,
+     dense_split: u64 = 0,
++    split_rows: u64 = 0,
+ };
+ 
+ fn fileHash(a: std.mem.Allocator, io: std.Io, path: []const u8) ![32]u8 {
+@@ -47,7 +48,7 @@ pub fn identity(a: std.mem.Allocator, io: std.Io, dir: []const u8, context: usiz
+     defer a.free(index);
+     const program = try std.process.executablePathAlloc(io, a);
+     defer a.free(program);
+-    return .{ .config = try fileHash(a, io, config), .index = try fileHash(a, io, index), .program = try fileHash(a, io, program), .checkpoint = checkpoint, .context = context, .chunk = chunk, .decode_graph = @intFromBool(@import("cuda_round_graph.zig").enabled()), .head_sharded = @intFromBool(try @import("cuda_head.zig").enabled()), .dense_split = @intFromBool(try @import("cuda_dense_split.zig").appliesDir(a, io, dir, 2)) };
++    return .{ .config = try fileHash(a, io, config), .index = try fileHash(a, io, index), .program = try fileHash(a, io, program), .checkpoint = checkpoint, .context = context, .chunk = chunk, .decode_graph = @intFromBool(@import("cuda_round_graph.zig").enabled()), .head_sharded = @intFromBool(try @import("cuda_head.zig").enabled()), .dense_split = @intFromBool(try @import("cuda_dense_split.zig").appliesDir(a, io, dir, 2)), .split_rows = try @import("cuda_moe_exchange.zig").asked() };
+ }
+ 
+ /// How long a rank waits for its peer: a minute with a given digest, 30 when the peer may be hashing every byte.
+@@ -97,6 +98,8 @@ pub const Session = struct {
+         }
+         if (!sameIdentity(mine, peer)) return error.RankIdentity;
+         s.* = .{ .gpa = a, .rank = rank, .link = link, .collective = try Collective.init(link, rank, 30_000), .drafting = mine.mtp == 1 };
++        const exchange = @import("cuda_moe_exchange.zig");
++        exchange.split_rows = exchange.pick(mine.split_rows, s.collective.parent != null); // a split shares one host's links
+         return s;
+     }
+ 
+diff --git a/zig/src/platform/environment.zig b/zig/src/platform/environment.zig
+index 14ce432da..33f3ef817 100644
+--- a/zig/src/platform/environment.zig
++++ b/zig/src/platform/environment.zig
+@@ -230,6 +230,7 @@ pub const rules = [_]Rule{
+     .{ .name = "TF_FLASHNEXT_DRAFTS_GREEDY", .scope = .flashnext, .kind = .size, .forms = "a whole draft count from 0 to the native size maximum (default 8; clamped to 1 through 15)" },
+     .{ .name = "TF_FLASHNEXT_GREEDY_WIDE", .scope = .flashnext, .kind = .size, .forms = "a whole round width from 0 to the native size maximum (default 4)" },
+     .{ .name = "TF_FLASHNEXT_WINDOW_ROWS", .scope = .flashnext, .kind = .size, .forms = "a whole row count from 0 to the native size maximum (default the shared round's rows; capped by them)" },
++    .{ .name = "TF_FLASHNEXT_SPLIT_ROWS", .scope = .flashnext, .kind = .size, .forms = "a whole row count from 0 to the native size maximum (0 or unset: one host's default; more rows a pass than this split the --tp 2 expert exchange by rows); give every rank the same" },
+     .{ .name = "TF_FLASHNEXT_READOUT_ROWS", .scope = .flashnext, .kind = .size, .forms = "a whole row count from 0 to the native size maximum (default 64; 0 never takes the tiles)" },
+     .{ .name = "TF_FLASHNEXT_CHUNK", .scope = .flashnext, .kind = .size, .min = 1, .max = 16384, .forms = "whole prompt rows a pass, 1 to 16384 (default 3072)" },
+     .{ .name = "TF_FLASHNEXT_CHUNK_SOLO", .scope = .flashnext, .kind = .size, .max = 16384, .forms = "whole prompt rows a pass with no stream decoding, TF_FLASHNEXT_CHUNK to 16384 (unset: 8192 alone at --parallel 1, else off)" },
+diff --git a/zig/src/platform/environment_flashnext_test.zig b/zig/src/platform/environment_flashnext_test.zig
+index 527a1021c..0fbba58a4 100644
+--- a/zig/src/platform/environment_flashnext_test.zig
++++ b/zig/src/platform/environment_flashnext_test.zig
+@@ -33,13 +33,13 @@ fn check(name: []const u8, raw: []const u8, valid: bool) !void {
+     try t.expect(std.mem.endsWith(u8, why.?, e.rule(name).forms));
+ }
+ 
+-test "Flash Next strict env: the table holds all 35 settings: 22 switches, 9 integers, 1 real, 3 structured" {
++test "Flash Next strict env: the table holds all 36 settings: 22 switches, 10 integers, 1 real, 3 structured" {
+     var counts: [4]usize = @splat(0);
+     for (e.rules) |r| if (r.scope == .flashnext) {
+         try t.expect(std.mem.startsWith(u8, r.name, "TF_FLASHNEXT_"));
+         counts[@backingInt(group(r))] += 1;
+     };
+-    try t.expectEqual([4]usize{ 22, 9, 1, 3 }, counts);
++    try t.expectEqual([4]usize{ 22, 10, 1, 3 }, counts);
+ }
+ 
+ test "Flash Next strict env: unset and blank settings both read as the caller's default" {

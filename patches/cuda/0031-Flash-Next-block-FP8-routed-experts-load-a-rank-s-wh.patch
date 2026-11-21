@@ -1,0 +1,545 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jay Leaton <58495321+jayleaton@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 18:19:50 +0700
+Subject: [PATCH 31/46] Flash Next: block-FP8 routed experts load a rank's
+ whole experts and serve at --tp 2
+
+Qwen's FP8 release converts only the routed experts (E4M3 weights, BF16 128x128
+weight_scale_inv); shared-expert, attention and dense projections stay BF16. The
+config check now names that layout as its own mode, the FP8 expert loader takes a
+rank's experts in place of refusing world != 1, moe_native.fp8 takes its expert
+count and shared slot from the rank's layer, and rank memory counts FP8 experts.
+
+Device test flashnext-fp8-experts checks each rank's half against the one-GPU
+bytes. Host tests match the base (one pre-existing rank-start crash).
+---
+ zig/src/families/flashnext/cuda_config.zig    | 114 +++++++++++++++++-
+ .../flashnext/cuda_fp8_experts_load.zig       |  12 +-
+ .../flashnext/cuda_fp8_experts_load_test.zig  |  36 ++++--
+ zig/src/families/flashnext/cuda_lanes.zig     |   2 +-
+ .../families/flashnext/cuda_lanes_bytes.zig   |   2 +-
+ .../families/flashnext/cuda_lanes_explain.zig |   2 +-
+ .../families/flashnext/cuda_lanes_load.zig    |   2 +-
+ .../flashnext/cuda_modelopt_experts.zig       |   4 +-
+ .../families/flashnext/cuda_moe_native.zig    |  12 +-
+ .../families/flashnext/cuda_rank_memory.zig   |  11 ++
+ .../cuda/flashnext_fp8_experts_tests.zig      |  31 ++++-
+ zig/tests/cuda/main_usage.zig                 |   2 +-
+ zig/tests/fixtures/gradient-serving.tsv       |  18 +--
+ 13 files changed, 207 insertions(+), 41 deletions(-)
+
+diff --git a/zig/src/families/flashnext/cuda_config.zig b/zig/src/families/flashnext/cuda_config.zig
+index 1054083b3..153eeebc2 100644
+--- a/zig/src/families/flashnext/cuda_config.zig
++++ b/zig/src/families/flashnext/cuda_config.zig
+@@ -111,7 +111,16 @@ fn geometry(text: std.json.ObjectMap) ?[]const u8 {
+     return semantics(text);
+ }
+ 
+-pub const Mode = enum { affine, modelopt };
++pub const Mode = enum {
++    affine,
++    modelopt,
++    fp8,
++
++    /// Tensors load in their stored formats (BF16 projections, NVFP4 or block-FP8 routed experts): what --tp 2 splits.
++    pub fn stored(m: Mode) bool {
++        return m != .affine;
++    }
++};
+ 
+ fn projection(q: std.json.ObjectMap, name: []const u8, algo: []const u8, group: i64) bool {
+     const p = object(q, name) orelse return false;
+@@ -143,6 +152,39 @@ fn modeloptMismatch(text: std.json.ObjectMap, quant: std.json.ObjectMap) ?[]cons
+     return null;
+ }
+ 
++/// Qwen's block-FP8 release: routed experts E4M3 in 128x128 scale blocks, every projection the loaders read left BF16.
++fn fp8Mismatch(text: std.json.ObjectMap, quant: std.json.ObjectMap) ?[]const u8 {
++    const block = given(quant, "weight_block_size") orelse return "quantization_config.weight_block_size";
++    if (block != .array or block.array.items.len != 2) return "quantization_config.weight_block_size";
++    for (block.array.items) |side| if (!holds(side, .{ .int = 128 })) return "quantization_config.weight_block_size";
++    if (given(quant, "weight_per_tensor")) |v| if (!holds(v, .{ .flag = false })) return "quantization_config.weight_per_tensor";
++    if (given(quant, "kv_cache_scheme") != null) return "quantization_config.kv_cache_scheme";
++    if (geometry(text)) |field| return field;
++    const kept = given(quant, "modules_to_not_convert") orelse return "quantization_config.modules_to_not_convert";
++    if (kept != .array) return "quantization_config.modules_to_not_convert";
++    var buf: [256]u8 = undefined;
++    for (0..wt.layers_n) |layer| {
++        const routed = std.fmt.bufPrint(&buf, "model.language_model.layers.{d}.mlp.experts", .{layer}) catch unreachable;
++        for (kept.array.items) |v| if (v == .string and std.mem.startsWith(u8, v.string, routed)) return "quantization_config.routed_experts";
++        for (fp8_shared) |part| if (!unconverted(kept.array, layer, part)) return "quantization_config.shared_expert";
++        for (if (wt.linearLayer(layer)) fp8_linear else fp8_attention) |part| {
++            if (!unconverted(kept.array, layer, part)) return "quantization_config.attention_projection";
++        }
++    }
++    return null;
++}
++
++const fp8_shared: []const []const u8 = &.{ "mlp.shared_expert.gate_proj", "mlp.shared_expert.up_proj", "mlp.shared_expert.down_proj" };
++const fp8_linear: []const []const u8 = &.{ "linear_attn.in_proj_qkv", "linear_attn.in_proj_z", "linear_attn.in_proj_b", "linear_attn.in_proj_a", "linear_attn.out_proj" };
++const fp8_attention: []const []const u8 = &.{ "self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj", "self_attn.indexer.index_qk_proj", "self_attn.o_proj" };
++
++fn unconverted(kept: std.json.Array, layer: usize, part: []const u8) bool {
++    var buf: [256]u8 = undefined;
++    const name = std.fmt.bufPrint(&buf, "model.language_model.layers.{d}.{s}", .{ layer, part }) catch unreachable;
++    for (kept.items) |v| if (v == .string and std.mem.eql(u8, v.string, name)) return true;
++    return false;
++}
++
+ /// One loaded projection's parts: all MXFP8/32, or none listed (BF16); null when mixed or another format.
+ fn declared(entries: std.json.ObjectMap, layer: usize, prefix: []const u8, parts: []const []const u8) ?enum { mxfp8, bf16 } {
+     var listed: usize = 0;
+@@ -214,8 +256,14 @@ pub fn mode(gpa: std.mem.Allocator, io: std.Io, dir: []const u8) !Mode {
+     const root = parsed.value.object;
+     const text = if (root.get("text_config")) |v| (if (v == .object) v.object else root) else root;
+     const quant = if (root.get("quantization")) |v| (if (v == .object) v.object else null) else null;
+-    const selected: Mode = if (quant != null) .affine else .modelopt;
+-    var field = if (selected == .affine) mismatch(text, quant) else if (object(root, "quantization_config")) |q| modeloptMismatch(text, q) else "quantization";
++    const stored = object(root, "quantization_config");
++    const fp8 = if (stored) |q| if (q.get("quant_method")) |m| holds(m, .{ .word = "fp8" }) else false else false;
++    const selected: Mode = if (quant != null) .affine else if (fp8) .fp8 else .modelopt;
++    var field = switch (selected) {
++        .affine => mismatch(text, quant),
++        .modelopt => if (stored) |q| modeloptMismatch(text, q) else "quantization",
++        .fp8 => fp8Mismatch(text, stored.?),
++    };
+     if (field == null) if (given(root, "tie_word_embeddings")) |v| if (!holds(v, .{ .flag = false })) {
+         field = "tie_word_embeddings";
+     };
+@@ -478,3 +526,63 @@ fn addMxfp8(a: std.mem.Allocator, entries: *std.json.ObjectMap, layer: usize, pr
+     const name = try std.fmt.allocPrint(a, "model.language_model.layers.{d}.{s}.{s}", .{ layer, prefix, part });
+     try entries.put(a, name, .{ .object = p });
+ }
++
++test "Qwen's block-FP8 layout passes: 128x128 blocks, routed experts converted, shared and attention projections kept BF16" {
++    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
++    defer arena.deinit();
++    const a = arena.allocator();
++    var text: std.json.ObjectMap = .empty;
++    var rope_params: std.json.ObjectMap = .empty;
++    var mtp: std.json.ObjectMap = .empty;
++    var kinds: std.json.Array = .init(a);
++    var ple: std.json.Array = .init(a);
++    try served(a, &text, &rope_params, &mtp, &kinds, &ple);
++    var kept: std.json.Array = .init(a);
++    try kept.append(.{ .string = "lm_head" });
++    for (0..wt.layers_n) |layer| {
++        for (fp8_shared) |part| try kept.append(.{ .string = try std.fmt.allocPrint(a, "model.language_model.layers.{d}.{s}", .{ layer, part }) });
++        for (if (wt.linearLayer(layer)) fp8_linear else fp8_attention) |part| {
++            try kept.append(.{ .string = try std.fmt.allocPrint(a, "model.language_model.layers.{d}.{s}", .{ layer, part }) });
++        }
++    }
++    var block: std.json.Array = .init(a);
++    for (0..2) |_| try block.append(.{ .integer = 128 });
++    var quant: std.json.ObjectMap = .empty;
++    try quant.put(a, "quant_method", .{ .string = "fp8" });
++    try quant.put(a, "activation_scheme", .{ .string = "dynamic" });
++    try quant.put(a, "weight_per_tensor", .{ .bool = false });
++    try quant.put(a, "weight_block_size", .{ .array = block });
++    try quant.put(a, "modules_to_not_convert", .{ .array = kept });
++    try std.testing.expect(fp8Mismatch(text, quant) == null);
++    try std.testing.expect(Mode.fp8.stored() and Mode.modelopt.stored() and !Mode.affine.stored());
++    try quant.put(a, "weight_per_tensor", .{ .bool = true });
++    try std.testing.expectEqualStrings("quantization_config.weight_per_tensor", fp8Mismatch(text, quant).?);
++    try quant.put(a, "weight_per_tensor", .{ .bool = false });
++    block.items[1] = .{ .integer = 64 };
++    try quant.put(a, "weight_block_size", .{ .array = block });
++    try std.testing.expectEqualStrings("quantization_config.weight_block_size", fp8Mismatch(text, quant).?);
++    block.items[1] = .{ .integer = 128 };
++    try quant.put(a, "weight_block_size", .{ .array = block });
++    // a routed expert left BF16, or a projection the loaders read as BF16 converted, is named
++    try kept.append(.{ .string = "model.language_model.layers.9.mlp.experts.3.down_proj" });
++    try quant.put(a, "modules_to_not_convert", .{ .array = kept });
++    try std.testing.expectEqualStrings("quantization_config.routed_experts", fp8Mismatch(text, quant).?);
++    _ = kept.pop();
++    const cases = [_]struct { name: []const u8, refused: []const u8 }{
++        .{ .name = "model.language_model.layers.17.mlp.shared_expert.down_proj", .refused = "quantization_config.shared_expert" },
++        .{ .name = "model.language_model.layers.0.linear_attn.in_proj_b", .refused = "quantization_config.attention_projection" },
++        .{ .name = "model.language_model.layers.47.self_attn.indexer.index_qk_proj", .refused = "quantization_config.attention_projection" },
++    };
++    for (cases) |c| {
++        const at = for (kept.items, 0..) |v, i| {
++            if (std.mem.eql(u8, v.string, c.name)) break i;
++        } else unreachable;
++        kept.items[at] = .{ .string = "lm_head" };
++        try quant.put(a, "modules_to_not_convert", .{ .array = kept });
++        try std.testing.expectEqualStrings(c.refused, fp8Mismatch(text, quant) orelse "accepted");
++        kept.items[at] = .{ .string = c.name };
++    }
++    try quant.put(a, "modules_to_not_convert", .{ .array = kept });
++    try text.put(a, "moe_intermediate_size", .{ .integer = 1280 });
++    try std.testing.expectEqualStrings("moe_intermediate_size", fp8Mismatch(text, quant).?);
++}
+diff --git a/zig/src/families/flashnext/cuda_fp8_experts_load.zig b/zig/src/families/flashnext/cuda_fp8_experts_load.zig
+index 0c4a0cf94..f6a8e7ecb 100644
+--- a/zig/src/families/flashnext/cuda_fp8_experts_load.zig
++++ b/zig/src/families/flashnext/cuda_fp8_experts_load.zig
+@@ -1,4 +1,4 @@
+-//! The MTP head's block-FP8 routed experts: E4M3 weights, BF16 128x128 weight_scale_inv, packed for Fp8Experts (W8A16).
++//! Block-FP8 routed experts: E4M3 weights, BF16 128x128 weight_scale_inv, packed for Fp8Experts (W8A16).
+ const std = @import("std");
+ const core = @import("core");
+ const cuda = @import("cuda");
+@@ -25,11 +25,11 @@ pub const Shape = struct {
+     }
+ };
+ 
+-/// A layer of `count` experts on one GPU; a rank cut would split the 128-wide scale blocks, so world > 1 is refused.
+-pub fn load(a: std.mem.Allocator, d: *const cuda.Driver, store: anytype, prefix: []const u8, world: usize, dims: usize, width: usize, count: usize) !experts.Owned {
++/// A rank's `own.count` whole experts from `own.first`: no cut inside one, so its 128-wide scale blocks stay whole.
++pub fn load(a: std.mem.Allocator, d: *const cuda.Driver, store: anytype, prefix: []const u8, own: experts.Experts, dims: usize, width: usize) !experts.Owned {
+     defer store.release(); // loadShape's format probe borrowed the first gate weight
+-    if (world != 1) return error.UnevenExpertSplit;
+     const one = try Shape.of(dims, width);
++    const count = own.count;
+     if (count == 0) return error.UnexpectedTensor;
+     const up_total = std.math.mul(usize, count, one.up * 4) catch return error.UnexpectedTensor;
+     const down_total = std.math.mul(usize, count, one.down * 4) catch return error.UnexpectedTensor;
+@@ -47,7 +47,7 @@ pub fn load(a: std.mem.Allocator, d: *const cuda.Driver, store: anytype, prefix:
+     defer a.free(down_words);
+     for (0..count) |i| {
+         const at: Expert = .{ .up = up_words, .down = down_words, .up_scale = up_scale[i * one.up_scale ..][0..one.up_scale], .down_scale = down_scale[i * one.down_scale ..][0..one.down_scale] };
+-        try packExpert(a, store, prefix, i, dims, width, at);
++        try packExpert(a, store, prefix, own.first + i, dims, width, at);
+         // a failed wait may leave a copy writing `up` or `down`: drain before the errdefers free them (fromHost)
+         up.upload(i * one.up * 4, std.mem.sliceAsBytes(up_words)) catch |e| return drained(d, e);
+         down.upload(i * one.down * 4, std.mem.sliceAsBytes(down_words)) catch |e| return drained(d, e);
+@@ -55,7 +55,7 @@ pub fn load(a: std.mem.Allocator, d: *const cuda.Driver, store: anytype, prefix:
+     var us = try cuda.DeviceBuffer.fromHost(d, std.mem.sliceAsBytes(up_scale));
+     errdefer us.free();
+     const ds = try cuda.DeviceBuffer.fromHost(d, std.mem.sliceAsBytes(down_scale));
+-    return .{ .up = up, .down = down, .up_scale = us, .down_scale = ds, .width = width, .dims = dims, .count = count, .format = .fp8g };
++    return .{ .up = up, .down = down, .up_scale = us, .down_scale = ds, .width = width, .dims = dims, .count = count, .first = own.first, .format = .fp8g };
+ }
+ 
+ fn drained(d: *const cuda.Driver, e: anyerror) anyerror {
+diff --git a/zig/src/families/flashnext/cuda_fp8_experts_load_test.zig b/zig/src/families/flashnext/cuda_fp8_experts_load_test.zig
+index 1ae36e336..cd454b6d6 100644
+--- a/zig/src/families/flashnext/cuda_fp8_experts_load_test.zig
++++ b/zig/src/families/flashnext/cuda_fp8_experts_load_test.zig
+@@ -1,4 +1,4 @@
+-//! Block-FP8 MTP experts on the host: scale widening and packing, world 2 refused, the weight store's load, headFp8.
++//! Block-FP8 experts on the host: scale widening and packing, a rank's whole experts, the weight store's load, headFp8.
+ const std = @import("std");
+ const core = @import("core");
+ const cuda = @import("cuda");
+@@ -106,12 +106,23 @@ const Want = struct {
+     }
+ 
+     fn expectOwned(w: Want, o: experts.Owned) !void {
++        return w.expectExperts(o, 0, count);
++    }
++
++    /// `o` holds the set's experts `first .. first + n`, laid out from its own expert 0.
++    fn expectExperts(w: Want, o: experts.Owned, first: usize, n: usize) !void {
+         try std.testing.expectEqual(cuda.experts.Format.fp8g, o.view().format);
+         try std.testing.expectEqual(@as(usize, width), o.view().width);
+         try std.testing.expectEqual(@as(usize, dims), o.view().dims);
+-        try std.testing.expectEqual(@as(usize, count), o.view().experts);
++        try std.testing.expectEqual(n, o.view().experts);
++        try std.testing.expectEqual(first, o.first);
+         try std.testing.expectEqual(@as(f32, 0), o.view().limit);
+-        for ([_]struct { []const u8, cuda.DeviceBuffer }{ .{ std.mem.sliceAsBytes(w.up), o.up }, .{ std.mem.sliceAsBytes(w.down), o.down }, .{ std.mem.sliceAsBytes(w.up_scale), o.up_scale }, .{ std.mem.sliceAsBytes(w.down_scale), o.down_scale } }) |pair| {
++        for ([_]struct { []const u8, cuda.DeviceBuffer }{
++            .{ std.mem.sliceAsBytes(w.up[first * one.up ..][0 .. n * one.up]), o.up },
++            .{ std.mem.sliceAsBytes(w.down[first * one.down ..][0 .. n * one.down]), o.down },
++            .{ std.mem.sliceAsBytes(w.up_scale[first * 4 ..][0 .. n * 4]), o.up_scale },
++            .{ std.mem.sliceAsBytes(w.down_scale[first * 2 ..][0 .. n * 2]), o.down_scale },
++        }) |pair| {
+             try std.testing.expectEqualSlices(u8, pair[0], @as([*]const u8, @ptrFromInt(pair[1].ptr))[0..pair[1].len]);
+         }
+     }
+@@ -151,16 +162,25 @@ test "Flash Next expert loader: FP8 MTP experts: a hand-built 2-expert set packs
+     try std.testing.expectError(error.UnexpectedTensor, fp8.packExpert(ta, s, "p", 0, dims, width, .{ .up = up, .down = down[1..], .up_scale = &us, .down_scale = &ds }));
+ }
+ 
+-test "Flash Next expert loader: FP8 MTP experts: world 2 is refused before the driver is touched, the format probe's borrow released" {
++test "Flash Next expert loader: FP8 experts: at world 2 each rank loads its own whole experts, packed as at world 1" {
+     const s = try ta.create(Set);
+     defer ta.destroy(s);
+     s.init(1);
++    const want = try Want.init(s);
++    defer want.deinit();
+     Fake.reset();
+     var d = Fake.driver();
+-    // 128 channels cut in two are 32-column whole (Cut accepts them), but each half splits a 128-wide scale block
+-    try std.testing.expectError(error.UnevenExpertSplit, experts.loadShape(ta, &d, s, "language_model.mtp.layers.0.mlp", 2, 0, dims, width, count));
+-    try std.testing.expectError(error.UnevenExpertSplit, experts.loadShape(ta, &d, s, "language_model.mtp.layers.0.mlp", 2, 1, dims, width, count));
+-    try std.testing.expectEqual(@as(usize, 2), s.releases);
++    for (0..2) |rank| {
++        var owned = try experts.loadShape(ta, &d, s, "language_model.mtp.layers.0.mlp", 2, rank, dims, width, count);
++        defer owned.free();
++        try want.expectExperts(owned, rank, count / 2);
++    }
++    try std.testing.expectEqual(@as(usize, 0), Fake.live_device);
++    // an expert count the ranks cannot share whole is refused before the store or the driver is touched
++    const releases = s.releases;
++    Fake.reset();
++    try std.testing.expectError(error.UnevenExpertSplit, experts.loadShape(ta, &d, s, "language_model.mtp.layers.0.mlp", 2, 0, dims, width, count + 1));
++    try std.testing.expectEqual(releases, s.releases);
+     for (Fake.calls) |n| try std.testing.expectEqual(@as(usize, 0), n);
+ }
+ 
+diff --git a/zig/src/families/flashnext/cuda_lanes.zig b/zig/src/families/flashnext/cuda_lanes.zig
+index e84feb63b..70d72657e 100644
+--- a/zig/src/families/flashnext/cuda_lanes.zig
++++ b/zig/src/families/flashnext/cuda_lanes.zig
+@@ -26,7 +26,7 @@ pub const captured_head_entries = [_][]const u8{ "_rmsnorm", "_add_streams" };
+ pub fn Namespace(comptime Tri: type) type {
+     return struct {
+         pub const model_type = "qwen4_exp";
+-        pub const formats: []const []const u8 = &.{ "mlx-q4g32", "modelopt-mixed" };
++        pub const formats: []const []const u8 = &.{ "mlx-q4g32", "modelopt-mixed", "fp8-block128" };
+         // the model's window: past 2,048 keys the block indexer picks each row's 512 best blocks of 4 (cuda_batch.zig)
+         pub const default_context: i64 = @intCast(prompt.max_tokens);
+         // a prompt runs on the batched pass in chunks of this many rows, one a prefill_step: no staggered segments
+diff --git a/zig/src/families/flashnext/cuda_lanes_bytes.zig b/zig/src/families/flashnext/cuda_lanes_bytes.zig
+index ba1a163a9..7a6b18f98 100644
+--- a/zig/src/families/flashnext/cuda_lanes_bytes.zig
++++ b/zig/src/families/flashnext/cuda_lanes_bytes.zig
+@@ -13,7 +13,7 @@ pub fn deviceWeightBytes(gpa: std.mem.Allocator, io: std.Io, dir: []const u8) u6
+ pub fn placementWeightBytes(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, world: usize, rank: usize, drafts: bool) !u64 {
+     if ((world != 1 and world != 2) or rank >= world) return error.BadRank;
+     const mode = try config.mode(gpa, io, dir);
+-    if (mode == .modelopt) {
++    if (mode.stored()) {
+         const main = try @import("cuda_rank_memory.zig").estimate(gpa, io, dir, world, rank);
+         // Dense draft projections and vocabulary rows exceed the affine head's estimate.
+         return main + if (drafts and rank == 0) mtp.headBytes(try headFp8(gpa, io, dir)) + (1 << 30) else @as(u64, 0);
+diff --git a/zig/src/families/flashnext/cuda_lanes_explain.zig b/zig/src/families/flashnext/cuda_lanes_explain.zig
+index a71969e72..672f5149a 100644
+--- a/zig/src/families/flashnext/cuda_lanes_explain.zig
++++ b/zig/src/families/flashnext/cuda_lanes_explain.zig
+@@ -4,7 +4,7 @@
+ pub fn open(err: anyerror) ?[]const u8 {
+     return switch (err) {
+         error.FlashNextRanksOverTwo => "Flash Next on CUDA runs on one GPU or at --tp 2 (two ranks): serve with --tp 1 or --tp 2",
+-        error.FlashNextRanksNeedModelopt => "--tp 2 splits Flash Next's ModelOpt checkpoints only; serve this MLX checkpoint on one GPU, without --tp",
++        error.FlashNextRanksNeedModelopt => "--tp 2 splits Flash Next's ModelOpt and block-FP8 checkpoints only; serve this MLX checkpoint on one GPU, without --tp",
+         error.FlashNextRanksOnCapturedGlue => "--tp 2 runs Flash Next's own glue, not a captured set: set TENSORFOLD_CUDA_KERNELS=native, or serve on one GPU",
+         error.BadFlashNextKvPages, error.BadFlashNextPageTest, error.FlashNextPagesUnsupported, error.UnsupportedCheckpoint => explain(err),
+         error.UnsupportedLearningFormat, error.TrainingOnCapturedGlue => explain(err),
+diff --git a/zig/src/families/flashnext/cuda_lanes_load.zig b/zig/src/families/flashnext/cuda_lanes_load.zig
+index 086b217e4..263f98133 100644
+--- a/zig/src/families/flashnext/cuda_lanes_load.zig
++++ b/zig/src/families/flashnext/cuda_lanes_load.zig
+@@ -23,7 +23,7 @@ pub fn open(comptime F: type, gpa: std.mem.Allocator, io: std.Io, ctx: *const cu
+     const chunk = try @import("cuda_chunk.zig").soloRows(try prompt.chunkRows(), o.one_stream and o.tp == 1);
+     _ = try @import("cuda_modelopt_threads.zig").configured(); // TF_FLASHNEXT_LOAD_THREADS, refused before any load
+     const mode = try config.mode(gpa, io, dir);
+-    if (o.tp != 1 and mode != .modelopt) return error.FlashNextRanksNeedModelopt;
++    if (o.tp != 1 and !mode.stored()) return error.FlashNextRanksNeedModelopt;
+     if (o.tp != 1 and captured != null) return error.FlashNextRanksOnCapturedGlue;
+     if (o.slide and (mode != .affine or o.tp != 1)) return error.UnsupportedLearningFormat;
+     if (o.slide and captured != null) return error.TrainingOnCapturedGlue;
+diff --git a/zig/src/families/flashnext/cuda_modelopt_experts.zig b/zig/src/families/flashnext/cuda_modelopt_experts.zig
+index 7bae50f6c..9b05e8f1e 100644
+--- a/zig/src/families/flashnext/cuda_modelopt_experts.zig
++++ b/zig/src/families/flashnext/cuda_modelopt_experts.zig
+@@ -1,4 +1,4 @@
+-//! Routed experts: NVFP4 (whole experts a rank at --tp), or block FP8 at world 1; the shared expert keeps its format.
++//! Routed experts, whole ones a rank at --tp: NVFP4 or block FP8; the shared expert keeps its format.
+ const std = @import("std");
+ const core = @import("core");
+ const cuda = @import("cuda");
+@@ -85,7 +85,7 @@ pub fn loadShape(a: std.mem.Allocator, d: *const cuda.Driver, store: anytype, pr
+     const own = try Experts.init(count, world, rank);
+     if (dims == 0 or dims % 32 != 0 or count == 0) return error.UnexpectedTensor;
+     // F8_E4M3 weights load in their own loop; U8 (NVFP4) goes on to the threaded or one-expert paths below
+-    if (try formatOf(store, prefix) == .fp8g) return fp8.load(a, d, store, prefix, world, dims, full_width, count);
++    if (try formatOf(store, prefix) == .fp8g) return fp8.load(a, d, store, prefix, own, dims, full_width);
+     // one GPU and the weight store: packed on threads (cuda_modelopt_threads.zig); other readers or 1 thread: this loop
+     if (comptime @typeInfo(@TypeOf(store)).pointer.child == wt.Store) {
+         const n = try threads.configured();
+diff --git a/zig/src/families/flashnext/cuda_moe_native.zig b/zig/src/families/flashnext/cuda_moe_native.zig
+index 5498da8e0..9e7706150 100644
+--- a/zig/src/families/flashnext/cuda_moe_native.zig
++++ b/zig/src/families/flashnext/cuda_moe_native.zig
+@@ -9,7 +9,6 @@ const exchange = @import("cuda_moe_exchange.zig");
+ const Kernels = @import("cuda_batch_kernels.zig").Kernels;
+ 
+ const dims = wt.dims;
+-const experts_n = wt.experts_n;
+ const slots = wt.slots;
+ 
+ /// moeBlockKeep's native layer: each routed pair's fp32 row into y [pairs, dims], the shared slot's on rank 0.
+@@ -31,7 +30,7 @@ pub fn run(self: anytype, native: *const mixed.Owned, n: usize, pairs: usize, pl
+             try nvfp4_tile.run(self.k, pt, self.stream, .up, .{ .x = s.mixed, .stride = dims, .slots = slots }, owned.view(), plan, s.moe_act, items, skip);
+             try nvfp4_tile.run(self.k, pt, self.stream, .down_f32, .{ .x = s.moe_act, .stride = owned.width }, owned.view(), plan, s.y, items, skip);
+         },
+-        .fp8g => try fp8(self.k, self.stream, s.picks, s.mixed, owned.view(), plan, pairs, n, s.y, s.moe_act),
++        .fp8g => try fp8(self.k, self.stream, picks, s.mixed, owned.view(), plan, pairs, n, s.y, s.moe_act),
+         else => return error.UnsupportedQuantization,
+     }
+     if (side != null) try shared.join(self, side, native, n) else try @import("cuda_shared_split.zig").run(self, native, n);
+@@ -52,14 +51,15 @@ fn ownPicks(self: anytype, picks: u64, out: u64, pairs: usize, first: usize, cou
+     return out;
+ }
+ 
+-/// Block-FP8 pairs (W8A16) at NVFP4's decode/prompt tile: `act` bf16, `out` fp32; the shared slot is skipped.
++/// Block-FP8 pairs (W8A16) at NVFP4's decode/prompt tile: `act` bf16, `out` fp32; a pick of `layer.experts` is skipped.
+ pub fn fp8(k: *const Kernels, stream: cuda.Stream, picks: u64, x: u64, layer: cuda.experts.Layer, plan: cuda.grouped.Plan, pairs: usize, n: usize, out: u64, act: u64) !void {
+     if (layer.format != .fp8g) return error.UnsupportedQuantization;
+-    const e = experts_n + 1;
++    const e = layer.experts + 1;
++    const skip: i32 = @intCast(layer.experts);
+     const prompt = nvfp4_tile.size(k, n) != 16;
+     const tile: usize = if (prompt) cuda.experts.promptTile(.fp8g) else 16;
+     try k.router.route(stream, picks, pairs, e, tile, plan);
+     const items = cuda.grouped.maxItems(pairs, e, tile);
+-    try k.fp8.run(stream, .up, .{ .x = x, .stride = layer.dims, .slots = slots }, layer, plan, prompt, act, items, experts_n);
+-    try k.fp8.run(stream, .down_f32, .{ .x = act, .stride = layer.width }, layer, plan, prompt, out, items, experts_n);
++    try k.fp8.run(stream, .up, .{ .x = x, .stride = layer.dims, .slots = slots }, layer, plan, prompt, act, items, skip);
++    try k.fp8.run(stream, .down_f32, .{ .x = act, .stride = layer.width }, layer, plan, prompt, out, items, skip);
+ }
+diff --git a/zig/src/families/flashnext/cuda_rank_memory.zig b/zig/src/families/flashnext/cuda_rank_memory.zig
+index bad76b127..da1cc3237 100644
+--- a/zig/src/families/flashnext/cuda_rank_memory.zig
++++ b/zig/src/families/flashnext/cuda_rank_memory.zig
+@@ -39,7 +39,10 @@ fn tensorBytes(name: []const u8, e: Entry, world: usize, rank: usize, split: boo
+     if (rank != 0 and std.mem.indexOf(u8, name, ".mlp.shared_expert.") != null) return 0;
+     if (std.mem.indexOf(u8, name, ".mlp.experts.") != null) {
+         if (std.mem.endsWith(u8, name, ".weight_scale_2")) return bytes;
++        // block FP8: a rank's whole experts keep their E4M3 bytes, and their BF16 block scales widen to f32
++        if (std.mem.endsWith(u8, name, ".weight_scale_inv")) return bytes * 2 / world;
+         if (!std.mem.endsWith(u8, name, ".weight")) return 0;
++        if (e.dtype == .f8_e4m3) return if (e.rank == 2 and bytes % world == 0) bytes / world else error.UnexpectedTensor;
+         if (e.dtype != .u8 or e.rank != 2 or bytes % (8 * world) != 0) return error.UnexpectedTensor;
+         // NVFP4 device blocks hold 128 code words and 16 scale words; a rank's whole experts average bytes / world.
+         return try std.math.mul(u64, bytes / (8 * world), 9);
+@@ -69,6 +72,14 @@ test "rank estimates partition routed storage while retaining replicated and ran
+     const name = "model.language_model.layers.0.mlp.experts.0.gate_proj.weight";
+     try std.testing.expectEqual(@as(u64, cuda.experts.Nvfp4Experts.bytes(1, 320, 2560, 1)), try tensorBytes(name, e, 2, 0, false));
+     try std.testing.expectEqual(try tensorBytes(name, e, 2, 0, false), try tensorBytes(name, e, 2, 1, false));
++    // block FP8: a rank's half of the experts keeps its E4M3 bytes, and the BF16 block scales widen to f32
++    const fp8: Entry = .{ .dtype = .f8_e4m3, .rank = 2, .shape = .{ 640, 2560, 1, 1, 1 }, .begin = 0, .end = 640 * 2560 };
++    const scale: Entry = .{ .dtype = .bf16, .rank = 2, .shape = .{ 5, 20, 1, 1, 1 }, .begin = 0, .end = 5 * 20 * 2 };
++    for (0..2) |rank| {
++        try std.testing.expectEqual(@as(u64, 640 * 2560 / 2), try tensorBytes(name, fp8, 2, rank, false));
++        try std.testing.expectEqual(@as(u64, 5 * 20 * 4 / 2), try tensorBytes("model.language_model.layers.0.mlp.experts.0.gate_proj.weight_scale_inv", scale, 2, rank, false));
++    }
++    try std.testing.expectEqual(@as(u64, 640 * 2560), try tensorBytes(name, fp8, 1, 0, false));
+     var shared = e;
+     shared.dtype = .f8_e4m3;
+     shared.shape = .{ 640, 2560, 1, 1, 1 };
+diff --git a/zig/tests/cuda/flashnext_fp8_experts_tests.zig b/zig/tests/cuda/flashnext_fp8_experts_tests.zig
+index 8ec27578b..847aad736 100644
+--- a/zig/tests/cuda/flashnext_fp8_experts_tests.zig
++++ b/zig/tests/cuda/flashnext_fp8_experts_tests.zig
+@@ -1,4 +1,4 @@
+-//! Flash Next's block-FP8 MTP experts at the head's shapes: loader and moe_native.fp8, decode and prompt, vs FP64.
++//! Flash Next's block-FP8 experts: loader and moe_native.fp8, decode and prompt, vs FP64; a rank's half vs one GPU.
+ const std = @import("std");
+ const cuda = @import("cuda");
+ const core = @import("core");
+@@ -164,6 +164,10 @@ pub fn run(gpu: check.Gpu) !void {
+     var owned = try flash.modelopt_experts.loadShape(gpu.gpa, gpu.d, &source, "language_model.mtp.layers.0.mlp", 1, 0, D, NI, experts);
+     defer owned.free();
+     const layer = owned.view();
++    var rank0 = try flash.modelopt_experts.loadShape(gpu.gpa, gpu.d, &source, "language_model.mtp.layers.0.mlp", 2, 0, D, NI, experts);
++    defer rank0.free();
++    var rank1 = try flash.modelopt_experts.loadShape(gpu.gpa, gpu.d, &source, "language_model.mtp.layers.0.mlp", 2, 1, D, NI, experts);
++    defer rank1.free();
+     try check.expect(layer.format == .fp8g and layer.width == NI and layer.dims == D and layer.experts == experts, "the head's experts load as block FP8, {d} x {d}, {d} experts", .{ NI, D, experts });
+     var k = try flash.batch_state.Kernels.load(gpu.d);
+     defer k.deinit();
+@@ -191,6 +195,29 @@ pub fn run(gpu: check.Gpu) !void {
+             for (got_act[p * NI ..][0..NI]) |v| try check.expect(v == 0xffff, "{d} rows: the shared slot's activations untouched", .{rows});
+             for (std.mem.sliceAsBytes(got_y[p * D ..][0..D])) |v| try check.expect(v == 0xff, "{d} rows: the shared slot's down rows untouched", .{rows});
+         };
++        for ([_]*const flash.modelopt_experts.Owned{ &rank0, &rank1 }, 0..) |half, rank| {
++            const local: i32 = @intCast(half.count);
++            const first: i32 = @intCast(half.first);
++            try check.expect(half.count == experts / 2 and half.first == rank * (experts / 2), "rank {d} holds its half of the experts whole", .{rank});
++            // fn_ep_picks' rule: the rank's experts from 0, every other pick (the shared slot too) its skip id
++            const own = try a.alloc(i32, pairs);
++            for (picks, own) |e, *o| o.* = if (e >= first and e < first + local) e - first else local;
++            const rank_act = try r.out(pairs * NI * 2);
++            const rank_y = try r.out(pairs * D * 4);
++            try flash.moe_native.fp8(&k, r.s, try r.dev(std.mem.sliceAsBytes(own)), dx, half.view(), plan, pairs, rows, rank_y, rank_act);
++            const half_act = try r.back(u16, rank_act, pairs * NI);
++            const half_y = try r.back(f32, rank_y, pairs * D);
++            for (own, 0..) |o, p| {
++                const act_bytes = std.mem.sliceAsBytes(half_act[p * NI ..][0..NI]);
++                const y_bytes = std.mem.sliceAsBytes(half_y[p * D ..][0..D]);
++                if (o == local) {
++                    try check.expect(std.mem.allEqual(u8, act_bytes, 0xff) and std.mem.allEqual(u8, y_bytes, 0xff), "{d} rows, rank {d}: another rank's pair untouched", .{ rows, rank });
++                } else {
++                    try check.expect(std.mem.eql(u8, act_bytes, std.mem.sliceAsBytes(got_act[p * NI ..][0..NI])), "{d} rows, rank {d}: its pair's gate-up bytes equal one GPU's", .{ rows, rank });
++                    try check.expect(std.mem.eql(u8, y_bytes, std.mem.sliceAsBytes(got_y[p * D ..][0..D])), "{d} rows, rank {d}: its pair's fp32 down bytes equal one GPU's", .{ rows, rank });
++                }
++            }
++        }
+         const threads = @min(32, @max(1, std.Thread.getCpuCount() catch 1));
+         var refs: [32]Ref = undefined;
+         var handles: [32]?std.Thread = @splat(null);
+@@ -213,5 +240,5 @@ pub fn run(gpu: check.Gpu) !void {
+         try check.expect(bad[1] == 0, "fp8 head experts {s}, {d} rows: fp32 down within FP64 tolerance ({d} outside, worst {d:.3})", .{ path, rows, bad[1], worst[1] });
+         checked += rows * (slots - 1);
+     }
+-    check.pass("flashnext-fp8-experts: 512 block-FP8 experts at {d} x {d} through moe_native.fp8, decode rows 1/3/16 and prompt rows 64/200; {d} routed pairs within FP64 (worst gate-up {d:.3}, down {d:.3} tolerances), the shared slot untouched", .{ NI, D, checked, worst[0], worst[1] });
++    check.pass("flashnext-fp8-experts: 512 block-FP8 experts at {d} x {d} through moe_native.fp8, decode rows 1/3/16 and prompt rows 64/200; {d} routed pairs within FP64 (worst gate-up {d:.3}, down {d:.3} tolerances), the shared slot untouched, and at two ranks each pair's owner writes the one-GPU bytes", .{ NI, D, checked, worst[0], worst[1] });
+ }
+diff --git a/zig/tests/cuda/main_usage.zig b/zig/tests/cuda/main_usage.zig
+index 3022f5a1e..e8c5ab9b2 100644
+--- a/zig/tests/cuda/main_usage.zig
++++ b/zig/tests/cuda/main_usage.zig
+@@ -18,7 +18,7 @@ pub const usage =
+     \\  flashnext-draft-affine    proposal-head affine projection against FP64 and row-count invariance
+     \\  flashnext-shared          separate MXFP8 shared expert and reserved-slot scatter against FP64
+     \\  flashnext-nvfp4-tp        rank-local expert cuts and FP32 partials against FP64 (one GPU)
+-    \\  flashnext-fp8-experts     the MTP head's block-FP8 experts (512 x 640 x 2560) through moe_native.fp8 against FP64
++    \\  flashnext-fp8-experts     block-FP8 experts (512 x 640 x 2560) through moe_native.fp8 against FP64, one rank and two
+     \\  moetile                   whole shared down writes only slot 10 with identical FP32 bytes
+     \\  moetile-contract          shared down replacement gates and the planted control
+     \\  moetile-bench             alternate shared-down plus scatter and direct-slot GPU timings
+diff --git a/zig/tests/fixtures/gradient-serving.tsv b/zig/tests/fixtures/gradient-serving.tsv
+index 34e518d0d..1db4168ba 100644
+--- a/zig/tests/fixtures/gradient-serving.tsv
++++ b/zig/tests/fixtures/gradient-serving.tsv
+@@ -119,7 +119,7 @@ zig/src/families/flashnext/cuda_batch.zig	7fa858c564356e9cc80ee50a86602a5d1c1c3d
+ zig/src/families/flashnext/cuda_batch_state.zig	ae9d16a76aa56cd3448b3414140cbabd2f918bfb69a094b02be82544f371603c	raw	y and moe_f32 take one spare row for a --tp 2 prompt pass's padded rank block; replies unchanged
+ zig/src/families/flashnext/cuda_collective.zig	793d89e979fd6445bf9ae5b4e9b1503f4322ea9022b7eedf34ce816082570c57	raw	adds sumBlock, the in-place FP32 reduce-scatter with sum's peer check, deadline and abort; no served change on its own; collectives on a blocking split of the nonblocking communicator on one host, on the nonblocking communicator across hosts; NCCL_RUNTIME_CONNECT=0 when unset on one host; the same collectives and sums, replies unchanged; #2980
+ zig/src/families/flashnext/cuda_compare_main.zig	ade014dfec88f0b386076cdc093ea20710d7bf36c33ff566ca2caf472064695b	raw	main dfd9ac5ef4 (#2585: the TF_FLASHNEXT_* startup check), c274b45cc1 (the check through the flashnext module)
+-zig/src/families/flashnext/cuda_config.zig	19366ee591270c719fa6f710af0efd4d5a55cfc3e30c923f5ed08771b5c14001	raw
++zig/src/families/flashnext/cuda_config.zig	836bd828bc10439721aca2bfaebc91eccfbdb8d02ae94d59c03e63b028c22a4f	raw	F6: block-FP8 routed experts (Qwen's FP8 release) load a rank's whole experts and are admitted at --tp 2; the NVFP4 and affine paths keep their bytes
+ zig/src/families/flashnext/cuda_draft_affine.zig	2ec22bec1a38a6d2cc7e16a65d41deeb452d1a679661351a473652b5f39f2da8	raw
+ zig/src/families/flashnext/cuda_embed.zig	f52cee06a9bf820554b5443e9278be7bedf3381ff6d2529902b40c6699de4518	raw
+ zig/src/families/flashnext/cuda_embed_main.zig	2b596788cccd420368fe803676e8ad45a4f0bf7a115a6cd8cbde9151cbf1e597	raw
+@@ -129,17 +129,17 @@ zig/src/families/flashnext/cuda_hc.zig	01f897ac65d6edd2cd6ac76d97cb4d96619c25ffa
+ zig/src/families/flashnext/cuda_head.zig	734cc1ccea8e99ce9a061273a2dd3042f32e4848b622b5de616aa4b6f546bdd4	raw	#3749: TF_FLASHNEXT_SHARD_HEAD read through platform/environment.zig, blank as unset
+ zig/src/families/flashnext/cuda_images.zig	5bd8a6c06cb69440522f4392794d9ef52b3760195b97d96f2316b1acac271bd4	raw
+ zig/src/families/flashnext/cuda_images_test.zig	df984d54d9de1bb732544785cddf82a124de2a7019041ed1f7483b2a4a2d7c99	raw
+-zig/src/families/flashnext/cuda_lanes.zig	b72cee919a557e16f001d2c6a7b77602889f6d41a225e0af4736368aff01aee6	raw	main 4f6017ced (marks inside the pass), fbca90714 (shared solo-chunk rule, #2391), 80e0fd72c (#2753: non-finite draft rows refused by name; finite rows unchanged), dfd9ac5ef4 (#2585: TF_FLASHNEXT_* read through platform/environment.zig, malformed text refused at startup; valid values keep their meaning), #1953: the ladder's values through snap_intermediate, #3308 (loader host test updates the named startup-refusal expectations; no runtime edit to this pinned file); #3135 (kept_disk renamed kept_view for the shared kept image; no served change), this change (the page pool opens with the load's device and io, for its arena mapped as pages are used; a new paged stream's first prompt step waits while the arena's thread maps its pieces; paging off: unchanged)
++zig/src/families/flashnext/cuda_lanes.zig	e95c760a89dd5df368ab51fa695020b66d90bac2304d343fa45cb7532396b83f	raw	main 4f6017ced (marks inside the pass), fbca90714 (shared solo-chunk rule, #2391), 80e0fd72c (#2753: non-finite draft rows refused by name; finite rows unchanged), dfd9ac5ef4 (#2585: TF_FLASHNEXT_* read through platform/environment.zig, malformed text refused at startup; valid values keep their meaning), #1953: the ladder's values through snap_intermediate, #3308 (loader host test updates the named startup-refusal expectations; no runtime edit to this pinned file); #3135 (kept_disk renamed kept_view for the shared kept image; no served change), this change (the page pool opens with the load's device and io, for its arena mapped as pages are used; a new paged stream's first prompt step waits while the arena's thread maps its pieces; paging off: unchanged); F6: block-FP8 routed experts (Qwen's FP8 release) load a rank's whole experts and are admitted at --tp 2; the NVFP4 and affine paths keep their bytes
+ zig/src/families/flashnext/cuda_lanes_admission_test.zig	4b8052db793ba81f0e73e1b9bd77b1780bbc4fd550d90976d017da47e76faaa2	raw
+-zig/src/families/flashnext/cuda_lanes_load.zig	7e6bb6ebbdce847fee3e10364fdbb93b16832d77a3bc7435162469dca50e4b2a	raw
+-zig/src/families/flashnext/cuda_lanes_restore_test.zig	f9947521a6d9c7d7380ca1b784a93a43b364c6fa5861cad15efd3538d2b8ceff	raw
+-zig/src/families/flashnext/cuda_launch.zig	f8bebb5ed074e6c8ab8cef667cb01fa2bb1a2b2d6a4d3874a92291390278d9f7	raw	exports cuda_moe_exchange.zig for its device test; no served change; #2837 (Flash Next TP=2 graph replay)
++zig/src/families/flashnext/cuda_lanes_load.zig	e12505bde4ec8f7e343acacda9b6aaebe1219b8ec11d4bf74d8bd8f2ecc2c76b	raw	main dfd9ac5ef4 (#2585: TF_FLASHNEXT_* read through platform/environment.zig, malformed text refused at startup; valid values keep their meaning), #3467: after load a shard drops its page cache except the n-gram ranges, and the sweep reaches nested shards; tensors and replies are unchanged, this change (the load's device and io handed to the page pool's arena; paging off: unchanged); opt-in TF_FLASHNEXT_DECODE_GRAPH no longer refused with the dense split; default serving unchanged; #2972: the first collective waits up to 10 minutes for the peer's load, and a peer that leaves ends the wait within seconds; F6: block-FP8 routed experts (Qwen's FP8 release) load a rank's whole experts and are admitted at --tp 2; the NVFP4 and affine paths keep their bytes
++zig/src/families/flashnext/cuda_lanes_restore_test.zig	5d0ef1cac8d8704676505e50a7e46cc82a71803aadf7018d3da2136fdc71759c	raw	its rig names the collective's parent communicator; test only
++zig/src/families/flashnext/cuda_launch.zig	803795f27570003aeac3f1ee5c40a76d83f76781d4bb676af5c56526cc409171	raw	exports cuda_moe_exchange.zig for its device test; no served change; #2837 (Flash Next TP=2 graph replay); its test block reaches cuda_collective.zig's host tests, no served change
+ zig/src/families/flashnext/cuda_media.zig	394601e8a807f5516f501efcaefa6fb3308f392ee322db7296b11c90814f8eea	raw
+ zig/src/families/flashnext/cuda_media_test.zig	4292f8f7c8f8bf4efd0dfaaa5a6c63e11568f85534127a0ce9feb0ab0be05120	raw
+ zig/src/families/flashnext/cuda_mix.zig	248a2a86b3f377531f5b713c408ba99f73604510f4afe34ffae52615d5863c2c	raw
+ zig/src/families/flashnext/cuda_mixed_experts.zig	d0362f591e98c2d13581ae48fb75fb7391e41558e08119c6e21e3b34c004e503	raw
+ zig/src/families/flashnext/cuda_mlp.zig	8224a28003487487e69eb669be11eaafafdb1ce0bc4c5e57024cef0a6a29e66f	raw
+-zig/src/families/flashnext/cuda_modelopt_experts.zig	de779975629770b33ad5c0ebf9aa6e334f7a98f173a452d2b7c33b50a08d968e	raw
++zig/src/families/flashnext/cuda_modelopt_experts.zig	54c3eb705e952a79ac903c55dd4b70370c3e0df1cab63058664bbcbba55a957a	raw	F6: block-FP8 routed experts (Qwen's FP8 release) load a rank's whole experts and are admitted at --tp 2; the NVFP4 and affine paths keep their bytes
+ zig/src/families/flashnext/cuda_moe.zig	87ba75343c1d228800ed9fcc6d933f1175df172c008e14a8c7a64ff7011bed44	raw
+ zig/src/families/flashnext/cuda_mtp.zig	1349889f35d942b527361f2a62928945885bd42087609368fe8f6bf6f4938a04	raw	main 80e0fd72c (#2753: non-finite draft rows refused by name; finite rows unchanged), dfd9ac5ef4 (#2585: TF_FLASHNEXT_* read through platform/environment.zig, malformed text refused at startup; valid values keep their meaning), #2927
+ zig/src/families/flashnext/cuda_mtp_check.zig	35d9d0ad51171ca2d70a0458f90fe6a04dd5f759fd9f005593c9d1189fb7846d	raw	main dfd9ac5ef4 (#2585: TF_FLASHNEXT_* read through platform/environment.zig, malformed text refused at startup; valid values keep their meaning)
+@@ -161,9 +161,9 @@ zig/src/families/flashnext/cuda_prompt_wt.zig	4885be0ea938cfba80b34fbe9c160d2002
+ zig/src/families/flashnext/cuda_qmm.zig	6d035feb053691cc9750a369c86a5463d41ed942764ad85b861bb628c106dccf	raw
+ zig/src/families/flashnext/cuda_rank_engine.zig	575ebbf4656d8a064a9e1945527a3a12a54a2879f56d2dbfe0f2e51d3014d102	raw
+ zig/src/families/flashnext/cuda_rank_media.zig	e5c268c8cf257934bb49fe401ba6213ea8b108258bbfd4d06edb990d568c3c2b	raw
+-zig/src/families/flashnext/cuda_rank_memory.zig	072954f4e2e9d6ea66124a209d20a1fa1c7ed391e501310d41880f11ce61ada8	raw
+-zig/src/families/flashnext/cuda_rank_wire.zig	79e0af71e788100719baeaedd7bb0c3ce278f542eb4723c4f098a838f931f77f	raw	a control-link wait polls with a 50 us timeout for its first 50 ms, then blocks; how the host waits only, replies unchanged
+-zig/src/families/flashnext/cuda_round_graph.zig	7fa3a54e93c81de36cf3962d0a68eb72a7dd81b8869f47b6d9ed8b9a6cc325cd	raw	main dfd9ac5ef4 (#2585: TF_FLASHNEXT_* read through platform/environment.zig, malformed text refused at startup; valid values keep their meaning)
++zig/src/families/flashnext/cuda_rank_memory.zig	50cb33e3f704f7e5c78e6a5cc5ef3b4a985f718569a4dfa4b3c2829c6f600acc	raw	F6: block-FP8 routed experts (Qwen's FP8 release) load a rank's whole experts and are admitted at --tp 2; the NVFP4 and affine paths keep their bytes
++zig/src/families/flashnext/cuda_rank_wire.zig	53b83cfe5c3cc801ced0cad16e8214fd9f97b342558b992a20b3817df18a9e9a	raw	Link.oneHost: whether both ranks share a host, from the link's two addresses; a control-link wait polls with a 50 us timeout for its first 50 ms, then blocks; how the host waits only, replies unchanged
++zig/src/families/flashnext/cuda_round_graph.zig	152652f54efc8e357c53a9cec3d1cdcb02c1e63e8a184e166391947607c905d4	raw	main dfd9ac5ef4 (#2585: TF_FLASHNEXT_* read through platform/environment.zig, malformed text refused at startup; valid values keep their meaning); #2980
+ zig/src/families/flashnext/cuda_rows.zig	735fc8915036e47d09f533f4e5948e5fc4b61556172ebe2c6bfdaad3e0373216	raw	main dfd9ac5ef4 (#2585: TF_FLASHNEXT_* read through platform/environment.zig, malformed text refused at startup; valid values keep their meaning)
+ zig/src/families/flashnext/cuda_select_main.zig	5c012c2d59fa6dd573424fce7b6d8b162a06cb9f6103530a0fc0b03dbdb17bd3	raw
+ zig/src/families/flashnext/cuda_snap.zig	bbc66ed7e1aed820b4b60c148b1bbe47b2a5c7e7240c7da7f0bd8504080a6b56	raw	main 4f6017ced (prompt cache marks kept inside the pass), #1953: the prompt cache ladder's values

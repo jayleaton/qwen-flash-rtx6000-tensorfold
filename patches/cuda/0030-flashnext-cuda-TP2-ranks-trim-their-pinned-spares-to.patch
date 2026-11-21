@@ -1,0 +1,142 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jay Leaton <58495321+jayleaton@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 13:05:12 +0700
+Subject: [PATCH 30/46] flashnext cuda: TP2 ranks trim their pinned spares
+ together; TF_FLASHNEXT_KEPT picks where kept states go
+
+---
+ docs/environment.md                             |  1 +
+ zig/src/families/flashnext/cuda_lanes_snap.zig  |  1 +
+ zig/src/families/flashnext/cuda_rank_engine.zig | 11 +++++++++++
+ zig/src/families/flashnext/cuda_rank_wire.zig   |  2 +-
+ zig/src/families/flashnext/cuda_snap.zig        |  9 +++++++--
+ zig/src/platform/environment.zig                |  1 +
+ zig/src/platform/environment_flashnext_test.zig |  4 ++--
+ 7 files changed, 24 insertions(+), 5 deletions(-)
+
+diff --git a/docs/environment.md b/docs/environment.md
+index 894b1300e..b3426f83b 100644
+--- a/docs/environment.md
++++ b/docs/environment.md
+@@ -136,6 +136,7 @@ stops the start with the variable, the supplied text and the accepted forms.
+ | `TF_FLASHNEXT_WINDOW_GRAPH` | Exactly `0` or `1`; default on |
+ | `TF_FLASHNEXT_LANE_PARTS` | Exactly `0` or `1`; default on |
+ | `TF_FLASHNEXT_KEEP_INPASS` | Exactly `0` or `1`; default on |
++| `TF_FLASHNEXT_KEPT` | `host` or `device`; default `host` on a discrete card, `device` on an integrated GPU. Where kept prompt states go: `host` is mapped pinned host memory, which `--prompt-cache-gib` then budgets. Give every rank the same value. |
+ | `TF_FLASHNEXT_FIRST_EARLY` | Exactly `0` or `1`; default on |
+ | `TF_FLASHNEXT_GPU_TOPK` | Exactly `0` or `1`; default on |
+ | `TF_FLASHNEXT_GDN_FUSED` | Exactly `0` or `1`; default on |
+diff --git a/zig/src/families/flashnext/cuda_lanes_snap.zig b/zig/src/families/flashnext/cuda_lanes_snap.zig
+index f12ad0690..8c1cb520d 100644
+--- a/zig/src/families/flashnext/cuda_lanes_snap.zig
++++ b/zig/src/families/flashnext/cuda_lanes_snap.zig
+@@ -67,6 +67,7 @@ pub fn Snaps(comptime Cuda: type) type {
+         }
+ 
+         pub fn trim(ptr: *anyopaque, room: u64) void {
++            if (of(ptr).ranks) |r| return r.trimSpares(room);
+             if (of(ptr).engine.keptOn()) |s| s.trim(room);
+         }
+ 
+diff --git a/zig/src/families/flashnext/cuda_rank_engine.zig b/zig/src/families/flashnext/cuda_rank_engine.zig
+index 5a1f080d9..184abe810 100644
+--- a/zig/src/families/flashnext/cuda_rank_engine.zig
++++ b/zig/src/families/flashnext/cuda_rank_engine.zig
+@@ -296,6 +296,15 @@ pub const Session = struct {
+         snaps.drop(s.gpa, s.engine.stream.*, kept);
+     }
+ 
++    /// The prompt cache's trim on every rank: each rank's freed pinned buffers kept to at most `most` bytes.
++    pub fn trimSpares(s: *Session, most: u64) void {
++        const own = s.engine.keptOn() orelse return; // device states: no rank keeps spares
++        own.trim(most);
++        if (s.stopped) return;
++        const h = s.command(.{ .kind = .trim_spares, .arg = most }, &.{}) catch return s.poison();
++        s.ack(h) catch s.poison();
++    }
++
+     pub fn follow(s: *Session, comptime Tri: type, tri: Tri, logits: u64) !void {
+         if (s.rank != 1) return error.BadRank;
+         errdefer s.poison();
+@@ -405,6 +414,7 @@ pub const Session = struct {
+                 const entry = s.saved.fetchRemove(h.object) orelse return error.UnknownRankSnapshot;
+                 snaps.drop(s.gpa, s.engine.stream.*, entry.value);
+             },
++            .trim_spares => if (s.engine.keptOn()) |own| own.trim(h.arg),
+             .stop => return true,
+             else => return error.BadRankFrame,
+         }
+@@ -446,6 +456,7 @@ pub fn shape(h: wire.Header) !void {
+         .save, .restore => if (h.object == 0 or h.arg == 0 or h.bytes != 0 or h.flags != 0) return error.BadRankFrame,
+         .drop_seq, .drop_snap => if (h.object == 0 or h.arg != 0 or h.bytes != 0 or h.flags != 0) return error.BadRankFrame,
+         .stop => if (h.object != 0 or h.arg != 0 or h.bytes != 0 or h.flags != 0) return error.BadRankFrame,
++        .trim_spares => if (h.object != 0 or h.bytes != 0 or h.flags != 0) return error.BadRankFrame,
+         else => return error.BadRankFrame,
+     }
+ }
+diff --git a/zig/src/families/flashnext/cuda_rank_wire.zig b/zig/src/families/flashnext/cuda_rank_wire.zig
+index 27c583af9..ec498c503 100644
+--- a/zig/src/families/flashnext/cuda_rank_wire.zig
++++ b/zig/src/families/flashnext/cuda_rank_wire.zig
+@@ -6,7 +6,7 @@ const p = std.posix;
+ const net = std.Io.net;
+ 
+ pub const max_payload = 1 << 20;
+-pub const Kind = enum(u32) { hello = 1, ready, create, forward, round, drop_seq, save, restore, drop_snap, stop, ack, verify, keep, media, verify_many };
++pub const Kind = enum(u32) { hello = 1, ready, create, forward, round, drop_seq, save, restore, drop_snap, stop, ack, verify, keep, media, verify_many, trim_spares };
+ pub const Header = struct {
+     kind: Kind,
+     sequence: u64 = 0,
+diff --git a/zig/src/families/flashnext/cuda_snap.zig b/zig/src/families/flashnext/cuda_snap.zig
+index 0f56afa01..4be95e4c2 100644
+--- a/zig/src/families/flashnext/cuda_snap.zig
++++ b/zig/src/families/flashnext/cuda_snap.zig
+@@ -77,9 +77,14 @@ pub const layout = struct {
+     }
+ };
+ 
+-/// Whether kept states go to pinned host memory: a discrete card's; an integrated GPU's (GB10) stay in device memory.
++/// Whether kept states go to pinned host memory: TF_FLASHNEXT_KEPT's choice, else a discrete card's, not a GB10's.
+ pub fn onHost(ctx: *const cuda.Context) !bool {
+-    return try ctx.attribute(.integrated) == 0;
++    const auto = 2; // the startup check refused every malformed value already
++    return switch (@import("sys").environment.read(u64, "TF_FLASHNEXT_KEPT", auto) catch auto) {
++        0 => true,
++        1 => false,
++        else => try ctx.attribute(.integrated) == 0,
++    };
+ }
+ 
+ /// `n` bytes of device memory, or (`spares`) mapped pinned host memory the same copies reach, a spare when one fits.
+diff --git a/zig/src/platform/environment.zig b/zig/src/platform/environment.zig
+index 973c53e67..2719d099a 100644
+--- a/zig/src/platform/environment.zig
++++ b/zig/src/platform/environment.zig
+@@ -204,6 +204,7 @@ pub const rules = [_]Rule{
+     .{ .name = "TF_FLASHNEXT_WINDOW_GRAPH", .scope = .flashnext, .kind = .flag, .forms = "0 or 1 (default 1)" },
+     .{ .name = "TF_FLASHNEXT_LANE_PARTS", .scope = .flashnext, .kind = .flag, .forms = "0 or 1 (default 1)" },
+     .{ .name = "TF_FLASHNEXT_KEEP_INPASS", .scope = .flashnext, .kind = .flag, .forms = "0 or 1 (default 1)" },
++    .{ .name = "TF_FLASHNEXT_KEPT", .scope = .flashnext, .kind = .word, .words = &.{ "host", "device" }, .forms = "host or device (default: host on a discrete card, device on an integrated GPU); give every rank the same" },
+     .{ .name = "TF_FLASHNEXT_FIRST_EARLY", .scope = .flashnext, .kind = .flag, .forms = "0 or 1 (default 1)" },
+     .{ .name = "TF_FLASHNEXT_GPU_TOPK", .scope = .flashnext, .kind = .flag, .forms = "0 or 1 (default 1)" },
+     .{ .name = "TF_FLASHNEXT_GDN_FUSED", .scope = .flashnext, .kind = .flag, .forms = "0 or 1 (default 1)" },
+diff --git a/zig/src/platform/environment_flashnext_test.zig b/zig/src/platform/environment_flashnext_test.zig
+index 84865f5ba..def3340f5 100644
+--- a/zig/src/platform/environment_flashnext_test.zig
++++ b/zig/src/platform/environment_flashnext_test.zig
+@@ -33,13 +33,13 @@ fn check(name: []const u8, raw: []const u8, valid: bool) !void {
+     try t.expect(std.mem.endsWith(u8, why.?, e.rule(name).forms));
+ }
+ 
+-test "Flash Next strict env: the table holds all 33 settings: 22 switches, 9 integers, 1 real, 1 structured" {
++test "Flash Next strict env: the table holds all 34 settings: 22 switches, 9 integers, 1 real, 2 structured" {
+     var counts: [4]usize = @splat(0);
+     for (e.rules) |r| if (r.scope == .flashnext) {
+         try t.expect(std.mem.startsWith(u8, r.name, "TF_FLASHNEXT_"));
+         counts[@backingInt(group(r))] += 1;
+     };
+-    try t.expectEqual([4]usize{ 22, 9, 1, 1 }, counts);
++    try t.expectEqual([4]usize{ 22, 9, 1, 2 }, counts);
+ }
+ 
+ test "Flash Next strict env: unset and blank settings both read as the caller's default" {

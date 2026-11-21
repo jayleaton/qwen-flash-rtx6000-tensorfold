@@ -1,0 +1,89 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jay Leaton <58495321+jayleaton@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 17:22:04 +0700
+Subject: [PATCH 42/46] flashnext cuda: a verify window kept whole sends no
+ keep frame; the peer settles it at its next frame
+
+---
+ .../flashnext/cuda_lanes_restore_test.zig     | 21 ++++++++++++-------
+ .../families/flashnext/cuda_rank_engine.zig   | 10 ++++++++-
+ 2 files changed, 23 insertions(+), 8 deletions(-)
+
+diff --git a/zig/src/families/flashnext/cuda_lanes_restore_test.zig b/zig/src/families/flashnext/cuda_lanes_restore_test.zig
+index 615ad748d..e1237c357 100644
+--- a/zig/src/families/flashnext/cuda_lanes_restore_test.zig
++++ b/zig/src/families/flashnext/cuda_lanes_restore_test.zig
+@@ -227,20 +227,27 @@ pub fn Cases(comptime Cuda: type, comptime open: anytype, comptime restore: anyt
+             try run(Cuda, open, restore, drop, false, false, true);
+         }
+ 
+-        test "rank cache save: a follower's window flushes before its copy, and an open one refuses" {
+-            const frames = [_]wire.Header{.{ .kind = .save, .sequence = 1, .object = 1, .arg = 5 }};
++        test "rank cache save: a follower's open window was kept whole, so it settles before its copy" {
++            const frames = [_]wire.Header{
++                .{ .kind = .save, .sequence = 1, .object = 1, .arg = 5 },
++                .{ .kind = .stop, .sequence = 2 },
++            };
+             try follower(Cuda, &frames, struct {
+                 fn setup(_: *prompt.Seq, w: *mtp.Draft) void {
+-                    w.log = w.kc; // flushLate refuses an open window with pending rows before any launch
++                    w.log = w.kc; // the leader sent no keep frame: its pending rows went with the whole window
+                     w.pending = 1;
+                     w.open = true;
+                 }
+             }.setup, struct {
+-                fn check(rank: *ranks.Session, _: *prompt.Seq, _: *mtp.Draft) !void {
+-                    try std.testing.expectEqual(@as(usize, 0), Device.copies);
+-                    try std.testing.expectEqual(@as(u32, 0), rank.saved.count());
++                fn check(rank: *ranks.Session, _: *prompt.Seq, w: *mtp.Draft) !void {
++                    try std.testing.expect(!w.open);
++                    try std.testing.expectEqual(@as(usize, 0), w.pending);
++                    try std.testing.expect(Device.copies > 0);
++                    try std.testing.expectEqual(@as(u32, 1), rank.saved.count());
++                    var it = rank.saved.valueIterator();
++                    while (it.next()) |kept| snap.drop(rank.gpa, rank.engine.stream.*, kept.*);
+                 }
+-            }.check, error.CannotRewind);
++            }.check, null);
+         }
+ 
+         test "rank cache restore: a follower saves, and a restore starts its window over" {
+diff --git a/zig/src/families/flashnext/cuda_rank_engine.zig b/zig/src/families/flashnext/cuda_rank_engine.zig
+index 8fdde16ae..686c0ed7c 100644
+--- a/zig/src/families/flashnext/cuda_rank_engine.zig
++++ b/zig/src/families/flashnext/cuda_rank_engine.zig
+@@ -250,9 +250,10 @@ pub const Session = struct {
+ 
+     pub fn keep(s: *Session, comptime Tri: type, tri: Tri, q: *prompt.Seq, d: *mtp.Draft, count: usize) !void {
+         if (!s.drafting or count == 0 or count > d.rows) return error.CannotRewind;
++        const ops: mtp.Ops(Tri) = .{ .e = s.engine, .tri = tri, .h = undefined };
++        if (count == d.rows) return ops.rollback(q, d, count); // every row kept: the peer settles at its next frame
+         const h = try s.command(.{ .kind = .keep, .object = q.rank_id, .arg = count }, &.{});
+         errdefer s.poison();
+-        const ops: mtp.Ops(Tri) = .{ .e = s.engine, .tri = tri, .h = undefined };
+         try ops.rollback(q, d, count);
+         try s.collective.finish(s.engine.stream.*);
+         try s.ack(h);
+@@ -332,8 +333,14 @@ pub const Session = struct {
+         }
+     }
+ 
++    /// A window the leader kept whole sent no keep frame: its states settle before any other work on the sequence.
++    fn settleKept(s: *Session, id: u64) void {
++        if (s.windows.getPtr(id)) |w| if (s.seqs.get(id)) |q| w.settle(q);
++    }
++
+     fn apply(s: *Session, comptime Tri: type, tri: Tri, logits: u64, h: wire.Header, payload: []const u8) !bool {
+         try shape(h);
++        if (h.kind == .forward or h.kind == .save or h.kind == .restore) s.settleKept(h.object);
+         switch (h.kind) {
+             .create => {
+                 if (s.seqs.contains(h.object)) return error.BadRankFrame;
+@@ -363,6 +370,7 @@ pub const Session = struct {
+                 try roundPayload(payload);
+                 for (0..n) |i| {
+                     seqs[i] = s.seqs.get(std.mem.readInt(u64, payload[i * 12 ..][0..8], .little)) orelse return error.UnknownRankSequence;
++                    s.settleKept(seqs[i].rank_id);
+                     ids[i] = std.mem.readInt(u32, payload[i * 12 + 8 ..][0..4], .little);
+                     if (seqs[i].fed >= seqs[i].cap) return error.UnexpectedTensor;
+                 }

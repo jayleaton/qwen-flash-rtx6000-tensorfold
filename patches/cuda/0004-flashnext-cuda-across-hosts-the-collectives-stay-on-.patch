@@ -1,0 +1,242 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Scott Biggart <swbiggart@users.noreply.github.com>
+Date: Wed, 11 Nov 2026 14:07:58 -0800
+Subject: [PATCH 04/46] flashnext cuda: across hosts the collectives stay on
+ the nonblocking communicator; one host keeps the blocking split
+
+---
+ .../families/flashnext/cuda_collective.zig    | 42 +++++++++++-----
+ zig/src/families/flashnext/cuda_rank_wire.zig | 48 +++++++++++++++++++
+ zig/tests/cuda/flashnext_rank_tests.zig       |  5 +-
+ zig/tests/fixtures/gradient-serving.tsv       |  4 +-
+ 4 files changed, 82 insertions(+), 17 deletions(-)
+
+diff --git a/zig/src/families/flashnext/cuda_collective.zig b/zig/src/families/flashnext/cuda_collective.zig
+index 69e86f331..fc26a5e61 100644
+--- a/zig/src/families/flashnext/cuda_collective.zig
++++ b/zig/src/families/flashnext/cuda_collective.zig
+@@ -1,4 +1,4 @@
+-//! One two-rank NCCL owner: a nonblocking communicator bounds start-up; its blocking split carries the collectives.
++//! One two-rank NCCL owner: nonblocking start-up under a deadline; on one host a blocking split runs the collectives.
+ const std = @import("std");
+ const builtin = @import("builtin");
+ const cuda = @import("cuda");
+@@ -17,7 +17,7 @@ const Advanced = struct {
+ pub const Collective = struct {
+     lib: nccl.Library,
+     api: Advanced,
+-    comm: nccl.Comm = null, // the blocking split every collective uses once init returns
++    comm: nccl.Comm = null, // the collectives' communicator: the blocking split on one host, else the parent
+     parent: nccl.Comm = null, // the nonblocking start-up communicator, whose connections `comm` shares
+     link: wire.Link,
+     timeout_ms: u64,
+@@ -27,8 +27,9 @@ pub const Collective = struct {
+     /// `link` has completed the source/settings handshake; it stays owned by the caller.
+     pub fn init(link: wire.Link, rank: usize, timeout_ms: u64) !Collective {
+         if (rank > 1 or timeout_ms == 0) return error.BadRank;
+-        // every connection is made inside the bounded init and split, none by a collective; an operator's value stands
+-        _ = env.setenv("NCCL_RUNTIME_CONNECT", "0", 0);
++        const one_host = try link.oneHost();
++        // one host: connections are made in the bounded init and split, none by a collective; an operator's value wins
++        if (one_host) _ = env.setenv("NCCL_RUNTIME_CONNECT", "0", 0);
+         var c: Collective = .{ .lib = try nccl.Library.open(), .api = undefined, .link = link, .timeout_ms = timeout_ms, .rank = rank };
+         errdefer c.lib.close();
+         try c.lib.requireSupportedVersion();
+@@ -43,16 +44,17 @@ pub const Collective = struct {
+             try link.send(std.mem.asBytes(&id), until);
+         } else try link.receive(std.mem.asBytes(&id), until);
+         errdefer c.abort();
+-        try c.connect(id, until);
++        try c.connect(id, until, one_host);
+         cuda.p2p_report.afterInit(&diag, .{ .lib = &c.lib, .comm = c.comm }); // no driver here: no probe
+         return c;
+     }
+ 
+-    /// The parent shares its connections, so its split, which the collectives use, connects nothing of its own.
+-    fn connect(c: *Collective, id: nccl.UniqueId, until: u64) !void {
+-        var config: nccl.Config = .{ .split_share = 1 };
++    /// One host: the parent shares its connections with a blocking split for the collectives; across hosts it runs them
++    fn connect(c: *Collective, id: nccl.UniqueId, until: u64, one_host: bool) !void {
++        var config: nccl.Config = if (one_host) .{ .split_share = 1 } else .{};
+         try c.submitted(c.api.ncclCommInitRankConfig(&c.comm, 2, id, @intCast(c.rank), &config));
+         try c.wait(null, until);
++        if (!one_host) return;
+         var child: nccl.Comm = null;
+         errdefer {
+             c.abort(); // the parent first: it stops the split and joins it, after which NCCL has stored the child
+@@ -262,7 +264,7 @@ test "a nonblocking parent that shares its connections hands the collectives to
+         var c = try rig(&pair, 1000);
+         defer closePair(pair);
+         Fake.reset(&.{ nccl.in_progress, 0, nccl.in_progress, nccl.in_progress, 0 }, returned);
+-        try c.connect(undefined, wire.deadline(1000));
++        try c.connect(undefined, wire.deadline(1000), true);
+         try std.testing.expect(Fake.parent_config.blocking == 0 and Fake.parent_config.split_share == 1);
+         try std.testing.expect(Fake.child_config.blocking == 1 and Fake.color == 0 and Fake.key == 1);
+         try std.testing.expect(c.comm == Fake.child and c.parent == Fake.parent and !c.failed);
+@@ -274,13 +276,27 @@ test "a nonblocking parent that shares its connections hands the collectives to
+     }
+ }
+ 
++test "across hosts the collectives stay on the nonblocking parent with NCCL's default config, and nothing is split" {
++    if (builtin.os.tag == .windows) return error.SkipZigTest;
++    var pair: [2]c_int = undefined;
++    var c = try rig(&pair, 1000);
++    defer closePair(pair);
++    Fake.reset(&.{ nccl.in_progress, 0 }, 0);
++    try c.connect(undefined, wire.deadline(1000), false);
++    const default: nccl.Config = .{};
++    try std.testing.expect(Fake.parent_config.blocking == 0 and Fake.parent_config.split_share == default.split_share);
++    try std.testing.expect(c.comm == Fake.parent and c.parent == null and Fake.color == -1 and !c.failed);
++    c.abort();
++    try Fake.expectAborts(&.{Fake.parent});
++}
++
+ test "a split that fails through its parent's asynchronous error aborts the parent, then the child NCCL returned" {
+     if (builtin.os.tag == .windows) return error.SkipZigTest;
+     var pair: [2]c_int = undefined;
+     var c = try rig(&pair, 1000);
+     defer closePair(pair);
+     Fake.reset(&.{ 0, nccl.in_progress, 6 }, 0); // ncclRemoteError
+-    try std.testing.expectError(error.NcclFailed, c.connect(undefined, wire.deadline(1000)));
++    try std.testing.expectError(error.NcclFailed, c.connect(undefined, wire.deadline(1000), true));
+     try Fake.expectAborts(&.{ Fake.parent, Fake.child });
+     try std.testing.expect(c.failed and c.comm == null and c.parent == null);
+ }
+@@ -292,7 +308,7 @@ test "a split still running at its deadline is stopped through the parent within
+     defer closePair(pair);
+     Fake.reset(&.{ 0, nccl.in_progress }, 0);
+     const start = wire.now();
+-    try std.testing.expectError(error.RankTimeout, c.connect(undefined, wire.deadline(1000)));
++    try std.testing.expectError(error.RankTimeout, c.connect(undefined, wire.deadline(1000), true));
+     try std.testing.expect(wire.now() - start < std.time.ns_per_s);
+     try Fake.expectAborts(&.{ Fake.parent, Fake.child });
+     try std.testing.expect(c.failed and c.comm == null and c.parent == null);
+@@ -305,7 +321,7 @@ test "a peer that closes its link during the split surfaces as disconnected, bot
+     defer closePair(pair);
+     Fake.reset(&.{ 0, nccl.in_progress }, 0);
+     Fake.leaves = pair[1];
+-    try std.testing.expectError(error.RankDisconnected, c.connect(undefined, wire.deadline(1000)));
++    try std.testing.expectError(error.RankDisconnected, c.connect(undefined, wire.deadline(1000), true));
+     try Fake.expectAborts(&.{ Fake.parent, Fake.child });
+     try std.testing.expect(c.failed and c.comm == null and c.parent == null);
+ }
+@@ -316,7 +332,7 @@ test "a split NCCL refuses outright aborts the parent and leaves no child" {
+     var c = try rig(&pair, 1000);
+     defer closePair(pair);
+     Fake.reset(&.{0}, 4); // ncclInvalidArgument
+-    try std.testing.expectError(error.NcclFailed, c.connect(undefined, wire.deadline(1000)));
++    try std.testing.expectError(error.NcclFailed, c.connect(undefined, wire.deadline(1000), true));
+     try Fake.expectAborts(&.{Fake.parent});
+     try std.testing.expect(c.failed and c.comm == null and c.parent == null);
+ }
+diff --git a/zig/src/families/flashnext/cuda_rank_wire.zig b/zig/src/families/flashnext/cuda_rank_wire.zig
+index 23fc60e54..b5ac237bc 100644
+--- a/zig/src/families/flashnext/cuda_rank_wire.zig
++++ b/zig/src/families/flashnext/cuda_rank_wire.zig
+@@ -191,8 +191,30 @@ pub const Link = struct {
+             else => return error.RankDisconnected,
+         };
+     }
++
++    /// Whether both ranks run on one host; both ends of the link read the same answer.
++    pub fn oneHost(l: Link) !bool {
++        var local: std.Io.Threaded.PosixAddress = undefined;
++        var peer: std.Io.Threaded.PosixAddress = undefined;
++        var local_len: p.socklen_t = @sizeOf(std.Io.Threaded.PosixAddress);
++        var peer_len: p.socklen_t = @sizeOf(std.Io.Threaded.PosixAddress);
++        if (std.c.getsockname(l.fd, &local.any, &local_len) != 0 or std.c.getpeername(l.fd, &peer.any, &peer_len) != 0) return error.RankLink;
++        return sameHost(&local, &peer);
++    }
+ };
+ 
++/// A Unix socket, a loopback peer, or the same address at both ends of the link.
++pub fn sameHost(local: *const std.Io.Threaded.PosixAddress, peer: *const std.Io.Threaded.PosixAddress) bool {
++    if (peer.any.family == p.AF.UNIX) return true;
++    if (local.any.family != peer.any.family) return false;
++    const loop6 = [16]u8{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 };
++    return switch (peer.any.family) {
++        p.AF.INET => peer.in.addr == local.in.addr or std.mem.toBytes(peer.in.addr)[0] == 127,
++        p.AF.INET6 => std.mem.eql(u8, &peer.in6.addr, &local.in6.addr) or std.mem.eql(u8, &peer.in6.addr, &loop6),
++        else => false,
++    };
++}
++
+ fn socket(family: u32) !p.socket_t {
+     const fd = std.c.socket(family, p.SOCK.STREAM | p.SOCK.NONBLOCK | p.SOCK.CLOEXEC, 0);
+     if (p.errno(fd) != .SUCCESS) return error.RankSocket;
+@@ -220,3 +242,29 @@ test "rank frames are versioned, bounded and exact" {
+     try std.testing.expectError(error.BadRankFrame, Header.decode(&raw));
+     try std.testing.expectError(error.BadRankFrame, (Header{ .kind = .forward, .bytes = max_payload + 1 }).encode());
+ }
++
++test "one host is a Unix socket, a loopback peer or one address at both ends; two addresses are two hosts" {
++    const P = std.Io.Threaded.PosixAddress;
++    const at = struct {
++        fn v4(text: []const u8) P {
++            var out: P = undefined;
++            _ = std.Io.Threaded.addressToPosix(&(net.IpAddress.parse(text, 1) catch unreachable), &out);
++            return out;
++        }
++    }.v4;
++    const a = at("192.0.2.1");
++    const b = at("192.0.2.2");
++    const loop = at("127.0.0.1");
++    const six = at("::1");
++    const other6 = at("fd00::2");
++    try std.testing.expect(!sameHost(&a, &b) and !sameHost(&b, &a));
++    try std.testing.expect(sameHost(&a, &a) and sameHost(&loop, &loop) and sameHost(&a, &loop));
++    try std.testing.expect(sameHost(&six, &six) and !sameHost(&other6, &at("fd00::3")) and !sameHost(&a, &other6));
++    if (builtin.os.tag == .windows) return;
++    var pair: [2]c_int = undefined;
++    try std.testing.expect(std.c.socketpair(p.AF.UNIX, p.SOCK.STREAM, 0, &pair) == 0);
++    defer for (pair) |fd| {
++        _ = std.c.close(fd);
++    };
++    try std.testing.expect(try (Link{ .fd = pair[0] }).oneHost());
++}
+diff --git a/zig/tests/cuda/flashnext_rank_tests.zig b/zig/tests/cuda/flashnext_rank_tests.zig
+index d49ff2471..483887f0e 100644
+--- a/zig/tests/cuda/flashnext_rank_tests.zig
++++ b/zig/tests/cuda/flashnext_rank_tests.zig
+@@ -85,8 +85,9 @@ pub fn run(gpu: check.Gpu, rank: usize, port: u16, mode_arg: []const u8, master:
+     }
+     var probe = try cuda.DeviceBuffer.fromHost(gpu.d, std.mem.asBytes(&@as(f32, 1)));
+     defer probe.free();
++    const one_host = try link.oneHost();
+     const returned = collective.lib.api.ncclAllReduce(probe.ptr, probe.ptr, 1, .f32, .sum, collective.comm, stream.handle);
+-    try check.expect(returned == 0, "rank {d}: a collective returns enqueued, not in progress on NCCL's thread ({d})", .{ rank, returned });
++    try check.expect(returned == 0 or (!one_host and returned == cuda.nccl.in_progress), "rank {d}: a collective returns enqueued on one host, or in progress across hosts ({d})", .{ rank, returned });
+     try collective.finish(stream);
+     for ([_]usize{ 0, 1, 17, 4099, 1_000_003 }, 0..) |count, seq| {
+         const host = try gpu.gpa.alloc(f32, @max(1, count));
+@@ -128,7 +129,7 @@ pub fn run(gpu: check.Gpu, rank: usize, port: u16, mode_arg: []const u8, master:
+         };
+     }
+     try meet(link, rank, 99);
+-    check.pass("rank {d}: a collective returns enqueued; {d} MiB of device memory after the collectives", .{ rank, (before.free -| (try gpu.ctx.memInfo()).free) >> 20 });
++    check.pass("rank {d}: {s}; {d} MiB of device memory after the collectives", .{ rank, if (one_host) "one host: a collective returns enqueued" else "two hosts: collectives on the nonblocking communicator", (before.free -| (try gpu.ctx.memInfo()).free) >> 20 });
+     check.pass("rank {d}: BF16 all-gather preserves every bit and rank column order for empty, scalar, tail and vocabulary-half rows", .{rank});
+     check.pass("rank {d}: two-process chained NCCL FP32 sums exact for empty, scalar, tail and 1,000,003 values; fragmented framed control preserved", .{rank});
+ }
+diff --git a/zig/tests/fixtures/gradient-serving.tsv b/zig/tests/fixtures/gradient-serving.tsv
+index 935685b55..971c98814 100644
+--- a/zig/tests/fixtures/gradient-serving.tsv
++++ b/zig/tests/fixtures/gradient-serving.tsv
+@@ -117,7 +117,7 @@ zig/src/cuda/vit.zig	72c4301251f50d0f25907f0d8ad03a943281b234c506a455e413627a3ff
+ zig/src/families/flashnext/cuda_attn.zig	99dfe79f919a8599490f1cdba0bec20d6e73ccbeafe26d5848419a465fdfa0d0	raw
+ zig/src/families/flashnext/cuda_batch.zig	7fa858c564356e9cc80ee50a86602a5d1c1c3d1ef9ef6d0d69b2ac7a8a4b4e5e	raw	main 42ff6c510f (disk states keyed by the resolved prompt passes; serving unchanged)
+ zig/src/families/flashnext/cuda_batch_state.zig	ae9d16a76aa56cd3448b3414140cbabd2f918bfb69a094b02be82544f371603c	raw	y and moe_f32 take one spare row for a --tp 2 prompt pass's padded rank block; replies unchanged
+-zig/src/families/flashnext/cuda_collective.zig	23b4f9e5689ffc3f51dcef9aad2cd1aed7802a1d2374f68c6dd78c2c41cede87	raw	adds sumBlock, the in-place FP32 reduce-scatter with sum's peer check, deadline and abort; no served change on its own; collectives on a blocking split of the nonblocking communicator, NCCL_RUNTIME_CONNECT=0 when unset; the same collectives and sums, replies unchanged
++zig/src/families/flashnext/cuda_collective.zig	b6ed390e097b38ac44405f1487c2c461d98b3350ff7f4d55f98bd378a274ae13	raw	adds sumBlock, the in-place FP32 reduce-scatter with sum's peer check, deadline and abort; no served change on its own; collectives on a blocking split of the nonblocking communicator on one host, on the nonblocking communicator across hosts; NCCL_RUNTIME_CONNECT=0 when unset on one host; the same collectives and sums, replies unchanged
+ zig/src/families/flashnext/cuda_compare_main.zig	ade014dfec88f0b386076cdc093ea20710d7bf36c33ff566ca2caf472064695b	raw	main dfd9ac5ef4 (#2585: the TF_FLASHNEXT_* startup check), c274b45cc1 (the check through the flashnext module)
+ zig/src/families/flashnext/cuda_config.zig	19366ee591270c719fa6f710af0efd4d5a55cfc3e30c923f5ed08771b5c14001	raw
+ zig/src/families/flashnext/cuda_draft_affine.zig	2ec22bec1a38a6d2cc7e16a65d41deeb452d1a679661351a473652b5f39f2da8	raw
+@@ -162,7 +162,7 @@ zig/src/families/flashnext/cuda_qmm.zig	6d035feb053691cc9750a369c86a5463d41ed942
+ zig/src/families/flashnext/cuda_rank_engine.zig	df6a83bcf80edfd94ac4474dbbc2e73818d40b7532430399af73f2eb95ccfa33	raw
+ zig/src/families/flashnext/cuda_rank_media.zig	e5c268c8cf257934bb49fe401ba6213ea8b108258bbfd4d06edb990d568c3c2b	raw
+ zig/src/families/flashnext/cuda_rank_memory.zig	072954f4e2e9d6ea66124a209d20a1fa1c7ed391e501310d41880f11ce61ada8	raw
+-zig/src/families/flashnext/cuda_rank_wire.zig	ee1ea4202cb6b383e03a3c909d002fbdefb8fee469cae1440714e51291aa30a4	raw
++zig/src/families/flashnext/cuda_rank_wire.zig	b14747f6178a76ae2b974ec9b12515452533725392c422c65ab97c4ccf50144c	raw	Link.oneHost: whether both ranks share a host, from the link's two addresses; framing and waits unchanged
+ zig/src/families/flashnext/cuda_round_graph.zig	7fa3a54e93c81de36cf3962d0a68eb72a7dd81b8869f47b6d9ed8b9a6cc325cd	raw	main dfd9ac5ef4 (#2585: TF_FLASHNEXT_* read through platform/environment.zig, malformed text refused at startup; valid values keep their meaning)
+ zig/src/families/flashnext/cuda_rows.zig	735fc8915036e47d09f533f4e5948e5fc4b61556172ebe2c6bfdaad3e0373216	raw	main dfd9ac5ef4 (#2585: TF_FLASHNEXT_* read through platform/environment.zig, malformed text refused at startup; valid values keep their meaning)
+ zig/src/families/flashnext/cuda_select_main.zig	5c012c2d59fa6dd573424fce7b6d8b162a06cb9f6103530a0fc0b03dbdb17bd3	raw

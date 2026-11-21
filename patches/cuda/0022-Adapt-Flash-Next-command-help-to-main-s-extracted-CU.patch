@@ -1,0 +1,29 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ashhart <71890694+ashhart@users.noreply.github.com>
+Date: Thu, 19 Nov 2026 19:11:43 +0000
+Subject: [PATCH 22/46] Adapt Flash Next command help to main's extracted CUDA
+ usage module
+
+Main e54cb349293035edbf6a2128d6ae3beab9a9a7a4 moved command help
+from cuda/main.zig to cuda/main_usage.zig. Carry the contributor's
+rank and model-rank argument updates to that module while keeping
+every other main command.
+---
+ zig/tests/cuda/main_usage.zig | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/zig/tests/cuda/main_usage.zig b/zig/tests/cuda/main_usage.zig
+index 274f8a560..a1c8fddac 100644
+--- a/zig/tests/cuda/main_usage.zig
++++ b/zig/tests/cuda/main_usage.zig
+@@ -12,8 +12,8 @@ pub const usage =
+     \\  flashnext-windows MODEL IDS_FILE  several streams' windows in one shared verify against each alone
+     \\  flashnext-mtp-parity MODEL IDS_FILE  several streams' MTP heads in one shared pass against each alone
+     \\  flashnext-score MODEL IDS_FILE  decisions' label scores against a plain pass's last row
+-    \\  flashnext-model-rank MODEL RANK PORT IDS_FILE  explicit full-model replay experiment (no drafts)
+-    \\  flashnext-rank RANK PORT [sum|eof|timeout|missing|eof-scatter|timeout-scatter|exchange]  two-process collectives, failures, the expert exchange
++    \\  flashnext-model-rank MODEL RANK PORT IDS_FILE [rounds|leave] [MASTER]  full-model rounds == eager rows; leave: the peer is stopped
++    \\  flashnext-rank RANK PORT [sum|eof|timeout|missing|eof-scatter|timeout-scatter|exchange] [MASTER]  two-process collectives, failures, the expert exchange
+     \\  flashnext-draft-affine    proposal-head affine projection against FP64 and row-count invariance
+     \\  flashnext-shared          separate MXFP8 shared expert and reserved-slot scatter against FP64
+     \\  flashnext-nvfp4-tp        rank-local expert cuts and FP32 partials against FP64 (one GPU)

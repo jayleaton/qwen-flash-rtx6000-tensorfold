@@ -1,0 +1,308 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Scott Biggart <swbiggart@users.noreply.github.com>
+Date: Wed, 11 Nov 2026 05:17:53 -0800
+Subject: [PATCH 17/46] flashnext cuda: the decode round graph keys each lane's
+ buffers, so a drafted window's verify and keep leave it held
+
+A settle swaps a sequence's DeltaNet state buffers with its window's
+spares, and a captured round bakes those addresses in. The round graph's
+key now holds each lane's buffer digest (the one the window graphs key on)
+and capacity, so a settled lane is a new key, and verify, verifyMany and
+rollback no longer clear the graph. launch refuses a pass that carries a
+pocket before it captures anything.
+---
+ zig/src/families/flashnext/cuda_mtp_ops.zig   |   3 -
+ .../families/flashnext/cuda_round_graph.zig   |  29 +---
+ .../flashnext/cuda_round_graph_test.zig       | 141 +++++++++++++++++-
+ zig/tests/fixtures/gradient-serving.tsv       |   4 +-
+ 4 files changed, 146 insertions(+), 31 deletions(-)
+
+diff --git a/zig/src/families/flashnext/cuda_mtp_ops.zig b/zig/src/families/flashnext/cuda_mtp_ops.zig
+index 7f10c6660..5ca063993 100644
+--- a/zig/src/families/flashnext/cuda_mtp_ops.zig
++++ b/zig/src/families/flashnext/cuda_mtp_ops.zig
+@@ -277,7 +277,6 @@ pub fn Ops(comptime Tri: type) type {
+         /// One forward over the window `ids` from seq.fed: each row's scores in d.logits, its streams in d.streams.
+         pub fn verify(o: Self, seq: *prompt.Seq, d: *Draft, ids: []const u32) !void {
+             if (o.main) |m| return m.verify(m.ptr, seq, d, ids);
+-            o.e.round_graph.clear();
+             const n = ids.len;
+             if (n == 0 or n > max_rows) return error.WindowTooWide;
+             if (seq.fed + n > seq.cap) return error.PromptTooLong;
+@@ -303,7 +302,6 @@ pub fn Ops(comptime Tri: type) type {
+                 if (seq.fed + ids.len > seq.cap) return error.PromptTooLong;
+                 if (!d.layout.heads.eql(seq.heads)) return error.DraftHeads;
+             }
+-            o.e.round_graph.clear();
+             const wins = try o.e.gpa.alloc(prompt.Engine.Window, seqs.len);
+             defer o.e.gpa.free(wins);
+             for (seqs, ds, idss, wins) |seq, d, ids, *w| {
+@@ -377,7 +375,6 @@ pub fn Ops(comptime Tri: type) type {
+         /// Keep the window's first `keep` rows (Python forward.commit) from its saved rows; a repeat is a no-op.
+         pub fn rollback(o: Self, seq: *prompt.Seq, d: *Draft, keep: usize) !void {
+             if (o.main) |m| return m.rollback(m.ptr, seq, d, keep);
+-            o.e.round_graph.clear();
+             if (keep == 0 or keep > d.rows) return error.CannotRewind;
+             if (keep == d.rows) return d.settle(seq);
+             if (!d.open) return error.CannotRewind;
+diff --git a/zig/src/families/flashnext/cuda_round_graph.zig b/zig/src/families/flashnext/cuda_round_graph.zig
+index cc70a5388..2ce547282 100644
+--- a/zig/src/families/flashnext/cuda_round_graph.zig
++++ b/zig/src/families/flashnext/cuda_round_graph.zig
+@@ -1,4 +1,4 @@
+-//! A single bounded decode graph, recaptured when sequence owners, scratch or attention geometry change.
++//! A single bounded decode graph, recaptured when sequence owners or buffers, scratch or attention geometry change.
+ const std = @import("std");
+ const cuda = @import("cuda");
+ const Collective = @import("cuda_collective.zig").Collective;
+@@ -11,6 +11,9 @@ pub fn enabled() bool {
+ pub const Key = struct {
+     count: usize,
+     owners: [32]u64 = @splat(0),
++    /// Each lane's buffers (window_graph.pieces): a drafted window's settle swaps its states, so the key moves too.
++    buffers: [32]u64 = @splat(0),
++    caps: [32]u64 = @splat(0),
+     chunks: [32]u32 = @splat(0),
+     score_tiles: [32]u32 = @splat(0),
+     scratch: u64,
+@@ -23,6 +26,8 @@ pub const Key = struct {
+         for (seqs, 0..) |q, i| {
+             if (q.rank_id == 0) return error.UnsupportedRankOperation;
+             key.owners[i] = q.rank_id;
++            key.buffers[i] = @import("cuda_window_graph.zig").pieces(q);
++            key.caps[i] = q.cap;
+             const end = q.fed + 1;
+             key.chunks[i] = @intCast((@min(end, 2051) + 511) / 512);
+             key.score_tiles[i] = if (end / 4 > 512) @intCast(((end + 3) / 4 + 63) / 64) else 0;
+@@ -72,6 +77,8 @@ pub const Cache = struct {
+     pub fn launch(c: *Cache, key: Key, pass: anytype, ids: []const u32) !void {
+         // inside a capture the copy-source owner refuses every host upload, so they all go ahead of it
+         if (!pass.staged) return error.UnexpectedTensor;
++        // the key holds no pocket or its row scales (Engine.taught_rows), so a pass with one is refused
++        if (pass.m.pocket != null) return error.UnexpectedTensor;
+         if (c.key == null or !std.meta.eql(c.key.?, key)) {
+             c.clear();
+             c.stream = pass.stream;
+@@ -95,26 +102,6 @@ pub const Cache = struct {
+     }
+ };
+ 
+-test "decode graph keys invalidate on owner order, attention seams and score tile seams" {
+-    const Seq = struct { rank_id: u64, fed: usize };
+-    var first: Seq = .{ .rank_id = 1, .fed = 10 };
+-    var second: Seq = .{ .rank_id = 2, .fed = 10 };
+-    const base = try Key.init(@as([]const *Seq, &.{ &first, &second }), 1, 2, 3);
+-    try std.testing.expect(!std.meta.eql(base, try Key.init(@as([]const *Seq, &.{ &second, &first }), 1, 2, 3)));
+-    first.fed = 511;
+-    const before = try Key.init(@as([]const *Seq, &.{&first}), 1, 2, 3);
+-    first.fed = 512;
+-    try std.testing.expect(!std.meta.eql(before, try Key.init(@as([]const *Seq, &.{&first}), 1, 2, 3)));
+-    first.fed = 2048;
+-    const dense = try Key.init(@as([]const *Seq, &.{&first}), 1, 2, 3);
+-    first.fed = 2051;
+-    try std.testing.expect(!std.meta.eql(dense, try Key.init(@as([]const *Seq, &.{&first}), 1, 2, 3)));
+-    first.fed = 2303;
+-    const score = try Key.init(@as([]const *Seq, &.{&first}), 1, 2, 3);
+-    first.fed = 2304;
+-    try std.testing.expect(!std.meta.eql(score, try Key.init(@as([]const *Seq, &.{&first}), 1, 2, 3)));
+-}
+-
+ test {
+     if (@import("builtin").os.tag != .windows) _ = @import("cuda_round_graph_test.zig"); // socket pairs are POSIX only
+ }
+diff --git a/zig/src/families/flashnext/cuda_round_graph_test.zig b/zig/src/families/flashnext/cuda_round_graph_test.zig
+index eb8c4f8f5..59780712d 100644
+--- a/zig/src/families/flashnext/cuda_round_graph_test.zig
++++ b/zig/src/families/flashnext/cuda_round_graph_test.zig
+@@ -121,7 +121,7 @@ const Pass = struct {
+     uploads: bool = false,
+     /// The dense split's layer: a BF16 head gather and an FP32 column gather beside the sum.
+     split: bool = false,
+-    m: struct { collective: ?*Collective },
++    m: struct { collective: ?*Collective, pocket: ?*anyopaque = null },
+ 
+     pub fn chunk(p: *Pass, _: []const u32, _: usize, _: ?[]u8) !void {
+         if (p.uploads) try cuda.copy_source.enqueue(p.stream.d, 0x5000, &.{ 1, 2, 3, 4 }, p.stream);
+@@ -133,10 +133,90 @@ const Pass = struct {
+     }
+ };
+ 
++const Buf = struct { ptr: u64 };
++const linear_n = @import("cuda_prompt_wt.zig").linear_n;
++const attn_n = @import("cuda_prompt_wt.zig").attn_n;
++
++/// A sequence's owner, length and the buffer addresses a round's lane takes from it.
++const Seq = struct {
++    rank_id: u64,
++    fed: usize = 10,
++    cap: usize = 1024,
++    conv: [linear_n]Buf = undefined,
++    state: [linear_n]Buf = undefined,
++    kc: [attn_n]Buf = undefined,
++    vc: [attn_n]Buf = undefined,
++    ikc: [attn_n]Buf = undefined,
++    pooled: [attn_n]Buf = undefined,
++    tail: Buf = undefined,
++    pg: @import("cuda_glue.zig").Pg = .{},
++
++    /// `owner`'s sequence whose buffers start at `base`, each the next 64 KiB.
++    fn at(owner: u64, base: u64) Seq {
++        var q: Seq = .{ .rank_id = owner };
++        var a = base;
++        inline for (.{ "conv", "state", "kc", "vc", "ikc", "pooled" }) |f| {
++            for (&@field(q, f)) |*b| {
++                b.ptr = a;
++                a += 0x10000;
++            }
++        }
++        q.tail.ptr = a;
++        return q;
++    }
++
++    /// A drafted window settled whole (Draft.settle): its states and the window's spares change places.
++    fn settle(q: *Seq, spare: *[linear_n]Buf) void {
++        for (&q.state, spare) |*a, *b| std.mem.swap(Buf, a, b);
++    }
++};
++
++fn spares(base: u64) [linear_n]Buf {
++    var s: [linear_n]Buf = undefined;
++    for (&s, 0..) |*b, i| b.ptr = base + i * 0x10000;
++    return s;
++}
++
++fn keyOf(seqs: []const *const Seq) !rg.Key {
++    return rg.Key.init(seqs, 1, 2, 3);
++}
++
+ fn key(owner: u64) !rg.Key {
+-    const Seq = struct { rank_id: u64, fed: usize };
+-    const q: Seq = .{ .rank_id = owner, .fed = 10 };
+-    return rg.Key.init(@as([]const *const Seq, &.{&q}), 1, 2, 3);
++    const q: Seq = .at(owner, owner << 32);
++    return keyOf(&.{&q});
++}
++
++test "decode graph keys: owner order, attention and score tile seams, each lane's buffers and length" {
++    var first: Seq = .at(1, 0x1000_0000);
++    var second: Seq = .at(2, 0x2000_0000);
++    const base = try keyOf(&.{ &first, &second });
++    try t.expectEqual(base, try keyOf(&.{ &first, &second }));
++    try t.expect(!std.meta.eql(base, try keyOf(&.{ &second, &first })));
++    const alone = try keyOf(&.{&first});
++    var spare = spares(0x3000_0000);
++    second.settle(&spare);
++    try t.expect(!std.meta.eql(base, try keyOf(&.{ &first, &second })));
++    // another stream's settled window leaves a round without it on its graph
++    try t.expectEqual(alone, try keyOf(&.{&first}));
++    second.settle(&spare);
++    try t.expectEqual(base, try keyOf(&.{ &first, &second }));
++    second.tail.ptr += 0x100;
++    try t.expect(!std.meta.eql(base, try keyOf(&.{ &first, &second })));
++    second.tail.ptr -= 0x100;
++    second.cap = 2048;
++    try t.expect(!std.meta.eql(base, try keyOf(&.{ &first, &second })));
++    first.fed = 511;
++    const before = try keyOf(&.{&first});
++    first.fed = 512;
++    try t.expect(!std.meta.eql(before, try keyOf(&.{&first})));
++    first.fed = 2048;
++    const dense = try keyOf(&.{&first});
++    first.fed = 2051;
++    try t.expect(!std.meta.eql(dense, try keyOf(&.{&first})));
++    first.fed = 2303;
++    const score = try keyOf(&.{&first});
++    first.fed = 2304;
++    try t.expect(!std.meta.eql(score, try keyOf(&.{&first})));
+ }
+ 
+ /// The same stream can be captured again: no capture is open and the copy guard was released.
+@@ -199,7 +279,7 @@ test "a dense-split round's gathers join its capture, and a clear between rounds
+     for (0..3) |_| try c.launch(try key(1), &p, &.{7});
+     try t.expectEqual([3]usize{ 1, 2, 1 }, [3]usize{ Fake.begins, Fake.captured_gathers, Fake.captured_sums });
+     try t.expectEqual([2]u64{ 1, 2 }, [2]u64{ c.captures, c.replays });
+-    // a drafted window's verify clears the graph ahead of the plain rounds in the same step
++    // a sequence made or dropped clears the graph: the round after it is captured again with its gathers
+     for (0..3) |_| {
+         c.clear();
+         try c.launch(try key(1), &p, &.{7});
+@@ -208,6 +288,57 @@ test "a dense-split round's gathers join its capture, and a clear between rounds
+     try t.expectEqual([2]u64{ 4, 2 }, [2]u64{ c.captures, c.replays });
+ }
+ 
++test "mixed drafted and plain streams: verifies between plain rounds keep their graph; a settled lane is captured anew" {
++    var d = Fake.driver();
++    const previous = enter();
++    defer cuda.copy_source.setCurrent(previous);
++    const stream: cuda.Stream = .{ .d = &d, .handle = @ptrFromInt(1) };
++    var pair: [2]c_int = undefined;
++    var col = try collective(&pair);
++    defer for (pair) |fd| {
++        _ = std.c.close(fd);
++    };
++    var c: rg.Cache = .{};
++    defer c.clear();
++    var p: Pass = .{ .stream = stream, .split = true, .m = .{ .collective = &col } };
++    const plain: Seq = .at(1, 0x1000_0000);
++    var drafted: Seq = .at(2, 0x2000_0000);
++    var spare = spares(0x3000_0000);
++    // each step: the plain stream's round, then the drafted stream's window verified and kept whole
++    for (0..4) |_| {
++        try c.launch(try keyOf(&.{&plain}), &p, &.{7});
++        drafted.settle(&spare);
++    }
++    try t.expectEqual([2]u64{ 1, 3 }, [2]u64{ c.captures, c.replays });
++    // a round that holds the drafted lane: its states moved after each settle, so the graph is recorded again
++    for (0..3) |_| {
++        try c.launch(try keyOf(&.{ &plain, &drafted }), &p, &.{ 7, 8 });
++        try c.launch(try keyOf(&.{ &plain, &drafted }), &p, &.{ 7, 8 });
++        drafted.settle(&spare);
++    }
++    try t.expectEqual([2]u64{ 4, 6 }, [2]u64{ c.captures, c.replays });
++    try t.expectEqual([2]usize{ 4, 4 }, [2]usize{ Fake.begins, Fake.captured_sums });
++    try t.expectEqual(@as(usize, 1), Fake.execs);
++}
++
++test "a decode round whose pass adds a pocket is refused before any capture" {
++    var d = Fake.driver();
++    const previous = enter();
++    defer cuda.copy_source.setCurrent(previous);
++    const stream: cuda.Stream = .{ .d = &d, .handle = @ptrFromInt(1) };
++    var pair: [2]c_int = undefined;
++    var col = try collective(&pair);
++    defer for (pair) |fd| {
++        _ = std.c.close(fd);
++    };
++    var c: rg.Cache = .{};
++    defer c.clear();
++    var p: Pass = .{ .stream = stream, .m = .{ .collective = &col, .pocket = @ptrFromInt(0x10) } };
++    try t.expectError(error.UnexpectedTensor, c.launch(try key(1), &p, &.{7}));
++    try t.expectEqual([2]usize{ 0, 0 }, [2]usize{ Fake.begins, Fake.launches });
++    try t.expect(c.exec == null);
++}
++
+ test "a decode round whose pass uploads inside its capture is refused; its stream and copy guard are released" {
+     var d = Fake.driver();
+     const previous = enter();
+diff --git a/zig/tests/fixtures/gradient-serving.tsv b/zig/tests/fixtures/gradient-serving.tsv
+index 5c5f981eb..a857b650c 100644
+--- a/zig/tests/fixtures/gradient-serving.tsv
++++ b/zig/tests/fixtures/gradient-serving.tsv
+@@ -145,7 +145,7 @@ zig/src/families/flashnext/cuda_mtp.zig	1349889f35d942b527361f2a62928945885bd420
+ zig/src/families/flashnext/cuda_mtp_check.zig	35d9d0ad51171ca2d70a0458f90fe6a04dd5f759fd9f005593c9d1189fb7846d	raw	main dfd9ac5ef4 (#2585: TF_FLASHNEXT_* read through platform/environment.zig, malformed text refused at startup; valid values keep their meaning)
+ zig/src/families/flashnext/cuda_mtp_draft.zig	41628480a1071c4a58a229f5e8b42e26fcd030a046ca6796d2dcb2fedb8daf28	raw	main 80e0fd72c (#2753: non-finite draft rows refused by name; finite rows unchanged), dfd9ac5ef4 (#2585: TF_FLASHNEXT_* read through platform/environment.zig, malformed text refused at startup; valid values keep their meaning), 52479d3036 (#2585: a test of the blank TF_FLASHNEXT_KEEP_LATE reader)
+ zig/src/families/flashnext/cuda_mtp_load.zig	095c8b71f984a7810adb1fb5e6d13da4a9abdc438de08405b4ad82d3f51f56e9	raw
+-zig/src/families/flashnext/cuda_mtp_ops.zig	c6e07580378538c0131fc687003d7559bca8b2318373c1f889ef1a07423ffa3c	raw	main 4b2679bf9 (grouped draft head carries its page table), 4f6017ced, ec76abd45 (reserveRows), 80e0fd72c, c6a337753 (#2753: verify rows checked after one completion wait, non-finite rows refused; finite rows unchanged), #2927
++zig/src/families/flashnext/cuda_mtp_ops.zig	00b0d19c90a30c48d62c85f9b3e45a04d6e7b95ff34a70db623b193248e698da	raw	main 4b2679bf9 (grouped draft head carries its page table), 4f6017ced, ec76abd45 (reserveRows), 80e0fd72c, c6a337753 (#2753: verify rows checked after one completion wait, non-finite rows refused; finite rows unchanged), #2927; a verify and keep leave the opt-in round graph to its key
+ zig/src/families/flashnext/cuda_norms.zig	c6ca7f9c1a9049c0f9d512fe2a38c2672a2e96b5c060d6cec2bca0d39e34bad0	raw
+ zig/src/families/flashnext/cuda_ple.zig	7c4b009de2e44a7c28db56725ed010bbc7e67dff4688640ecf8e22a1cbefeac7	raw	main dfd9ac5ef4 (#2585: TF_FLASHNEXT_* read through platform/environment.zig, malformed text refused at startup; valid values keep their meaning)
+ zig/src/families/flashnext/cuda_ple_check.zig	e8b7cac1e0d3718f106482f6cff7375c0063e1757c46814bd40da435c83ba8ed	raw
+@@ -163,7 +163,7 @@ zig/src/families/flashnext/cuda_rank_engine.zig	df6a83bcf80edfd94ac4474dbbc2e738
+ zig/src/families/flashnext/cuda_rank_media.zig	e5c268c8cf257934bb49fe401ba6213ea8b108258bbfd4d06edb990d568c3c2b	raw
+ zig/src/families/flashnext/cuda_rank_memory.zig	072954f4e2e9d6ea66124a209d20a1fa1c7ed391e501310d41880f11ce61ada8	raw
+ zig/src/families/flashnext/cuda_rank_wire.zig	20980642342b78387f45e3218a419ef07a5c7e99412a88933d1ee4687bf0a679	raw	Link.oneHost: whether both ranks share a host, from the link's two addresses; framing and waits unchanged
+-zig/src/families/flashnext/cuda_round_graph.zig	a58dc1d570c6ce1abbeecd45f82db3c2788c8d55231077315f5bdb3945033b23	raw	main dfd9ac5ef4 (#2585: TF_FLASHNEXT_* read through platform/environment.zig, malformed text refused at startup; valid values keep their meaning); #2980
++zig/src/families/flashnext/cuda_round_graph.zig	937ecd8f82379253bdfcbd7018b0b76ddf7761a31645623fdf00ebafa0563b66	raw	main dfd9ac5ef4 (#2585: TF_FLASHNEXT_* read through platform/environment.zig, malformed text refused at startup; valid values keep their meaning); #2980
+ zig/src/families/flashnext/cuda_rows.zig	735fc8915036e47d09f533f4e5948e5fc4b61556172ebe2c6bfdaad3e0373216	raw	main dfd9ac5ef4 (#2585: TF_FLASHNEXT_* read through platform/environment.zig, malformed text refused at startup; valid values keep their meaning)
+ zig/src/families/flashnext/cuda_select_main.zig	5c012c2d59fa6dd573424fce7b6d8b162a06cb9f6103530a0fc0b03dbdb17bd3	raw
+ zig/src/families/flashnext/cuda_snap.zig	bbc66ed7e1aed820b4b60c148b1bbe47b2a5c7e7240c7da7f0bd8504080a6b56	raw	main 4f6017ced (prompt cache marks kept inside the pass), #1953: the prompt cache ladder's values

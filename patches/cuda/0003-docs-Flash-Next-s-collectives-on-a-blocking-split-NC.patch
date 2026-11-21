@@ -1,0 +1,62 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Scott Biggart <swbiggart@users.noreply.github.com>
+Date: Tue, 10 Nov 2026 17:38:41 -0800
+Subject: [PATCH 03/46] docs: Flash Next's collectives on a blocking split,
+ NCCL_RUNTIME_CONNECT and the measured decode
+
+The two-rank recipe says how start-up stays bounded and what NCCL_RUNTIME_CONNECT=1 would give up; the CUDA recipe's
+transport report names Flash Next with GLM; the changelog and the ledger's tensor-parallel row carry the measurements.
+---
+ docs/optimization-ledger.md     | 1 +
+ docs/recipes/cuda.md            | 8 ++++----
+ docs/recipes/flash-next-cuda.md | 6 ++++++
+ 3 files changed, 11 insertions(+), 4 deletions(-)
+
+diff --git a/docs/optimization-ledger.md b/docs/optimization-ledger.md
+index 128c354be..8b5b32110 100644
+--- a/docs/optimization-ledger.md
++++ b/docs/optimization-ledger.md
+@@ -483,6 +483,7 @@ below; these are estimates for planning a port, not results.
+     | Family | Gain (measured) | Where |
+     | --- | --- | --- |
+     | flashnext (C), TP=2 | prompt passes reduce-scatter the experts' slots by rows: rank 0 sends 5.81 → 3.43 MiB a prompt token, cold prefill +26.5..+26.8 % on two GB10s, +30.9..+33.9 % on two RTX PRO 6000s, same replies | [#2977] |
++    | flashnext (C), TP=2 | collectives on a blocking split: plain decode 28.9 → 73.3 tok/s, drafted code 114 → 211 on 2 × RTX PRO 6000; 2 × GB10 chat −0.1..−2.1 % at one stream, −2.0..−2.9 % at four, code 0..−0.8 % and −0.7..−2.3 %, 8 streams level, cold prompts 0..+0.9 %; same replies | proposed |
+ 
+ 26. **Pipeline stages.** Layer ranges on different nodes, one hidden row a token over Ethernet, so a GB10 and a Mac
+     can serve one model ([#2005]). The stage link and its protocol are [#2012] and [#2060]; the 27B as a stage is
+diff --git a/docs/recipes/cuda.md b/docs/recipes/cuda.md
+index 03453090e..0de6a051f 100644
+--- a/docs/recipes/cuda.md
++++ b/docs/recipes/cuda.md
+@@ -378,10 +378,10 @@ SHM or NET). GLM prints the device and capability facts immediately after NCCL i
+ transfer. The transport comes from NCCL's own INFO log, written to a private temporary file during init and removed
+ when startup diagnostics finish. A line before init names that file; GLM's minute wait warnings repeat its path.
+ The early report leaves capture active through warm-up. Capture is skipped when `NCCL_DEBUG`, `NCCL_DEBUG_SUBSYS`
+-or `NCCL_DEBUG_FILE` is set. NCCL connects peers on first use unless `NCCL_RUNTIME_CONNECT=0`, which GLM sets when
+-unset: GLM reports the transport before warm-up if known, otherwise after warm-up or when the ranks are ready.
+-Nemotron reports it when its ranks are ready, and DeepSeek and Flash Next say `transport not reported` unless a
+-connection was made by then (on DeepSeek the probe makes one). A P2P status other than OK adds one warning naming
++or `NCCL_DEBUG_FILE` is set. NCCL connects peers on first use unless `NCCL_RUNTIME_CONNECT=0`, which GLM and Flash
++Next set when unset: GLM reports the transport before warm-up if known, otherwise after warm-up or when the ranks are
++ready, and Flash Next after NCCL init. Nemotron reports it when its ranks are ready, and DeepSeek says `transport not
++reported` unless a connection was made by then (the probe makes one). A P2P status other than OK adds one warning naming
+ what NVML or CUDA reported.
+ 
+ TensorFold never enables peer access itself; NCCL sets up its own peers. The report changes no driver, BIOS or IOMMU
+diff --git a/docs/recipes/flash-next-cuda.md b/docs/recipes/flash-next-cuda.md
+index 952c9d1dd..7a8292ddb 100644
+--- a/docs/recipes/flash-next-cuda.md
++++ b/docs/recipes/flash-next-cuda.md
+@@ -44,6 +44,12 @@ tensorfold-native serve nvidia/Qwen3.8-Flash-Next-NVFP4 --tp 2 --rank 0 --master
+ - Each rank sends a digest of every checkpoint byte, cached after the first read (about 2 minutes for this
+   checkpoint's 124 GiB on a GB10), and both wait up to 30 minutes for the other. `TENSORFOLD_CHECKPOINT_SHA256`, when
+   set the same on both ranks, replaces the digest and keeps the wait at a minute.
++- Each rank opens NCCL nonblocking, so its start-up waits on the peer under a 30 s deadline, then splits from it,
++  under a second 30 s deadline, a blocking communicator that shares its connections and carries every collective, so a
++  collective returns once enqueued. The engine sets `NCCL_RUNTIME_CONNECT=0` when it is unset, so NCCL makes every
++  connection inside that bounded start-up and none at a collective's first use; with `NCCL_RUNTIME_CONNECT=1` a first
++  collective could wait on a frozen peer without a bound. `NCCL_COMM_BLOCKING`, when set, overrides both
++  communicators.
+ - `--prompt-cache-gib 0` is required with drafts at `--tp 2`, and `--idle-unload` is refused with `--tp`.
+ - A prompt pass wider than 64 rows reduce-scatters its routed experts' FP32 slots by row halves, sums each rank's
+   rows and gathers the sums: rank 0 sends 3.43 MiB a prompt token over two GB10s' RoCE link instead of 5.81, with the

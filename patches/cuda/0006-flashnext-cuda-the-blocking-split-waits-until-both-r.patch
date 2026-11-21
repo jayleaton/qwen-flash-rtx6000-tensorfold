@@ -1,0 +1,129 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Scott Biggart <swbiggart@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 06:40:00 -0800
+Subject: [PATCH 06/46] flashnext cuda: the blocking split waits until both
+ ranks report one host
+
+---
+ docs/recipes/flash-next-cuda.md               |  2 +-
+ .../families/flashnext/cuda_collective.zig    | 43 ++++++++++++++++++-
+ zig/src/families/flashnext/cuda_rank_wire.zig |  2 +-
+ zig/tests/fixtures/gradient-serving.tsv       |  4 +-
+ 4 files changed, 46 insertions(+), 5 deletions(-)
+
+diff --git a/docs/recipes/flash-next-cuda.md b/docs/recipes/flash-next-cuda.md
+index 2c41f914c..5c52557f4 100644
+--- a/docs/recipes/flash-next-cuda.md
++++ b/docs/recipes/flash-next-cuda.md
+@@ -45,7 +45,7 @@ tensorfold-native serve nvidia/Qwen3.8-Flash-Next-NVFP4 --tp 2 --rank 0 --master
+   checkpoint's 124 GiB on a GB10), and both wait up to 30 minutes for the other. `TENSORFOLD_CHECKPOINT_SHA256`, when
+   set the same on both ranks, replaces the digest and keeps the wait at a minute.
+ - Each rank opens NCCL nonblocking, so its start-up waits on the peer under a 30 s deadline. When both ranks run on
+-  one host (the control link's two ends share an address), each then splits from it, under a second 30 s deadline, a
++  one host (both ranks must report it over the link), each then splits from it, under a second 30 s deadline, a
+   blocking communicator that shares its connections and carries every collective, so a collective returns once
+   enqueued; there the engine sets `NCCL_RUNTIME_CONNECT=0` when it is unset, so NCCL makes every connection inside that
+   bounded start-up and none at a collective's first use. Ranks on two hosts run their collectives on the nonblocking
+diff --git a/zig/src/families/flashnext/cuda_collective.zig b/zig/src/families/flashnext/cuda_collective.zig
+index fc26a5e61..95dabe54a 100644
+--- a/zig/src/families/flashnext/cuda_collective.zig
++++ b/zig/src/families/flashnext/cuda_collective.zig
+@@ -27,7 +27,7 @@ pub const Collective = struct {
+     /// `link` has completed the source/settings handshake; it stays owned by the caller.
+     pub fn init(link: wire.Link, rank: usize, timeout_ms: u64) !Collective {
+         if (rank > 1 or timeout_ms == 0) return error.BadRank;
+-        const one_host = try link.oneHost();
++        const one_host = try agreeOneHost(link, rank, try link.oneHost(), wire.deadline(timeout_ms));
+         // one host: connections are made in the bounded init and split, none by a collective; an operator's value wins
+         if (one_host) _ = env.setenv("NCCL_RUNTIME_CONNECT", "0", 0);
+         var c: Collective = .{ .lib = try nccl.Library.open(), .api = undefined, .link = link, .timeout_ms = timeout_ms, .rank = rank };
+@@ -49,6 +49,21 @@ pub const Collective = struct {
+         return c;
+     }
+ 
++    /// Each rank sends its one-host answer over the link before NCCL starts; the split needs both to say one host.
++    fn agreeOneHost(link: wire.Link, rank: usize, mine: bool, until: u64) !bool {
++        const out = [1]u8{@as(u8, @intFromBool(mine))};
++        var peer: [1]u8 = undefined;
++        if (rank == 0) {
++            try link.send(&out, until);
++            try link.receive(&peer, until);
++        } else {
++            try link.receive(&peer, until);
++            try link.send(&out, until);
++        }
++        if (peer[0] > 1) return error.BadRankFrame;
++        return mine and peer[0] == 1;
++    }
++
+     /// One host: the parent shares its connections with a blocking split for the collectives; across hosts it runs them
+     fn connect(c: *Collective, id: nccl.UniqueId, until: u64, one_host: bool) !void {
+         var config: nccl.Config = if (one_host) .{ .split_share = 1 } else .{};
+@@ -290,6 +305,32 @@ test "across hosts the collectives stay on the nonblocking parent with NCCL's de
+     try Fake.expectAborts(&.{Fake.parent});
+ }
+ 
++test "the split needs both ranks to say one host; a disagreeing or malformed answer keeps the nonblocking path" {
++    if (builtin.os.tag == .windows) return error.SkipZigTest;
++    const Case = struct { rank: usize, mine: bool, peer: u8, want: ?bool };
++    const cases = [_]Case{
++        .{ .rank = 0, .mine = true, .peer = 1, .want = true },
++        .{ .rank = 1, .mine = true, .peer = 1, .want = true },
++        .{ .rank = 0, .mine = true, .peer = 0, .want = false },
++        .{ .rank = 1, .mine = false, .peer = 1, .want = false },
++        .{ .rank = 0, .mine = true, .peer = 2, .want = null },
++    };
++    for (cases) |k| {
++        var pair: [2]c_int = undefined;
++        try std.testing.expect(std.c.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0, &pair) == 0);
++        defer closePair(pair);
++        const peer = wire.Link{ .fd = pair[1] };
++        try peer.send(&.{k.peer}, wire.deadline(1000));
++        const got = Collective.agreeOneHost(.{ .fd = pair[0] }, k.rank, k.mine, wire.deadline(1000));
++        if (k.want) |want| try std.testing.expectEqual(want, try got) else try std.testing.expectError(error.BadRankFrame, got);
++        var sent: [1]u8 = undefined;
++        if (k.want != null or k.rank == 0) {
++            try peer.receive(&sent, wire.deadline(1000));
++            try std.testing.expectEqual(@as(u8, @intFromBool(k.mine)), sent[0]);
++        }
++    }
++}
++
+ test "a split that fails through its parent's asynchronous error aborts the parent, then the child NCCL returned" {
+     if (builtin.os.tag == .windows) return error.SkipZigTest;
+     var pair: [2]c_int = undefined;
+diff --git a/zig/src/families/flashnext/cuda_rank_wire.zig b/zig/src/families/flashnext/cuda_rank_wire.zig
+index b5ac237bc..62d0f1017 100644
+--- a/zig/src/families/flashnext/cuda_rank_wire.zig
++++ b/zig/src/families/flashnext/cuda_rank_wire.zig
+@@ -192,7 +192,7 @@ pub const Link = struct {
+         };
+     }
+ 
+-    /// Whether both ranks run on one host; both ends of the link read the same answer.
++    /// Whether this end sees both ranks on one host; the collective splits only when both ends say so.
+     pub fn oneHost(l: Link) !bool {
+         var local: std.Io.Threaded.PosixAddress = undefined;
+         var peer: std.Io.Threaded.PosixAddress = undefined;
+diff --git a/zig/tests/fixtures/gradient-serving.tsv b/zig/tests/fixtures/gradient-serving.tsv
+index 971c98814..c950f91ba 100644
+--- a/zig/tests/fixtures/gradient-serving.tsv
++++ b/zig/tests/fixtures/gradient-serving.tsv
+@@ -117,7 +117,7 @@ zig/src/cuda/vit.zig	72c4301251f50d0f25907f0d8ad03a943281b234c506a455e413627a3ff
+ zig/src/families/flashnext/cuda_attn.zig	99dfe79f919a8599490f1cdba0bec20d6e73ccbeafe26d5848419a465fdfa0d0	raw
+ zig/src/families/flashnext/cuda_batch.zig	7fa858c564356e9cc80ee50a86602a5d1c1c3d1ef9ef6d0d69b2ac7a8a4b4e5e	raw	main 42ff6c510f (disk states keyed by the resolved prompt passes; serving unchanged)
+ zig/src/families/flashnext/cuda_batch_state.zig	ae9d16a76aa56cd3448b3414140cbabd2f918bfb69a094b02be82544f371603c	raw	y and moe_f32 take one spare row for a --tp 2 prompt pass's padded rank block; replies unchanged
+-zig/src/families/flashnext/cuda_collective.zig	b6ed390e097b38ac44405f1487c2c461d98b3350ff7f4d55f98bd378a274ae13	raw	adds sumBlock, the in-place FP32 reduce-scatter with sum's peer check, deadline and abort; no served change on its own; collectives on a blocking split of the nonblocking communicator on one host, on the nonblocking communicator across hosts; NCCL_RUNTIME_CONNECT=0 when unset on one host; the same collectives and sums, replies unchanged
++zig/src/families/flashnext/cuda_collective.zig	45f995f975c01113a04b15d0f83098b92a40b34c3ea24d3c8df9d81e349c9494	raw	adds sumBlock, the in-place FP32 reduce-scatter with sum's peer check, deadline and abort; no served change on its own; collectives on a blocking split of the nonblocking communicator on one host, on the nonblocking communicator across hosts; NCCL_RUNTIME_CONNECT=0 when unset on one host; the same collectives and sums, replies unchanged
+ zig/src/families/flashnext/cuda_compare_main.zig	ade014dfec88f0b386076cdc093ea20710d7bf36c33ff566ca2caf472064695b	raw	main dfd9ac5ef4 (#2585: the TF_FLASHNEXT_* startup check), c274b45cc1 (the check through the flashnext module)
+ zig/src/families/flashnext/cuda_config.zig	19366ee591270c719fa6f710af0efd4d5a55cfc3e30c923f5ed08771b5c14001	raw
+ zig/src/families/flashnext/cuda_draft_affine.zig	2ec22bec1a38a6d2cc7e16a65d41deeb452d1a679661351a473652b5f39f2da8	raw
+@@ -162,7 +162,7 @@ zig/src/families/flashnext/cuda_qmm.zig	6d035feb053691cc9750a369c86a5463d41ed942
+ zig/src/families/flashnext/cuda_rank_engine.zig	df6a83bcf80edfd94ac4474dbbc2e73818d40b7532430399af73f2eb95ccfa33	raw
+ zig/src/families/flashnext/cuda_rank_media.zig	e5c268c8cf257934bb49fe401ba6213ea8b108258bbfd4d06edb990d568c3c2b	raw
+ zig/src/families/flashnext/cuda_rank_memory.zig	072954f4e2e9d6ea66124a209d20a1fa1c7ed391e501310d41880f11ce61ada8	raw
+-zig/src/families/flashnext/cuda_rank_wire.zig	b14747f6178a76ae2b974ec9b12515452533725392c422c65ab97c4ccf50144c	raw	Link.oneHost: whether both ranks share a host, from the link's two addresses; framing and waits unchanged
++zig/src/families/flashnext/cuda_rank_wire.zig	20980642342b78387f45e3218a419ef07a5c7e99412a88933d1ee4687bf0a679	raw	Link.oneHost: whether both ranks share a host, from the link's two addresses; framing and waits unchanged
+ zig/src/families/flashnext/cuda_round_graph.zig	7fa3a54e93c81de36cf3962d0a68eb72a7dd81b8869f47b6d9ed8b9a6cc325cd	raw	main dfd9ac5ef4 (#2585: TF_FLASHNEXT_* read through platform/environment.zig, malformed text refused at startup; valid values keep their meaning)
+ zig/src/families/flashnext/cuda_rows.zig	735fc8915036e47d09f533f4e5948e5fc4b61556172ebe2c6bfdaad3e0373216	raw	main dfd9ac5ef4 (#2585: TF_FLASHNEXT_* read through platform/environment.zig, malformed text refused at startup; valid values keep their meaning)
+ zig/src/families/flashnext/cuda_select_main.zig	5c012c2d59fa6dd573424fce7b6d8b162a06cb9f6103530a0fc0b03dbdb17bd3	raw

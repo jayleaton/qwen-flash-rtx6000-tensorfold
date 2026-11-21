@@ -1,0 +1,223 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Scott Biggart <swbiggart@users.noreply.github.com>
+Date: Tue, 10 Nov 2026 15:43:40 -0800
+Subject: [PATCH 08/46] flashnext cuda: an aborted communicator releases the
+ round graph first
+
+A graph that captured NCCL collectives holds persistent plans, and
+ncclCommAbort waits without a bound until every such graph is destroyed
+(commDestroySync polls localPersistentRefs). With the round graph held
+by the engine, a peer lost during a replay, a capture or between rounds
+would hang the surviving rank in the abort instead of returning
+RankDisconnected or RankTimeout. The cache that captures a
+communicator's collectives now registers a release that the abort runs
+first: it ends an open capture, frees its graph and destroys the
+executable, so NCCL's abort can drain and return.
+---
+ .../families/flashnext/cuda_collective.zig    |  3 +
+ .../flashnext/cuda_lanes_restore_test.zig     |  2 +
+ .../flashnext/cuda_moe_exchange_test.zig      |  1 +
+ .../flashnext/cuda_rank_media_test.zig        |  1 +
+ .../families/flashnext/cuda_round_graph.zig   | 15 +++++
+ .../flashnext/cuda_round_graph_test.zig       | 59 +++++++++++++++++++
+ 6 files changed, 81 insertions(+)
+
+diff --git a/zig/src/families/flashnext/cuda_collective.zig b/zig/src/families/flashnext/cuda_collective.zig
+index 95dabe54a..efa4e4b38 100644
+--- a/zig/src/families/flashnext/cuda_collective.zig
++++ b/zig/src/families/flashnext/cuda_collective.zig
+@@ -23,6 +23,8 @@ pub const Collective = struct {
+     timeout_ms: u64,
+     rank: usize = 0,
+     failed: bool = false,
++    /// Runs first in `abort`: NCCL's abort waits until every graph holding this communicator's plans is destroyed.
++    release: ?struct { ctx: *anyopaque, run: *const fn (*anyopaque) void } = null,
+ 
+     /// `link` has completed the source/settings handshake; it stays owned by the caller.
+     pub fn init(link: wire.Link, rank: usize, timeout_ms: u64) !Collective {
+@@ -86,6 +88,7 @@ pub const Collective = struct {
+     /// The parent first, which stops a split in flight, then the communicator the collectives use.
+     pub fn abort(c: *Collective) void {
+         c.failed = true;
++        if (c.release) |r| r.run(r.ctx);
+         inline for (.{ "parent", "comm" }) |field| if (@field(c, field)) |comm| {
+             _ = c.api.ncclCommAbort(comm);
+             @field(c, field) = null;
+diff --git a/zig/src/families/flashnext/cuda_lanes_restore_test.zig b/zig/src/families/flashnext/cuda_lanes_restore_test.zig
+index 2dd40100c..f57378c48 100644
+--- a/zig/src/families/flashnext/cuda_lanes_restore_test.zig
++++ b/zig/src/families/flashnext/cuda_lanes_restore_test.zig
+@@ -78,6 +78,7 @@ pub fn run(comptime Cuda: type, comptime open: anytype, comptime restore: anytyp
+     try peer.sendHeader(.{ .kind = .ack, .sequence = 2, .object = 1 }, wire.deadline(1000));
+     var rank: ranks.Session = .{ .gpa = a, .rank = 0, .link = .{ .fd = pair[0] }, .collective = undefined, .engine = &engine };
+     rank.collective.failed = false;
++    rank.collective.release = null;
+     var ids = [_]u32{1};
+     var head: mtp.Head = undefined;
+     head.ids = &ids;
+@@ -164,6 +165,7 @@ fn follower(comptime Cuda: type, frames: []const wire.Header, setup: *const fn (
+     for (frames) |h| try leader.sendHeader(h, wire.deadline(1000));
+     var rank: ranks.Session = .{ .gpa = a, .rank = 1, .link = .{ .fd = pair[0] }, .collective = undefined, .engine = &engine, .drafting = true };
+     rank.collective.failed = false;
++    rank.collective.release = null;
+     rank.collective.comm = null;
+     rank.collective.parent = null;
+     defer rank.seqs.deinit(a);
+diff --git a/zig/src/families/flashnext/cuda_moe_exchange_test.zig b/zig/src/families/flashnext/cuda_moe_exchange_test.zig
+index 54da1ea2c..529fe90db 100644
+--- a/zig/src/families/flashnext/cuda_moe_exchange_test.zig
++++ b/zig/src/families/flashnext/cuda_moe_exchange_test.zig
+@@ -79,6 +79,7 @@ fn collective(pair: *[2]c_int, rank: usize, timeout_ms: u64) !Collective {
+     if (std.c.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0, pair) != 0) return error.SocketPair;
+     var c: Collective = undefined;
+     c.failed = false;
++    c.release = null;
+     c.comm = @ptrFromInt(0x1000);
+     c.parent = null;
+     c.link = .{ .fd = pair[0] };
+diff --git a/zig/src/families/flashnext/cuda_rank_media_test.zig b/zig/src/families/flashnext/cuda_rank_media_test.zig
+index 644ab32d6..123e52f59 100644
+--- a/zig/src/families/flashnext/cuda_rank_media_test.zig
++++ b/zig/src/families/flashnext/cuda_rank_media_test.zig
+@@ -91,6 +91,7 @@ fn session(engine: *prompt.Engine, rank: usize, pair: *[2]c_int) !ranks.Session
+     Fake.peer = pair[1];
+     var s: ranks.Session = .{ .gpa = std.testing.allocator, .rank = rank, .link = .{ .fd = pair[0] }, .collective = undefined, .engine = engine };
+     s.collective.failed = false;
++    s.collective.release = null;
+     s.collective.comm = @ptrFromInt(0x1000);
+     s.collective.parent = null;
+     s.collective.link = .{ .fd = pair[0] };
+diff --git a/zig/src/families/flashnext/cuda_round_graph.zig b/zig/src/families/flashnext/cuda_round_graph.zig
+index 3f5a4a9a8..f95d49d2b 100644
+--- a/zig/src/families/flashnext/cuda_round_graph.zig
++++ b/zig/src/families/flashnext/cuda_round_graph.zig
+@@ -1,6 +1,7 @@
+ //! A single bounded decode graph, recaptured when sequence owners, scratch or attention geometry change.
+ const std = @import("std");
+ const cuda = @import("cuda");
++const Collective = @import("cuda_collective.zig").Collective;
+ 
+ pub fn enabled() bool {
+     // the startup check refused every malformed value already, so a plain default stands here
+@@ -33,12 +34,23 @@ pub const Key = struct {
+ pub const Cache = struct {
+     exec: ?cuda.graph.Exec = null,
+     key: ?Key = null,
++    /// The stream the graph captures on and the communicator whose collectives it holds (released before its abort).
++    stream: ?cuda.Stream = null,
++    collective: ?*Collective = null,
+ 
+     pub fn clear(c: *Cache) void {
++        if (c.collective) |col| col.release = null;
+         if (c.exec) |*e| e.deinit();
+         c.* = .{};
+     }
+ 
++    /// Ahead of an abort, which waits for every graph holding the communicator's plans: any capture ended, all freed.
++    fn abandon(ctx: *anyopaque) void {
++        const c: *Cache = @ptrCast(@alignCast(ctx));
++        if (c.stream) |s| discard(s);
++        c.clear();
++    }
++
+     /// An open capture on `stream` ended and its graph freed; an abort may have ended it already.
+     fn discard(stream: cuda.Stream) void {
+         if ((cuda.graph.captureStatus(stream) catch .active) == .none) return;
+@@ -59,6 +71,9 @@ pub const Cache = struct {
+         if (!pass.staged) return error.UnexpectedTensor;
+         if (c.key == null or !std.meta.eql(c.key.?, key)) {
+             c.clear();
++            c.stream = pass.stream;
++            c.collective = pass.m.collective;
++            if (c.collective) |col| col.release = .{ .ctx = c, .run = abandon };
+             try cuda.graph.beginCapture(pass.stream, .thread_local);
+             pass.chunk(ids, 0, null) catch |err| {
+                 discard(pass.stream);
+diff --git a/zig/src/families/flashnext/cuda_round_graph_test.zig b/zig/src/families/flashnext/cuda_round_graph_test.zig
+index 2a7cbed76..ae0e9f93e 100644
+--- a/zig/src/families/flashnext/cuda_round_graph_test.zig
++++ b/zig/src/families/flashnext/cuda_round_graph_test.zig
+@@ -96,6 +96,7 @@ fn collective(pair: *[2]c_int) !Collective {
+     if (std.c.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0, pair) != 0) return error.SocketPair;
+     var c: Collective = undefined;
+     c.failed = false;
++    c.release = null;
+     c.comm = @ptrFromInt(0x1000);
+     c.link = .{ .fd = pair[0] };
+     c.timeout_ms = 1000;
+@@ -156,6 +157,7 @@ test "a decode round's graph: refused unstaged, captured once a key with its sum
+     p.staged = true;
+     try c.launch(try key(1), &p, &.{7});
+     try t.expectEqual([4]usize{ 1, 1, 1, 1 }, [4]usize{ Fake.begins, Fake.instantiates, Fake.launches, Fake.captured_sums });
++    try t.expect(col.release != null);
+     try c.launch(try key(1), &p, &.{8});
+     try t.expectEqual([4]usize{ 1, 1, 2, 1 }, [4]usize{ Fake.begins, Fake.instantiates, Fake.launches, Fake.captured_sums });
+     try c.launch(try key(2), &p, &.{9});
+@@ -163,6 +165,7 @@ test "a decode round's graph: refused unstaged, captured once a key with its sum
+     try t.expectEqual(@as(usize, 1), Fake.execs);
+     c.clear();
+     try t.expectEqual([2]usize{ 0, 0 }, [2]usize{ Fake.execs, Fake.graphs });
++    try t.expect(col.release == null);
+ }
+ 
+ test "a decode round whose pass uploads inside its capture is refused; its stream and copy guard are released" {
+@@ -182,3 +185,59 @@ test "a decode round whose pass uploads inside its capture is refused; its strea
+     try t.expectEqual([2]usize{ 0, 0 }, [2]usize{ Fake.instantiates, Fake.graphs });
+     try expectReleased(stream);
+ }
++
++test "a peer lost after a replayed round: the communicator's abort finds the round's executable destroyed" {
++    var d = Fake.driver();
++    const previous = enter();
++    defer cuda.copy_source.setCurrent(previous);
++    const stream: cuda.Stream = .{ .d = &d, .handle = @ptrFromInt(1) };
++    var pair: [2]c_int = undefined;
++    var col = try collective(&pair);
++    defer _ = std.c.close(pair[0]);
++    var c: rg.Cache = .{};
++    defer c.clear();
++    var p: Pass = .{ .stream = stream, .m = .{ .collective = &col } };
++    try c.launch(try key(1), &p, &.{7});
++    try c.launch(try key(1), &p, &.{8});
++    _ = std.c.close(pair[1]);
++    try t.expectError(error.RankDisconnected, col.finish(stream));
++    try t.expectEqual([3]usize{ 0, 0, 0 }, Fake.at_abort.?);
++    try t.expect(c.exec == null and col.release == null);
++}
++
++test "a peer lost during a round's capture: the capture is ended and its graph freed before the abort" {
++    var d = Fake.driver();
++    const previous = enter();
++    defer cuda.copy_source.setCurrent(previous);
++    const stream: cuda.Stream = .{ .d = &d, .handle = @ptrFromInt(1) };
++    var pair: [2]c_int = undefined;
++    var col = try collective(&pair);
++    defer _ = std.c.close(pair[0]);
++    var c: rg.Cache = .{};
++    defer c.clear();
++    var p: Pass = .{ .stream = stream, .m = .{ .collective = &col } };
++    _ = std.c.close(pair[1]);
++    try t.expectError(error.RankDisconnected, c.launch(try key(1), &p, &.{7}));
++    try t.expectEqual([3]usize{ 0, 0, 0 }, Fake.at_abort.?);
++    try t.expectEqual(@as(usize, 0), Fake.instantiates);
++    try expectReleased(stream);
++}
++
++test "control: a communicator without the release finds the round's executable alive at its abort" {
++    var d = Fake.driver();
++    const previous = enter();
++    defer cuda.copy_source.setCurrent(previous);
++    const stream: cuda.Stream = .{ .d = &d, .handle = @ptrFromInt(1) };
++    var pair: [2]c_int = undefined;
++    var col = try collective(&pair);
++    defer for (pair) |fd| {
++        _ = std.c.close(fd);
++    };
++    var c: rg.Cache = .{};
++    var p: Pass = .{ .stream = stream, .m = .{ .collective = &col } };
++    try c.launch(try key(1), &p, &.{7});
++    col.release = null;
++    col.abort();
++    try t.expectEqual([3]usize{ 0, 1, 0 }, Fake.at_abort.?);
++    c.clear();
++}

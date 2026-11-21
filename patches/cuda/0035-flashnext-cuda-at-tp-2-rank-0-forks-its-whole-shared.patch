@@ -1,0 +1,56 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jay Leaton <58495321+jayleaton@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 22:09:54 +0700
+Subject: [PATCH 35/46] flashnext cuda: at --tp 2 rank 0 forks its whole shared
+ expert onto the side stream too
+
+The shared expert runs whole on rank 0 at --tp 2 unless the dense split cuts it (FP4-Local at TP2, FP8 or NVFP4 with
+TF_FLASHNEXT_SPLIT_DENSE=0). It is local to rank 0 and writes only the shared slot of y, which rank 0 then sums with
+the routed slots as before, so the fork and join keep the bits; it joins before the rank sum. This takes rank 0's
+extra kernel time (X2 measured about 11% over rank 1) off the critical path. A split shared expert still runs in line.
+
+The side stream is upstream's (8efa0f976, Armin); the idea is MiaAI-Lab's patch
+0016-decode-shared-expert-side-stream-and-lane-batched-deltanet (Qwen3.8-Flash-Next-RTX-PRO-6000-TernsorFold 57d815c, MIT).
+---
+ THIRD_PARTY_NOTICES.md                         | 10 ++++++++++
+ zig/src/families/flashnext/cuda_batch_side.zig |  4 ++--
+ 2 files changed, 12 insertions(+), 2 deletions(-)
+
+diff --git a/THIRD_PARTY_NOTICES.md b/THIRD_PARTY_NOTICES.md
+index 7be8b0829..85d6724e7 100644
+--- a/THIRD_PARTY_NOTICES.md
++++ b/THIRD_PARTY_NOTICES.md
+@@ -459,6 +459,16 @@ recipe commit e1f564eb915bb5272474b6c1c527aec3b9ed3de6. It credits TensorFold Co
+ arithmetic and staging design. Copyright (c) 2026 MiaAI-Lab and Copyright (c) 2026 TensorFold contributors.
+ The complete original MIT notices and permission text are retained in [Mia-FlashNext-MIT.txt](LICENSES/Mia-FlashNext-MIT.txt).
+ 
++## MiaAI-Lab Flash Next recipe for one RTX PRO 6000
++
++Changes on the qflash branches taken from MiaAI-Lab's
++[Qwen3.8-Flash-Next-RTX-PRO-6000-TernsorFold](https://github.com/MiaAI-Lab/Qwen3.8-Flash-Next-RTX-PRO-6000-TernsorFold)
++recipe, commit 57d815c2c, whose patches 0001-0025 on TensorFold v1.1.4 are MIT licensed, Copyright (c) 2026 MiaAI-Lab;
++the MIT text is in [Mia-FlashNext-MIT.txt](LICENSES/Mia-FlashNext-MIT.txt). By patch:
++
++- `0016-decode-shared-expert-side-stream-and-lane-batched-deltanet`: the shared expert on a side stream, here also on
++  rank 0 at `--tp 2` (`zig/src/families/flashnext/cuda_batch_side.zig`; the stream itself is upstream's).
++
+ ## Ling-3.0-tiny and Ling-3.1-flash
+ 
+ Ling-3.0-tiny and Ling-3.1-flash are MIT licensed by inclusionAI. The host family package
+diff --git a/zig/src/families/flashnext/cuda_batch_side.zig b/zig/src/families/flashnext/cuda_batch_side.zig
+index 282557604..0cc02a05e 100644
+--- a/zig/src/families/flashnext/cuda_batch_side.zig
++++ b/zig/src/families/flashnext/cuda_batch_side.zig
+@@ -55,10 +55,10 @@ pub fn down(pass: anytype, st: cuda.Stream, input: u64, native: anytype, n: usiz
+     try glue.sharedScatter(st, s.shared_out, s.y, n, dims, slots);
+ }
+ 
+-/// After y is cleared: the shared expert forked onto the side stream (one GPU, not a prompt fill), or null.
++/// After y is cleared: the whole shared expert forked onto rank 0's side stream (not a prompt fill), or null.
+ pub fn fork(pass: anytype, native: anytype, n: usize) !?Side {
+     const x = pass.s.side orelse return null;
+-    if (native.rank != 0 or native.world != 1 or pass.hooks.prompt) return null;
++    if (native.rank != 0 or native.split_shared or pass.hooks.prompt) return null;
+     try x.fork.record(pass.stream);
+     try x.stream.wait(x.fork);
+     try run(pass, x.stream, native, n);

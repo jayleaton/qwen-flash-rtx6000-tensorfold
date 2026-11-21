@@ -1,0 +1,280 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Scott Biggart <swbiggart@users.noreply.github.com>
+Date: Tue, 10 Nov 2026 15:43:32 -0800
+Subject: [PATCH 07/46] flashnext cuda: a captured decode round stages its
+ inputs ahead of the capture
+
+TF_FLASHNEXT_DECODE_GRAPH=1 at --tp 2 failed every first plain round
+with UnownedCaptureSource: Cache.run set only `prepared`, so Pass.chunk
+uploaded the round's token ids through the copy-source owner inside the
+capture, which refuses any host source there. The round now queues its
+ids, positions, lane table and n-gram rows on the stream with
+stageWindow, as the one-GPU shared windows do, then captures or replays
+kernels and collectives alone; an unstaged pass is refused before any
+capture. A replay stages every round's inputs afresh, the lane table
+included.
+---
+ .../families/flashnext/cuda_round_graph.zig   |  40 ++--
+ .../flashnext/cuda_round_graph_test.zig       | 184 ++++++++++++++++++
+ 2 files changed, 204 insertions(+), 20 deletions(-)
+ create mode 100644 zig/src/families/flashnext/cuda_round_graph_test.zig
+
+diff --git a/zig/src/families/flashnext/cuda_round_graph.zig b/zig/src/families/flashnext/cuda_round_graph.zig
+index fdb1cc991..3f5a4a9a8 100644
+--- a/zig/src/families/flashnext/cuda_round_graph.zig
++++ b/zig/src/families/flashnext/cuda_round_graph.zig
+@@ -1,7 +1,6 @@
+ //! A single bounded decode graph, recaptured when sequence owners, scratch or attention geometry change.
+ const std = @import("std");
+ const cuda = @import("cuda");
+-const dims = 2560;
+ 
+ pub fn enabled() bool {
+     // the startup check refused every malformed value already, so a plain default stands here
+@@ -40,32 +39,29 @@ pub const Cache = struct {
+         c.* = .{};
+     }
+ 
+-    /// CPU histories and pinned inputs advance once per round, outside stream capture and replay.
+-    fn prepare(pass: anytype, ids: []const u32) !void {
+-        const s = pass.s;
+-        // a captured round is one row a lane; windows run the plain pass
+-        if (ids.len != pass.lanes.len) return error.UnexpectedTensor;
+-        try s.ready();
+-        for (s.hostIds(ids.len), ids) |*out, token| out.* = @intCast(token);
+-        const positions = s.hostPos(ids.len * 4);
+-        @memset(positions, 0);
+-        for (pass.lanes, 0..) |lane, i| {
+-            positions[i * 4] = @intCast(lane.pos);
+-            try pass.m.ngram.rows(lane.seq.history[0..], ids[i..][0..1], s.hostEmb(ids.len)[i * dims ..][0..dims], s.hostXs(ids.len)[i * (dims / 32) ..][0 .. dims / 32]);
+-        }
++    /// An open capture on `stream` ended and its graph freed; an abort may have ended it already.
++    fn discard(stream: cuda.Stream) void {
++        if ((cuda.graph.captureStatus(stream) catch .active) == .none) return;
++        var graph = cuda.graph.endCapture(stream) catch return;
++        graph.deinit();
+     }
+ 
++    /// A decode round, one row a lane: its inputs queued on the stream first, then `key`'s graph captured or replayed.
+     pub fn run(c: *Cache, key: Key, pass: anytype, ids: []const u32) !void {
+-        try prepare(pass, ids);
++        if (ids.len != pass.lanes.len) return error.UnexpectedTensor;
++        try @import("cuda_window_graph.zig").stageWindow(pass, ids, 0);
++        try c.launch(key, pass, ids);
++    }
++
++    /// A staged round's kernels and collectives as `key`'s graph: captured when the key is new, else replayed.
++    pub fn launch(c: *Cache, key: Key, pass: anytype, ids: []const u32) !void {
++        // inside a capture the copy-source owner refuses every host upload, so they all go ahead of it
++        if (!pass.staged) return error.UnexpectedTensor;
+         if (c.key == null or !std.meta.eql(c.key.?, key)) {
+             c.clear();
+             try cuda.graph.beginCapture(pass.stream, .thread_local);
+-            pass.prepared = true;
+             pass.chunk(ids, 0, null) catch |err| {
+-                if (cuda.graph.endCapture(pass.stream)) |g| {
+-                    var discarded = g;
+-                    discarded.deinit();
+-                } else |_| {}
++                discard(pass.stream);
+                 return err;
+             };
+             var graph = try cuda.graph.endCapture(pass.stream);
+@@ -98,3 +94,7 @@ test "decode graph keys invalidate on owner order, attention seams and score til
+     first.fed = 2304;
+     try std.testing.expect(!std.meta.eql(score, try Key.init(@as([]const *Seq, &.{&first}), 1, 2, 3)));
+ }
++
++test {
++    if (@import("builtin").os.tag != .windows) _ = @import("cuda_round_graph_test.zig"); // socket pairs are POSIX only
++}
+diff --git a/zig/src/families/flashnext/cuda_round_graph_test.zig b/zig/src/families/flashnext/cuda_round_graph_test.zig
+new file mode 100644
+index 000000000..2a7cbed76
+--- /dev/null
++++ b/zig/src/families/flashnext/cuda_round_graph_test.zig
+@@ -0,0 +1,184 @@
++//! The decode round's graph on a counting driver and a faked communicator over a socket pair whose peer can leave.
++const std = @import("std");
++const t = std.testing;
++const cuda = @import("cuda");
++const abi = cuda.abi;
++const nccl = cuda.nccl;
++const rg = @import("cuda_round_graph.zig");
++const Collective = @import("cuda_collective.zig").Collective;
++
++const Fake = struct {
++    var capturing = false;
++    var begins: usize = 0;
++    var instantiates: usize = 0;
++    var launches: usize = 0;
++    var execs: usize = 0;
++    var graphs: usize = 0;
++    var captured_sums: usize = 0;
++    /// What the communicator's abort found: a capture still open, executables and captured graphs still alive.
++    var at_abort: ?[3]usize = null;
++
++    fn reset() void {
++        capturing = false;
++        begins = 0;
++        instantiates = 0;
++        launches = 0;
++        execs = 0;
++        graphs = 0;
++        captured_sums = 0;
++        at_abort = null;
++    }
++    fn begin(_: abi.Stream, _: abi.CaptureMode) callconv(.c) abi.Result {
++        capturing = true;
++        begins += 1;
++        return 0;
++    }
++    fn end(_: abi.Stream, out: *abi.Graph) callconv(.c) abi.Result {
++        capturing = false;
++        graphs += 1;
++        out.* = @ptrFromInt(1);
++        return 0;
++    }
++    fn status(_: abi.Stream, s: *abi.CaptureStatus) callconv(.c) abi.Result {
++        s.* = if (capturing) .active else .none;
++        return 0;
++    }
++    fn instantiate(e: *abi.GraphExec, _: abi.Graph, _: u64) callconv(.c) abi.Result {
++        instantiates += 1;
++        execs += 1;
++        e.* = @ptrFromInt(instantiates);
++        return 0;
++    }
++    fn graphDestroy(_: abi.Graph) callconv(.c) abi.Result {
++        graphs -= 1;
++        return 0;
++    }
++    fn upload(_: abi.GraphExec, _: abi.Stream) callconv(.c) abi.Result {
++        return 0;
++    }
++    fn launch(_: abi.GraphExec, _: abi.Stream) callconv(.c) abi.Result {
++        launches += 1;
++        return 0;
++    }
++    fn execDestroy(_: abi.GraphExec) callconv(.c) abi.Result {
++        execs -= 1;
++        return 0;
++    }
++    fn allReduce(_: abi.DevicePtr, _: abi.DevicePtr, _: usize, _: nccl.DataType, _: nccl.RedOp, _: nccl.Comm, _: abi.Stream) callconv(.c) c_int {
++        if (capturing) captured_sums += 1;
++        return 0;
++    }
++    fn asyncError(_: nccl.Comm, state: *c_int) callconv(.c) c_int {
++        state.* = 0;
++        return 0;
++    }
++    fn abort(_: nccl.Comm) callconv(.c) c_int {
++        at_abort = .{ @intFromBool(capturing), execs, graphs };
++        return 0;
++    }
++    fn driver() cuda.Driver {
++        reset();
++        var d: cuda.Driver = undefined;
++        d.api.cuStreamBeginCapture_v2 = begin;
++        d.api.cuStreamEndCapture = end;
++        d.api.cuStreamIsCapturing = status;
++        d.api.cuGraphInstantiateWithFlags = instantiate;
++        d.api.cuGraphDestroy = graphDestroy;
++        d.api.cuGraphUpload = upload;
++        d.api.cuGraphLaunch = launch;
++        d.api.cuGraphExecDestroy = execDestroy;
++        return d;
++    }
++};
++
++/// One rank's communicator over one end of a socket pair; closing `pair[1]` is its peer leaving.
++fn collective(pair: *[2]c_int) !Collective {
++    if (std.c.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0, pair) != 0) return error.SocketPair;
++    var c: Collective = undefined;
++    c.failed = false;
++    c.comm = @ptrFromInt(0x1000);
++    c.link = .{ .fd = pair[0] };
++    c.timeout_ms = 1000;
++    c.lib.api.ncclAllReduce = Fake.allReduce;
++    c.api.ncclCommGetAsyncError = Fake.asyncError;
++    c.api.ncclCommAbort = Fake.abort;
++    return c;
++}
++
++/// A staged round of one lane whose pass sums over the communicator, or uploads a host row as an unstaged pass would.
++const Pass = struct {
++    stream: cuda.Stream,
++    staged: bool = true,
++    uploads: bool = false,
++    m: struct { collective: ?*Collective },
++
++    pub fn chunk(p: *Pass, _: []const u32, _: usize, _: ?[]u8) !void {
++        if (p.uploads) try cuda.copy_source.enqueue(p.stream.d, 0x5000, &.{ 1, 2, 3, 4 }, p.stream);
++        try p.m.collective.?.sum(p.stream, 0x6000, 4);
++    }
++};
++
++fn key(owner: u64) !rg.Key {
++    const Seq = struct { rank_id: u64, fed: usize };
++    const q: Seq = .{ .rank_id = owner, .fed = 10 };
++    return rg.Key.init(@as([]const *const Seq, &.{&q}), 1, 2, 3);
++}
++
++/// The same stream can be captured again: no capture is open and the copy guard was released.
++fn expectReleased(stream: cuda.Stream) !void {
++    try t.expectEqual(abi.CaptureStatus.none, try cuda.graph.captureStatus(stream));
++    try cuda.graph.beginCapture(stream, .thread_local);
++    var g = try cuda.graph.endCapture(stream);
++    g.deinit();
++}
++
++/// Sets a copy-source context for the capture guard and returns the one to restore.
++fn enter() abi.Context {
++    const previous = cuda.copy_source.current();
++    cuda.copy_source.setCurrent(@ptrFromInt(0x3254));
++    return previous;
++}
++
++test "a decode round's graph: refused unstaged, captured once a key with its sums, replayed, recaptured on a new key" {
++    var d = Fake.driver();
++    const previous = enter();
++    defer cuda.copy_source.setCurrent(previous);
++    const stream: cuda.Stream = .{ .d = &d, .handle = @ptrFromInt(1) };
++    var pair: [2]c_int = undefined;
++    var col = try collective(&pair);
++    defer for (pair) |fd| {
++        _ = std.c.close(fd);
++    };
++    var c: rg.Cache = .{};
++    var p: Pass = .{ .stream = stream, .staged = false, .m = .{ .collective = &col } };
++    try t.expectError(error.UnexpectedTensor, c.launch(try key(1), &p, &.{7}));
++    try t.expectEqual(@as(usize, 0), Fake.begins);
++    p.staged = true;
++    try c.launch(try key(1), &p, &.{7});
++    try t.expectEqual([4]usize{ 1, 1, 1, 1 }, [4]usize{ Fake.begins, Fake.instantiates, Fake.launches, Fake.captured_sums });
++    try c.launch(try key(1), &p, &.{8});
++    try t.expectEqual([4]usize{ 1, 1, 2, 1 }, [4]usize{ Fake.begins, Fake.instantiates, Fake.launches, Fake.captured_sums });
++    try c.launch(try key(2), &p, &.{9});
++    try t.expectEqual([4]usize{ 2, 2, 3, 2 }, [4]usize{ Fake.begins, Fake.instantiates, Fake.launches, Fake.captured_sums });
++    try t.expectEqual(@as(usize, 1), Fake.execs);
++    c.clear();
++    try t.expectEqual([2]usize{ 0, 0 }, [2]usize{ Fake.execs, Fake.graphs });
++}
++
++test "a decode round whose pass uploads inside its capture is refused; its stream and copy guard are released" {
++    var d = Fake.driver();
++    const previous = enter();
++    defer cuda.copy_source.setCurrent(previous);
++    const stream: cuda.Stream = .{ .d = &d, .handle = @ptrFromInt(1) };
++    var pair: [2]c_int = undefined;
++    var col = try collective(&pair);
++    defer for (pair) |fd| {
++        _ = std.c.close(fd);
++    };
++    var c: rg.Cache = .{};
++    defer c.clear();
++    var p: Pass = .{ .stream = stream, .uploads = true, .m = .{ .collective = &col } };
++    try t.expectError(error.UnownedCaptureSource, c.launch(try key(1), &p, &.{7}));
++    try t.expectEqual([2]usize{ 0, 0 }, [2]usize{ Fake.instantiates, Fake.graphs });
++    try expectReleased(stream);
++}

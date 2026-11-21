@@ -1,0 +1,29 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Scott Biggart <swbiggart@users.noreply.github.com>
+Date: Tue, 10 Nov 2026 15:43:46 -0800
+Subject: [PATCH 09/46] flashnext cuda: a folder with learned pockets keeps its
+ --tp 2 rounds eager
+
+A round of taught and untaught streams scales its pocket rows through a
+buffer rowScales allocates anew every round, which the round graph's key
+does not cover, so a replay would read the freed one. Like the window
+graphs, the round graph now leaves pockets out: with any pocket loaded
+both ranks run their rounds eagerly (the mask is the checkpoint's, so
+the ranks agree).
+---
+ zig/src/families/flashnext/cuda_prompt.zig | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/zig/src/families/flashnext/cuda_prompt.zig b/zig/src/families/flashnext/cuda_prompt.zig
+index e3aa3a0a5..97abb35e8 100644
+--- a/zig/src/families/flashnext/cuda_prompt.zig
++++ b/zig/src/families/flashnext/cuda_prompt.zig
+@@ -455,7 +455,7 @@ pub const Engine = struct {
+         const has_media = for (seqs) |q| {
+             if (q.media != null) break true;
+         } else false;
+-        if (e.collective != null and round_graph.enabled() and !has_media and e.layers[0].dense_cut == null) {
++        if (e.collective != null and round_graph.enabled() and !has_media and e.layers[0].dense_cut == null and e.pockets.mask() == 0) {
+             const key = try round_graph.Key.init(seqs, s.ids, scores, out);
+             try e.round_graph.run(key, &p, ids);
+         } else try p.chunk(ids, 0, null);

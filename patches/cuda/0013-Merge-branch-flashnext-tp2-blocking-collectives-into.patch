@@ -1,0 +1,25 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Scott Biggart <swbiggart@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 09:25:14 -0800
+Subject: [PATCH 13/46] Merge branch 'flashnext-tp2-blocking-collectives' into
+ flashnext-tp2-graph-split
+
+The abort releases the round graph before it aborts the parent and the
+split it made, cuda_collective.zig is re-pinned for both changes, and the
+round graph host test's fake communicator has no parent.
+---
+ zig/src/families/flashnext/cuda_round_graph_test.zig | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/zig/src/families/flashnext/cuda_round_graph_test.zig b/zig/src/families/flashnext/cuda_round_graph_test.zig
+index ae0e9f93e..c6362d1d1 100644
+--- a/zig/src/families/flashnext/cuda_round_graph_test.zig
++++ b/zig/src/families/flashnext/cuda_round_graph_test.zig
+@@ -98,6 +98,7 @@ fn collective(pair: *[2]c_int) !Collective {
+     c.failed = false;
+     c.release = null;
+     c.comm = @ptrFromInt(0x1000);
++    c.parent = null;
+     c.link = .{ .fd = pair[0] };
+     c.timeout_ms = 1000;
+     c.lib.api.ncclAllReduce = Fake.allReduce;

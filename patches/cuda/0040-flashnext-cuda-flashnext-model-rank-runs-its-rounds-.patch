@@ -1,0 +1,23 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jay Leaton <58495321+jayleaton@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 17:22:04 +0700
+Subject: [PATCH 40/46] flashnext cuda: flashnext-model-rank runs its rounds
+ over TF_FLASHNEXT_KV_HOST's placement
+
+---
+ zig/tests/cuda/flashnext_model_rank_tests.zig | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/zig/tests/cuda/flashnext_model_rank_tests.zig b/zig/tests/cuda/flashnext_model_rank_tests.zig
+index dd29e59db..2e7c628a0 100644
+--- a/zig/tests/cuda/flashnext_model_rank_tests.zig
++++ b/zig/tests/cuda/flashnext_model_rank_tests.zig
+@@ -26,6 +26,8 @@ pub fn run(gpu: check.Gpu, dir: []const u8, rank: usize, port: u16, ids_path: []
+     defer glue.deinit();
+     const tri: flash.Tri = .{ .s = stream, .own = &glue };
+     var identity = try ranks.identity(gpu.gpa, gpu.io, dir, context, chunk);
++    flash.kv_host.mode = flash.kv_host.readMode(); // TF_FLASHNEXT_KV_HOST: the same rounds over host-placed K/V
++    identity.kv_host = @backingInt(flash.kv_host.mode);
+     identity.mtp = 1; // both ranks take verify and keep frames
+     const session = try ranks.Session.init(gpu.gpa, gpu.io, master, port, rank, identity, ranks.linkWait());
+     const engine = prompt.Engine.initRank(gpu.gpa, gpu.io, @constCast(gpu.d), &stream, dir, 2, rank) catch |err| {

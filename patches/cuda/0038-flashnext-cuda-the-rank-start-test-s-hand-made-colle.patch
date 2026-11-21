@@ -1,0 +1,23 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jay Leaton <58495321+jayleaton@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 17:16:07 +0700
+Subject: [PATCH 38/46] flashnext cuda: the rank-start test's hand-made
+ collective names parent and release, which abort() now runs through
+
+---
+ zig/src/families/flashnext/cuda_rank_start_test.zig | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/zig/src/families/flashnext/cuda_rank_start_test.zig b/zig/src/families/flashnext/cuda_rank_start_test.zig
+index 50f9a2b08..d1c3d6a4f 100644
+--- a/zig/src/families/flashnext/cuda_rank_start_test.zig
++++ b/zig/src/families/flashnext/cuda_rank_start_test.zig
+@@ -51,6 +51,8 @@ fn session(rank: usize, pair: *[2]c_int) !ranks.Session {
+     s.collective.timeout_ms = 50;
+     s.collective.lib.api.ncclCommCount = Fake.count;
+     s.collective.api.ncclCommAbort = Fake.abort;
++    s.collective.parent = null; // the fields abort() runs through: a hand-made collective names them all
++    s.collective.release = null;
+     return s;
+ }
+ 

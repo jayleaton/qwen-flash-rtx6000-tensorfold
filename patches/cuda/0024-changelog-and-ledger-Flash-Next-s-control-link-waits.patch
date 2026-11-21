@@ -1,0 +1,45 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Scott Biggart <swbiggart@users.noreply.github.com>
+Date: Wed, 11 Nov 2026 02:53:01 -0800
+Subject: [PATCH 24/46] changelog and ledger: Flash Next's control-link waits
+ poll briefly before they block
+
+---
+ CHANGELOG.md                | 2 ++
+ docs/optimization-ledger.md | 6 ++----
+ 2 files changed, 4 insertions(+), 4 deletions(-)
+
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 5d87dc229..87e68c06c 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -771,6 +771,8 @@ Each release's page on GitHub has its notes and measurements. See [the 1.0.0 rel
+ 
+ - Server: a request body that no route reads is capped at 64 KiB, and a larger one gets HTTP 400 (#3029).
+ 
++- Flash Next on CUDA at `--tp 2`: a wait on the ranks' control link polls with a 50 µs timeout for its first 50 ms, then blocks as before. On two GB10s, an instrumented build showed a rank that waited out a round in a blocking poll waking 200 to 380 µs after its peer's frame arrived, its core in a deep idle state, and about 50 µs after it with the short polls. Over two alternated starts each there, drafted decode at one stream is 1.4% to 1.5% faster (chat 37.80 to 38.38 tok/s, code 51.25 to 51.98) and four streams 3.7% to 4.7% faster (chat 101.00 to 105.75, code 144.75 to 150.10); plain decode is unchanged, and so is every token. A server stops polling 50 ms after its last frame (#2971).
++
+ - DeepSeek-V4.1: both ranks print the startup settings line, and its transport field now reads `comm=roce` or `comm=nccl` with its source from `TF_COMM_BACKEND`; DeepSeek says once at startup that it does not read `TF_ROCE` when that is set, where the line used to report `roce=1(set)` for `TF_ROCE=0` (#2877, for #2715).
+ 
+ - GLM-5.3-Flash EXL3 on CUDA: a whole prompt pass routes its experts in one call instead of 1,024-row calls, and writes straight into its output slots, with bit-identical rows (#2852, for #2819).
+diff --git a/docs/optimization-ledger.md b/docs/optimization-ledger.md
+index 2a1d99171..3da57e90b 100644
+--- a/docs/optimization-ledger.md
++++ b/docs/optimization-ledger.md
+@@ -483,8 +483,7 @@ below; these are estimates for planning a port, not results.
+     | Family | Gain (measured) | Where |
+     | --- | --- | --- |
+     | flashnext (C), TP=2 | prompt passes reduce-scatter the experts' slots by rows: rank 0 sends 5.81 → 3.43 MiB a prompt token, cold prefill +26.5..+26.8 % on two GB10s, +30.9..+33.9 % on two RTX PRO 6000s, same replies | [#2977] |
+-    | flashnext (C), TP=2 | collectives on a blocking split when both ranks share a host: plain decode 28.9 → 73.3 tok/s, drafted code 114 → 211 on 2 × RTX PRO 6000; ranks on two hosts keep the nonblocking communicator, 2 × GB10 decode level with main; same replies | [#2978] |
+-    | flashnext (C), TP=2 | opt-in decode graph with the dense split, keyed by each lane's buffers: 2 × GB10 plain decode +5.9..+6.0 %, drafted level; a drafted and a plain stream no longer recapture once a verify; same replies; off by default | [#2982] |
++    | flashnext (C), TP=2 | control-link waits poll 50 µs for 50 ms before they block: drafted decode +1.4..+1.5 % at one stream, +3.7..+4.7 % at four on two GB10s, same replies | [#2971] |
+ 
+ 26. **Pipeline stages.** Layer ranges on different nodes, one hidden row a token over Ethernet, so a GB10 and a Mac
+     can serve one model ([#2005]). The stage link and its protocol are [#2012] and [#2060]; the 27B as a stage is
+@@ -693,5 +692,4 @@ below; these are estimates for planning a port, not results.
+ [#1603]: https://github.com/ashhart/TensorFold/issues/1603
+ [#2977]: https://github.com/ashhart/TensorFold/pull/2977
+ [#2805]: https://github.com/ashhart/TensorFold/pull/2805
+-[#2978]: https://github.com/ashhart/TensorFold/pull/2978
+-[#2982]: https://github.com/ashhart/TensorFold/pull/2982
++[#2971]: https://github.com/ashhart/TensorFold/pull/2971

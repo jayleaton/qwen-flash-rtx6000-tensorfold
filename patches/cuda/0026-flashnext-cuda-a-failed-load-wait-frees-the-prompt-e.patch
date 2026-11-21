@@ -1,0 +1,61 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Scott Biggart <swbiggart@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 07:38:25 -0800
+Subject: [PATCH 26/46] flashnext cuda: a failed load wait frees the prompt
+ engine
+
+---
+ zig/src/families/flashnext/cuda_lanes_load.zig      | 2 +-
+ zig/src/families/flashnext/cuda_rank_start_test.zig | 6 ++++--
+ zig/tests/fixtures/gradient-serving.tsv             | 2 +-
+ 3 files changed, 6 insertions(+), 4 deletions(-)
+
+diff --git a/zig/src/families/flashnext/cuda_lanes_load.zig b/zig/src/families/flashnext/cuda_lanes_load.zig
+index 1f0ba55c7..30b3dceec 100644
+--- a/zig/src/families/flashnext/cuda_lanes_load.zig
++++ b/zig/src/families/flashnext/cuda_lanes_load.zig
+@@ -62,13 +62,13 @@ pub fn open(comptime F: type, gpa: std.mem.Allocator, io: std.Io, ctx: *const cu
+         r.deinit();
+     };
+     own.engine = try prompt.Engine.initRank(gpa, io, driver, &own.stream, dir, o.tp, o.rank);
++    errdefer own.engine.deinit();
+     own.engine.chunk = chunk;
+     if (own.ranks) |r| {
+         r.engine = own.engine;
+         own.engine.collective = &r.collective;
+         try r.afterLoad(io, ctx, own.stream);
+     }
+-    errdefer own.engine.deinit();
+     const e = own.engine;
+     if (e.chunk != e.busy_chunk) std.log.info("flashnext: prompt passes of {d} rows, {d} while another stream decodes", .{ e.chunk, e.busy_chunk });
+     if (o.vision) |limits| {
+diff --git a/zig/src/families/flashnext/cuda_rank_start_test.zig b/zig/src/families/flashnext/cuda_rank_start_test.zig
+index a8f9d4b1c..50f9a2b08 100644
+--- a/zig/src/families/flashnext/cuda_rank_start_test.zig
++++ b/zig/src/families/flashnext/cuda_rank_start_test.zig
+@@ -90,8 +90,10 @@ test "rank start: a peer that closes its link during the wait ends it at once, b
+     }
+ }
+ 
+-test "rank start: the loader's first collective waits for the peer's load" {
++test "rank start: the loader's first collective waits for the peer's load, and a failed wait frees the engine" {
+     const load = @embedFile("cuda_lanes_load.zig");
+     try std.testing.expect(std.mem.indexOf(u8, load, "benchmark_group.") == null);
+-    try std.testing.expect(std.mem.indexOf(u8, load, "try r.afterLoad(io, ctx, own.stream);") != null);
++    const wait = std.mem.indexOf(u8, load, "try r.afterLoad(io, ctx, own.stream);") orelse return error.TestUnexpectedResult;
++    const free = std.mem.indexOf(u8, load, "errdefer own.engine.deinit();") orelse return error.TestUnexpectedResult;
++    try std.testing.expect(free < wait);
+ }
+diff --git a/zig/tests/fixtures/gradient-serving.tsv b/zig/tests/fixtures/gradient-serving.tsv
+index a301d9c68..34e518d0d 100644
+--- a/zig/tests/fixtures/gradient-serving.tsv
++++ b/zig/tests/fixtures/gradient-serving.tsv
+@@ -131,7 +131,7 @@ zig/src/families/flashnext/cuda_images.zig	5bd8a6c06cb69440522f4392794d9ef52b376
+ zig/src/families/flashnext/cuda_images_test.zig	df984d54d9de1bb732544785cddf82a124de2a7019041ed1f7483b2a4a2d7c99	raw
+ zig/src/families/flashnext/cuda_lanes.zig	b72cee919a557e16f001d2c6a7b77602889f6d41a225e0af4736368aff01aee6	raw	main 4f6017ced (marks inside the pass), fbca90714 (shared solo-chunk rule, #2391), 80e0fd72c (#2753: non-finite draft rows refused by name; finite rows unchanged), dfd9ac5ef4 (#2585: TF_FLASHNEXT_* read through platform/environment.zig, malformed text refused at startup; valid values keep their meaning), #1953: the ladder's values through snap_intermediate, #3308 (loader host test updates the named startup-refusal expectations; no runtime edit to this pinned file); #3135 (kept_disk renamed kept_view for the shared kept image; no served change), this change (the page pool opens with the load's device and io, for its arena mapped as pages are used; a new paged stream's first prompt step waits while the arena's thread maps its pieces; paging off: unchanged)
+ zig/src/families/flashnext/cuda_lanes_admission_test.zig	4b8052db793ba81f0e73e1b9bd77b1780bbc4fd550d90976d017da47e76faaa2	raw
+-zig/src/families/flashnext/cuda_lanes_load.zig	018366470bd55eb5370d7a6c4f7c967cf005d3614e8303594d1e92e91d8426f8	raw
++zig/src/families/flashnext/cuda_lanes_load.zig	7e6bb6ebbdce847fee3e10364fdbb93b16832d77a3bc7435162469dca50e4b2a	raw
+ zig/src/families/flashnext/cuda_lanes_restore_test.zig	f9947521a6d9c7d7380ca1b784a93a43b364c6fa5861cad15efd3538d2b8ceff	raw
+ zig/src/families/flashnext/cuda_launch.zig	f8bebb5ed074e6c8ab8cef667cb01fa2bb1a2b2d6a4d3874a92291390278d9f7	raw	exports cuda_moe_exchange.zig for its device test; no served change; #2837 (Flash Next TP=2 graph replay)
+ zig/src/families/flashnext/cuda_media.zig	394601e8a807f5516f501efcaefa6fb3308f392ee322db7296b11c90814f8eea	raw

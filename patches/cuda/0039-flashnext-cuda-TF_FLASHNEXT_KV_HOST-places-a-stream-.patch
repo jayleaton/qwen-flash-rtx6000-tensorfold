@@ -1,0 +1,544 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jay Leaton <58495321+jayleaton@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 17:16:08 +0700
+Subject: [PATCH 39/46] flashnext cuda: TF_FLASHNEXT_KV_HOST places a stream's
+ K/V rows on mapped pinned host pages (off, overflow, all)
+
+---
+ docs/environment.md                           |   1 +
+ zig/src/families/flashnext/cuda_kv_host.zig   | 176 ++++++++++++++++++
+ zig/src/families/flashnext/cuda_lanes.zig     |   1 +
+ .../families/flashnext/cuda_lanes_load.zig    |   6 +
+ zig/src/families/flashnext/cuda_launch.zig    |   5 +
+ zig/src/families/flashnext/cuda_prompt.zig    |   7 +-
+ .../families/flashnext/cuda_rank_engine.zig   |   4 +
+ zig/src/families/flashnext/cuda_seq_parts.zig |   4 +-
+ zig/src/native/cuda.zig                       |   1 +
+ zig/src/platform/environment.zig              |   1 +
+ .../platform/environment_flashnext_test.zig   |  17 +-
+ zig/tests/cuda/flashnext_kv_host_tests.zig    |  74 ++++++++
+ zig/tests/cuda/main.zig                       |   2 +
+ zig/tests/cuda/main_usage.zig                 |   1 +
+ 14 files changed, 294 insertions(+), 6 deletions(-)
+ create mode 100644 zig/src/families/flashnext/cuda_kv_host.zig
+ create mode 100644 zig/tests/cuda/flashnext_kv_host_tests.zig
+
+diff --git a/docs/environment.md b/docs/environment.md
+index 582089cbe..c84b4e7cb 100644
+--- a/docs/environment.md
++++ b/docs/environment.md
+@@ -137,6 +137,7 @@ stops the start with the variable, the supplied text and the accepted forms.
+ | `TF_FLASHNEXT_LANE_PARTS` | Exactly `0` or `1`; default on |
+ | `TF_FLASHNEXT_KEEP_INPASS` | Exactly `0` or `1`; default on |
+ | `TF_FLASHNEXT_KEPT` | `host` or `device`; default `host` on a discrete card, `device` on an integrated GPU. Where kept prompt states go: `host` is mapped pinned host memory, which `--prompt-cache-gib` then budgets. Give every rank the same value. |
++| `TF_FLASHNEXT_KV_HOST` | `off`, `overflow` or `all`; default `off`. Where a new stream's attention K/V rows go: `all` places every stream's on mapped pinned host pages (slower over PCIe, measured by the cost cells), `overflow` only once the granted device room is spent. Indexer keys, pooled rows and the DeltaNet state stay on the device. Refused with `TF_FLASHNEXT_KV_PAGES`. Give every rank the same value. |
+ | `TF_FLASHNEXT_FIRST_EARLY` | Exactly `0` or `1`; default on |
+ | `TF_FLASHNEXT_GPU_TOPK` | Exactly `0` or `1`; default on |
+ | `TF_FLASHNEXT_GDN_FUSED` | Exactly `0` or `1`; default on |
+diff --git a/zig/src/families/flashnext/cuda_kv_host.zig b/zig/src/families/flashnext/cuda_kv_host.zig
+new file mode 100644
+index 000000000..d62436ea2
+--- /dev/null
++++ b/zig/src/families/flashnext/cuda_kv_host.zig
+@@ -0,0 +1,176 @@
++//! TF_FLASHNEXT_KV_HOST: a stream's attention K/V rows on mapped pinned host pages, placed per stream.
++const std = @import("std");
++const cuda = @import("cuda");
++const prompt = @import("cuda_prompt.zig");
++const wt = @import("cuda_prompt_wt.zig");
++const sizes = @import("cuda_seq_bytes.zig");
++const Heads = @import("cuda_heads.zig").Heads;
++
++/// The placement a new stream's K/V rows take; the indexer keys, pooled rows and DeltaNet state stay on the device.
++pub const Mode = enum { off, overflow, all };
++
++/// The mode the family's load read (ranks.identity binds it, so a pair never serves one host stream and one device).
++pub var mode: Mode = .off;
++
++/// The device room left past every admitted stream's other buffers and the prompt cache: `overflow` spends it on K/V.
++pub var room: u64 = 0;
++
++/// The device K/V bytes `overflow` placed out of `room` and has not yet given back.
++pub var spent: u64 = 0;
++
++/// Freed K/V pages, kept whole for the next host-placed stream of the same size.
++pub var spares: cuda.HostSpares = .{ .mapped = true };
++
++/// The setting's word, read once at load (the startup check refused malformed text already).
++pub fn readMode() Mode {
++    return switch (@import("sys").environment.read(u64, "TF_FLASHNEXT_KV_HOST", 0) catch 0) {
++        1 => .overflow,
++        2 => .all,
++        else => .off,
++    };
++}
++
++/// A stream's K/V pages in mapped pinned host memory: the owner of the borrowed views its sequence holds.
++pub const Host = struct {
++    gpa: std.mem.Allocator,
++    pages: cuda.HostBuffer,
++    kc: []cuda.DeviceBuffer,
++    vc: []cuda.DeviceBuffer,
++
++    /// After the sequence drained (its own deinit frees the views it borrowed): its pages back to the spares.
++    pub fn release(h: *Host) void {
++        spares.give(h.pages);
++        h.gpa.destroy(h);
++    }
++};
++
++/// A new sequence's keys and values: pool pages, mapped host pages or device buffers, into its three fields.
++pub fn placeKv(e: *prompt.Engine, seq: *prompt.Seq) !void {
++    if (seq.paged) |*p| {
++        seq.kc = try p.views(e.gpa, e.driver, .key);
++        seq.vc = try p.views(e.gpa, e.driver, .value);
++        return;
++    }
++    if (try open(e, seq.cap)) |host| {
++        seq.kc = host.kc;
++        seq.vc = host.vc;
++        seq.kv_host = host;
++        return;
++    }
++    seq.kc = try prompt.zeros(e.gpa, e.driver, e.stream.*, wt.attn_n, sizes.kvBytes(seq.cap, e.heads));
++    seq.vc = try prompt.zeros(e.gpa, e.driver, e.stream.*, wt.attn_n, sizes.kvBytes(seq.cap, e.heads));
++    if (mode == .overflow) spent += kvBytes(seq.cap, e.heads);
++}
++
++/// A draining sequence's K/V: host pages back to the spares, or `overflow`'s device bytes back to the room.
++pub fn drop(seq: *prompt.Seq) void {
++    if (seq.kv_host) |h| return h.release();
++    if (mode != .overflow or seq.paged != null) return;
++    var held: u64 = 0;
++    for (seq.kc, seq.vc) |k, v| held += k.len + v.len;
++    spent -|= held;
++}
++
++/// This stream's K/V rows on mapped host pages (null: the device), by the mode and, at `overflow`, the budget.
++fn open(e: *prompt.Engine, cap: usize) !?*Host {
++    if (mode == .off or cap == 0) return null;
++    if (mode == .overflow and fits(spent, cap, e.heads)) return null;
++    const bytes = @as(usize, wt.attn_n) * sizes.kvBytes(cap, e.heads);
++    const host = try e.gpa.create(Host);
++    errdefer e.gpa.destroy(host);
++    host.* = .{ .gpa = e.gpa, .pages = try spares.take(e.driver, 2 * bytes), .kc = &.{}, .vc = &.{} };
++    errdefer host.pages.free();
++    const base = try host.pages.device();
++    try e.driver.check(e.driver.api.cuMemsetD8Async(base, 0, 2 * bytes, e.stream.handle), "cuMemsetD8Async");
++    host.kc = try views(e.gpa, e.driver, base, bytes);
++    errdefer e.gpa.free(host.kc);
++    host.vc = try views(e.gpa, e.driver, base + bytes, bytes);
++    return host;
++}
++
++/// `attn_n` borrowed views of `bytes` bytes at `base`, one a layer, 256-byte aligned.
++pub fn views(gpa: std.mem.Allocator, d: *const cuda.Driver, base: u64, bytes: usize) ![]cuda.DeviceBuffer {
++    const out = try gpa.alloc(cuda.DeviceBuffer, wt.attn_n);
++    errdefer gpa.free(out);
++    const row = std.mem.alignForward(usize, bytes / wt.attn_n, 256);
++    for (out, 0..) |*b, layer| b.* = .{ .d = d, .ptr = base + layer * row, .len = bytes / wt.attn_n, .borrowed = true };
++    return out;
++}
++
++/// One stream's keys and values over all attention layers: what the memory plan prices on the host, not the device.
++pub fn kvBytes(cap: usize, h: Heads) u64 {
++    return 2 * @as(u64, wt.attn_n) * sizes.kvBytes(cap, h);
++}
++
++/// A stream's device bytes in the memory plan: with K/V placement on, its K/V rows are not priced on the card.
++pub fn deviceStreamBytes(stream_bytes: usize, window: usize, h: Heads) usize {
++    return if (mode == .off) stream_bytes else stream_bytes - kvBytes(window, h);
++}
++
++/// The memory plan's device room left once the admitted streams and the prompt cache are priced.
++pub fn grant(left: u64) void {
++    room = left;
++    spent = 0;
++}
++
++/// Whether a `cap` sequence's K/V still fits the granted room past the `held` bytes `overflow` placed already.
++pub fn fits(held: u64, cap: usize, h: Heads) bool {
++    return held + kvBytes(cap, h) <= room;
++}
++
++test "a word read maps off, overflow and all, and a malformed value stays off" {
++    const env = @import("sys").environment;
++    const read = struct {
++        fn at(raw: []const u8) Mode {
++            return switch (env.value(u64, "TF_FLASHNEXT_KV_HOST", raw, 0) catch 0) {
++                1 => .overflow,
++                2 => .all,
++                else => .off,
++            };
++        }
++    }.at;
++    try std.testing.expectEqual(Mode.off, read("off"));
++    try std.testing.expectEqual(Mode.overflow, read("overflow"));
++    try std.testing.expectEqual(Mode.all, read("all"));
++    try std.testing.expectEqual(Mode.off, read("nonsense"));
++}
++
++test "overflow places a stream's K/V on the host once its rows no longer fit the granted room" {
++    const save = room;
++    defer room = save;
++    room = kvBytes(4096, .half);
++    try std.testing.expect(fits(0, 4096, .half)); // the room still fits this stream's rows
++    try std.testing.expect(!fits(1, 4096, .half)); // one byte over: its K/V goes to the host
++    try std.testing.expect(!fits(0, 8192, .half)); // a longer stream never fits the same room
++    room += kvBytes(4096, .half);
++    try std.testing.expect(fits(kvBytes(4096, .half), 4096, .half));
++}
++
++test "with placement on, the memory plan prices a stream's K/V rows off the card, and off it keeps them" {
++    const save = mode;
++    defer mode = save;
++    const whole = sizes.seqBytes(65536, .half);
++    mode = .off;
++    try std.testing.expectEqual(whole, deviceStreamBytes(whole, 65536, .half));
++    for ([_]Mode{ .overflow, .all }) |m| {
++        mode = m;
++        try std.testing.expectEqual(whole - kvBytes(65536, .half), deviceStreamBytes(whole, 65536, .half));
++    }
++}
++
++test "views cover each layer's rows once, 256-byte aligned, and the keys end where the values begin" {
++    const layers = wt.attn_n;
++    const bytes = layers * 4 * 256; // four aligned rows a layer
++    const fake: u64 = 0x10000;
++    const kc = try views(std.testing.allocator, undefined, fake, bytes);
++    defer std.testing.allocator.free(kc);
++    const vc = try views(std.testing.allocator, undefined, fake + bytes, bytes);
++    defer std.testing.allocator.free(vc);
++    try std.testing.expectEqual(layers, kc.len);
++    for (kc, 0..) |b, i| {
++        try std.testing.expectEqual(@as(u64, 4 * 256), b.len);
++        try std.testing.expectEqual(fake + i * 4 * 256, b.ptr);
++        try std.testing.expect(b.borrowed);
++    }
++    try std.testing.expectEqual(fake + bytes + layers * 4 * 256 - 4 * 256, vc[layers - 1].ptr);
++}
+diff --git a/zig/src/families/flashnext/cuda_lanes.zig b/zig/src/families/flashnext/cuda_lanes.zig
+index 70d72657e..a3b01d26f 100644
+--- a/zig/src/families/flashnext/cuda_lanes.zig
++++ b/zig/src/families/flashnext/cuda_lanes.zig
+@@ -44,6 +44,7 @@ pub fn Namespace(comptime Tri: type) type {
+         pub const snap_trim = snaps.trim;
+         pub const snap_reuses = snaps.reuses;
+         pub const kept_view = @import("cuda_disk.zig").View(@This()); // their disk image (native/cuda_kept.zig)
++        pub const kv_host_grant = @import("cuda_kv_host.zig").grant; // the device room `overflow` spends against
+         /// TF_FLASHNEXT_KV_PAGES: the pool's lanes, the pages of a request's rows and a drafted window (kvl).
+         pub const window_rows = kvl.window_rows;
+         pub fn attach(p: *anyopaque, streams: u32, count: usize) !void {
+diff --git a/zig/src/families/flashnext/cuda_lanes_load.zig b/zig/src/families/flashnext/cuda_lanes_load.zig
+index 263f98133..81df6b6f7 100644
+--- a/zig/src/families/flashnext/cuda_lanes_load.zig
++++ b/zig/src/families/flashnext/cuda_lanes_load.zig
+@@ -29,6 +29,10 @@ pub fn open(comptime F: type, gpa: std.mem.Allocator, io: std.Io, ctx: *const cu
+     if (o.slide and captured != null) return error.TrainingOnCapturedGlue;
+     const page_tokens = try @import("cuda_kv_lanes.zig").paging();
+     if (page_tokens > 0 and (o.tp != 1 or o.slide or captured != null)) return error.FlashNextPagesUnsupported;
++    // TF_FLASHNEXT_KV_HOST places a stream's K/V rows on mapped host pages: a pool lane's rows are pages already
++    const kv_host = @import("cuda_kv_host.zig");
++    kv_host.mode = kv_host.readMode();
++    if (kv_host.mode != .off and page_tokens > 0) return error.FlashNextKvHostUnsupported;
+     // pending DeltaNet rows run on one GPU only: TF_FLASHNEXT_KEEP_LATE=1 with tensor parallel is refused
+     const Draft = @import("cuda_mtp_draft.zig").Draft;
+     const late_fits = o.tp == 1;
+@@ -50,6 +54,7 @@ pub fn open(comptime F: type, gpa: std.mem.Allocator, io: std.Io, ctx: *const cu
+     if (o.tp == 2) {
+         var id = try ranks.identity(gpa, io, dir, o.context, chunk);
+         id.mtp = @intFromBool(o.drafts);
++        id.kv_host = @backingInt(@import("cuda_kv_host.zig").mode);
+         if (o.vision) |v| {
+             try @import("qwen_vision").media.checkLimits(v);
+             id.image_tokens = v.image_tokens;
+@@ -106,6 +111,7 @@ pub fn open(comptime F: type, gpa: std.mem.Allocator, io: std.Io, ctx: *const cu
+         stream_bytes += mtp.Draft.bytes(window, h.ids.len, own.engine.chunk, own.engine.heads);
+     } else if (o.drafts and o.tp == 2) stream_bytes += mtp.Draft.bytes(window, 1, own.engine.chunk, own.engine.heads);
+     if (o.vision) |v| stream_bytes += @as(usize, v.image_tokens) * @import("cuda_prompt_wt.zig").dims * 2 + 16 * o.context;
++    stream_bytes = kv_host.deviceStreamBytes(stream_bytes, window, own.engine.heads);
+     if (page_tokens > 0) {
+         // the lane's head runs at the engine's chunk: its cache on the stream's pages, its buffers in the run
+         own.kv.head = if (own.head) |h| .{ .draft_n = h.ids.len, .rows = own.engine.chunk } else null;
+diff --git a/zig/src/families/flashnext/cuda_launch.zig b/zig/src/families/flashnext/cuda_launch.zig
+index 04f13ec3f..d0b66b24f 100644
+--- a/zig/src/families/flashnext/cuda_launch.zig
++++ b/zig/src/families/flashnext/cuda_launch.zig
+@@ -36,6 +36,10 @@ pub const ple_check = @import("cuda_ple_check.zig");
+ pub const mix = @import("cuda_mix.zig");
+ pub const prompt = @import("cuda_prompt.zig");
+ pub const snap = @import("cuda_snap.zig");
++pub const kv_host = @import("cuda_kv_host.zig");
++/// A stream's cache sizes and the window's fixed geometry, for the K/V host pages' device test.
++pub const seq_bytes = @import("cuda_seq_bytes.zig");
++pub const wt = @import("cuda_prompt_wt.zig");
+ /// The row-by-row reference path, for flashnext-prompt
+ pub const row_path = @import("cuda_rows.zig");
+ /// The MTP head's drafts: its forward, the chain, the verify window's rows and their rollback
+@@ -470,6 +474,7 @@ test {
+     _ = mtp;
+     _ = native;
+     _ = @import("cuda_snap.zig");
++    _ = @import("cuda_kv_host.zig");
+     _ = @import("cuda_disk.zig");
+     _ = @import("cuda_pages.zig");
+     _ = @import("cuda_kv_lanes.zig");
+diff --git a/zig/src/families/flashnext/cuda_prompt.zig b/zig/src/families/flashnext/cuda_prompt.zig
+index ad01db764..3cadbe114 100644
+--- a/zig/src/families/flashnext/cuda_prompt.zig
++++ b/zig/src/families/flashnext/cuda_prompt.zig
+@@ -311,6 +311,7 @@ pub const Engine = struct {
+             .vc = &.{},
+             .ikc = &.{},
+             .pooled = &.{},
++            .kv_host = null,
+             .tail = .{ .d = e.driver, .ptr = 0, .len = 0 },
+             .history = .{ e.eos, e.eos },
+             .fed = 0,
+@@ -323,8 +324,7 @@ pub const Engine = struct {
+         seq.logits = try e.gpa.alloc(u8, vocab * 2);
+         seq.conv = try zeros(e.gpa, e.driver, e.stream.*, linear_n, sizes.convBytes(e.heads));
+         seq.state = try zeros(e.gpa, e.driver, e.stream.*, linear_n, sizes.stateBytes(e.heads));
+-        seq.kc = if (seq.paged) |*p| try p.views(e.gpa, e.driver, .key) else try zeros(e.gpa, e.driver, e.stream.*, attn_n, sizes.kvBytes(cap, e.heads));
+-        seq.vc = if (seq.paged) |*p| try p.views(e.gpa, e.driver, .value) else try zeros(e.gpa, e.driver, e.stream.*, attn_n, sizes.kvBytes(cap, e.heads));
++        try @import("cuda_kv_host.zig").placeKv(e, &seq);
+         seq.ikc = if (seq.paged) |*p| try p.views(e.gpa, e.driver, .index) else try zeros(e.gpa, e.driver, e.stream.*, attn_n, sizes.indexBytes(cap));
+         seq.pooled = if (seq.paged) |*p| try p.views(e.gpa, e.driver, .pooled) else try zeros(e.gpa, e.driver, e.stream.*, attn_n, pooledBytes(cap));
+         seq.tail = try cuda.DeviceBuffer.alloc(e.driver, ple_tail_n * wide * 2);
+@@ -492,6 +492,8 @@ pub const Seq = struct {
+     vc: []cuda.DeviceBuffer,
+     ikc: []cuda.DeviceBuffer,
+     pooled: []cuda.DeviceBuffer,
++    /// This sequence's K/V pages in mapped pinned host memory (null: kc and vc are device buffers or page views).
++    kv_host: ?*@import("cuda_kv_host.zig").Host = null,
+     /// kc, vc, ikc and pooled as borrowed views of page 0 of these pages (null: each its own contiguous buffer).
+     paged: ?pages.Paged = null,
+     tail: cuda.DeviceBuffer,
+@@ -521,6 +523,7 @@ pub const Seq = struct {
+         freeBufs(s.vc);
+         freeBufs(s.ikc);
+         freeBufs(s.pooled);
++        @import("cuda_kv_host.zig").drop(s);
+         gpa.free(s.conv);
+         gpa.free(s.state);
+         gpa.free(s.kc);
+diff --git a/zig/src/families/flashnext/cuda_rank_engine.zig b/zig/src/families/flashnext/cuda_rank_engine.zig
+index 184abe810..5acf0b493 100644
+--- a/zig/src/families/flashnext/cuda_rank_engine.zig
++++ b/zig/src/families/flashnext/cuda_rank_engine.zig
+@@ -19,6 +19,7 @@ pub const Identity = extern struct {
+     decode_graph: u64 = 0,
+     mtp: u64 = 0,
+     head_sharded: u64 = 0,
++    kv_host: u64 = 0,
+     image_tokens: u64 = 0,
+     max_images: u64 = 0,
+     dense_split: u64 = 0,
+@@ -484,6 +485,9 @@ test "rank identity binds checkpoint, config, index, program and execution setti
+     other = base;
+     other.head_sharded = 1;
+     try std.testing.expect(!sameIdentity(base, other));
++    other = base;
++    other.kv_host = @backingInt(@import("cuda_kv_host.zig").Mode.overflow);
++    try std.testing.expect(!sameIdentity(base, other));
+ }
+ 
+ test "rank operations refuse invalid geometry and unsupported hooks before execution" {
+diff --git a/zig/src/families/flashnext/cuda_seq_parts.zig b/zig/src/families/flashnext/cuda_seq_parts.zig
+index 4dacc9db7..8c7af45cd 100644
+--- a/zig/src/families/flashnext/cuda_seq_parts.zig
++++ b/zig/src/families/flashnext/cuda_seq_parts.zig
+@@ -48,6 +48,7 @@ pub fn newSeqIn(e: *Engine, cap: usize, block: cuda.DeviceBuffer) !Seq {
+         .vc = &.{},
+         .ikc = &.{},
+         .pooled = &.{},
++        .kv_host = null,
+         .tail = .{ .d = e.driver, .ptr = 0, .len = 0 },
+         .history = .{ e.eos, e.eos },
+         .fed = 0,
+@@ -61,8 +62,7 @@ pub fn newSeqIn(e: *Engine, cap: usize, block: cuda.DeviceBuffer) !Seq {
+     seq.conv = try viewsAt(e.gpa, e.driver, &at, linear_n, sizes.convBytes(e.heads));
+     seq.state = try viewsAt(e.gpa, e.driver, &at, linear_n, sizes.stateBytes(e.heads));
+     seq.tail = viewAt(e.driver, &at, ple_tail_n * wide * 2);
+-    seq.kc = try prompt.zeros(e.gpa, e.driver, e.stream.*, attn_n, sizes.kvBytes(cap, e.heads));
+-    seq.vc = try prompt.zeros(e.gpa, e.driver, e.stream.*, attn_n, sizes.kvBytes(cap, e.heads));
++    try @import("cuda_kv_host.zig").placeKv(e, &seq);
+     seq.ikc = try prompt.zeros(e.gpa, e.driver, e.stream.*, attn_n, sizes.indexBytes(cap));
+     seq.pooled = try prompt.zeros(e.gpa, e.driver, e.stream.*, attn_n, sizes.pooledBytes(cap));
+     return seq;
+diff --git a/zig/src/native/cuda.zig b/zig/src/native/cuda.zig
+index f5aca4e1a..524b626f4 100644
+--- a/zig/src/native/cuda.zig
++++ b/zig/src/native/cuda.zig
+@@ -380,6 +380,7 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, asked: a
+     // a ledger's plan placed the cache already, beside --parallel full-window requests
+     const kept = if (host_cache) kv_pages.kept(F, loaded, paged, o, room, held, final_host_budget, true) else if (counted.ledger) |lp| lp.kept else kv_pages.kept(F, loaded, paged, o, room, held, 0, false);
+     if (h.kv_plan) |*lp| lp.kept = kept;
++    if (@hasDecl(F, "kv_host_grant")) F.kv_host_grant(room -| held -| if (kept.host) kept.snap_bytes else kept.snaps * kept.snap_bytes + kept.copied);
+     const cache = kept.copied;
+     const cache_capacity = kv_pages.capacity(F, loaded, kept, @intCast(window));
+     try kv_pages.report(a, layout, paged);
+diff --git a/zig/src/platform/environment.zig b/zig/src/platform/environment.zig
+index 1332f2202..14ce432da 100644
+--- a/zig/src/platform/environment.zig
++++ b/zig/src/platform/environment.zig
+@@ -205,6 +205,7 @@ pub const rules = [_]Rule{
+     .{ .name = "TF_FLASHNEXT_LANE_PARTS", .scope = .flashnext, .kind = .flag, .forms = "0 or 1 (default 1)" },
+     .{ .name = "TF_FLASHNEXT_KEEP_INPASS", .scope = .flashnext, .kind = .flag, .forms = "0 or 1 (default 1)" },
+     .{ .name = "TF_FLASHNEXT_KEPT", .scope = .flashnext, .kind = .word, .words = &.{ "host", "device" }, .forms = "host or device (default: host on a discrete card, device on an integrated GPU); give every rank the same" },
++    .{ .name = "TF_FLASHNEXT_KV_HOST", .scope = .flashnext, .kind = .word, .words = &.{ "off", "overflow", "all" }, .forms = "off, overflow or all (default off; a stream's K/V rows on mapped pinned host pages, overflow only once the granted device room is spent); give every rank the same" },
+     .{ .name = "TF_FLASHNEXT_FIRST_EARLY", .scope = .flashnext, .kind = .flag, .forms = "0 or 1 (default 1)" },
+     .{ .name = "TF_FLASHNEXT_GPU_TOPK", .scope = .flashnext, .kind = .flag, .forms = "0 or 1 (default 1)" },
+     .{ .name = "TF_FLASHNEXT_GDN_FUSED", .scope = .flashnext, .kind = .flag, .forms = "0 or 1 (default 1)" },
+diff --git a/zig/src/platform/environment_flashnext_test.zig b/zig/src/platform/environment_flashnext_test.zig
+index b3c6bd384..527a1021c 100644
+--- a/zig/src/platform/environment_flashnext_test.zig
++++ b/zig/src/platform/environment_flashnext_test.zig
+@@ -33,13 +33,13 @@ fn check(name: []const u8, raw: []const u8, valid: bool) !void {
+     try t.expect(std.mem.endsWith(u8, why.?, e.rule(name).forms));
+ }
+ 
+-test "Flash Next strict env: the table holds all 36 settings: 24 switches, 9 integers, 1 real, 2 structured" {
++test "Flash Next strict env: the table holds all 35 settings: 22 switches, 9 integers, 1 real, 3 structured" {
+     var counts: [4]usize = @splat(0);
+     for (e.rules) |r| if (r.scope == .flashnext) {
+         try t.expect(std.mem.startsWith(u8, r.name, "TF_FLASHNEXT_"));
+         counts[@backingInt(group(r))] += 1;
+     };
+-    try t.expectEqual([4]usize{ 24, 9, 1, 2 }, counts);
++    try t.expectEqual([4]usize{ 22, 9, 1, 3 }, counts);
+ }
+ 
+ test "Flash Next strict env: unset and blank settings both read as the caller's default" {
+@@ -130,6 +130,19 @@ test "Flash Next strict env: the prompt word keeps rows as a present index and r
+     try t.expect((try e.value(?u64, name, null, null)) == null);
+ }
+ 
++test "Flash Next strict env: the kept and K/V host words take their indices and refuse every other text" {
++    try check("TF_FLASHNEXT_KEPT", "host", true);
++    try check("TF_FLASHNEXT_KEPT", "device", true);
++    try check("TF_FLASHNEXT_KEPT", "pinned", false);
++    const kv = "TF_FLASHNEXT_KV_HOST";
++    for ([_][]const u8{ "off", "overflow", "all" }) |raw| try check(kv, raw, true);
++    for ([_][]const u8{ "OVERFLOW", "host", "1" }) |raw| try check(kv, raw, false);
++    try t.expectEqual(@as(u64, 0), try e.value(u64, kv, "off", 0));
++    try t.expectEqual(@as(u64, 1), try e.value(u64, kv, "overflow", 0));
++    try t.expectEqual(@as(u64, 2), try e.value(u64, kv, "all", 0));
++    try t.expectEqual(@as(?u64, null), try e.value(?u64, kv, null, null));
++}
++
+ test "Flash Next strict env: the late keep reads unset and blank as null, and 0 and 1 as false and true" {
+     const name = "TF_FLASHNEXT_KEEP_LATE";
+     for ([_]?[]const u8{ null, "", " ", "\t", " \t\r\n" }) |raw|
+diff --git a/zig/tests/cuda/flashnext_kv_host_tests.zig b/zig/tests/cuda/flashnext_kv_host_tests.zig
+new file mode 100644
+index 000000000..838f6cc91
+--- /dev/null
++++ b/zig/tests/cuda/flashnext_kv_host_tests.zig
+@@ -0,0 +1,74 @@
++//! A stream's K/V rows on mapped pinned host pages: device writes, memsets and copies reach them, byte for byte.
++const std = @import("std");
++const cuda = @import("cuda");
++const flash = @import("flashnext");
++const check = @import("check.zig");
++const kv_host = flash.kv_host;
++const wt = flash.wt;
++const seq_bytes = flash.seq_bytes;
++
++pub fn run(gpu: check.Gpu) !void {
++    std.debug.print("flashnext-kv-host: placement mode {s}\n", .{@tagName(kv_host.mode)});
++    kv_host.mode = .all; // the serving mode's placement, whatever the process carried in
++    defer kv_host.mode = .off;
++    defer kv_host.spares.deinit();
++    var stream = try cuda.Stream.init(gpu.d, true);
++    defer stream.deinit();
++    // each band twice: the second takes the first's freed pages whole
++    for ([_]usize{ 8192, 32768 }) |cap| for (0..2) |pass| {
++        const reused = try one(gpu, &stream, cap, pass == 1);
++        try check.expect(reused == (pass == 1), "band of {d} rows, pass {d}: spare taken {}", .{ cap, pass, reused });
++    };
++    check.pass("flashnext-kv-host: mapped K/V pages take device writes and copies, byte for byte", .{});
++}
++
++fn one(gpu: check.Gpu, stream: *cuda.Stream, cap: usize, allow_spare: bool) !bool {
++    const d = gpu.d;
++    const bytes = @as(usize, wt.attn_n) * seq_bytes.kvBytes(cap, .full);
++    const reused = allow_spare and kv_host.spares.fits(2 * bytes);
++    const host = try gpu.gpa.create(kv_host.Host);
++    host.* = .{ .gpa = gpu.gpa, .pages = try kv_host.spares.take(d, 2 * bytes), .kc = &.{}, .vc = &.{} };
++    errdefer kv_host.Host.release(host);
++    errdefer gpu.gpa.free(host.kc);
++    const base = try host.pages.device();
++    host.kc = try kv_host.views(gpu.gpa, d, base, bytes);
++    host.vc = try kv_host.views(gpu.gpa, d, base + bytes, bytes);
++    try check.expect(host.kc[0].len == seq_bytes.kvBytes(cap, .full), "each layer's rows named once", .{});
++    // the keys' band: a pattern a kernel's stores would leave, read back through the device's eyes
++    const want = try gpu.gpa.alloc(u8, 2 * bytes);
++    defer gpu.gpa.free(want);
++    for (want[0..bytes], 0..) |*v, i| v.* = @truncate(i *% 2654435761 >> 7);
++    @memset(want[bytes..], 0x5a);
++    var src = try cuda.DeviceBuffer.alloc(d, 2 * bytes);
++    defer src.free();
++    try src.upload(0, want);
++    var dst = try cuda.DeviceBuffer.alloc(d, 2 * bytes);
++    defer dst.free();
++    const t0 = check.now(gpu.io);
++    try d.check(d.api.cuMemcpyDtoDAsync_v2(host.kc[0].ptr, src.ptr, bytes, stream.handle), "key band copy");
++    try stream.synchronize();
++    const t1 = check.now(gpu.io);
++    // the values' band: a device memset straight through the mapped pointer
++    try d.check(d.api.cuMemsetD8Async(host.vc[0].ptr, 0x5a, bytes, stream.handle), "value band memset");
++    try stream.synchronize();
++    const t2 = check.now(gpu.io);
++    try d.check(d.api.cuMemcpyDtoDAsync_v2(dst.ptr, base, 2 * bytes, stream.handle), "read back");
++    try stream.synchronize();
++    const t3 = check.now(gpu.io);
++    const got = try gpu.gpa.alloc(u8, 2 * bytes);
++    defer gpu.gpa.free(got);
++    try dst.download(0, got);
++    try check.sameBytes("mapped K/V pages", got, want);
++    gpu.gpa.free(host.kc);
++    gpu.gpa.free(host.vc);
++    kv_host.Host.release(host);
++    const gib = @as(f64, @floatFromInt(2 * bytes)) / (1 << 30);
++    std.debug.print("  {d} rows {s}: {d:.3} GiB, write {d:.2} GiB/s, memset {d:.2} GiB/s, read {d:.2} GiB/s\n", .{
++        cap, if (reused) "from a spare" else "newly pinned", gib, gib / s(t1 - t0), gib / s(t2 - t1), gib / s(t3 - t2),
++    });
++    return reused;
++}
++
++fn s(ns: i96) f64 {
++    return @as(f64, @floatFromInt(ns)) / 1e9;
++}
+diff --git a/zig/tests/cuda/main.zig b/zig/tests/cuda/main.zig
+index 27a2be45c..34523df72 100644
+--- a/zig/tests/cuda/main.zig
++++ b/zig/tests/cuda/main.zig
+@@ -90,6 +90,7 @@ const flashnext_rank_tests = @import("flashnext_rank_tests.zig");
+ const flashnext_draft_affine_tests = @import("flashnext_draft_affine_tests.zig");
+ const flashnext_shared_tests = @import("flashnext_shared_tests.zig");
+ const flashnext_snap_host_tests = @import("flashnext_snap_host_tests.zig");
++const flashnext_kv_host_tests = @import("flashnext_kv_host_tests.zig");
+ const flashnext_nvfp4_tp_tests = @import("flashnext_nvfp4_tp_tests.zig");
+ const flashnext_fp8_experts_tests = @import("flashnext_fp8_experts_tests.zig");
+ const nvfp4_fact_tests = @import("nvfp4_fact_tests.zig");
+@@ -370,6 +371,7 @@ fn run(gpu: check.Gpu, cmd: []const u8, rest: []const [:0]const u8) !void {
+     if (std.mem.eql(u8, cmd, "flashnext-draft-affine")) return flashnext_draft_affine_tests.run(gpu);
+     if (std.mem.eql(u8, cmd, "flashnext-shared")) return flashnext_shared_tests.run(gpu);
+     if (std.mem.eql(u8, cmd, "flashnext-snap-host")) return flashnext_snap_host_tests.run(gpu);
++    if (std.mem.eql(u8, cmd, "flashnext-kv-host")) return flashnext_kv_host_tests.run(gpu);
+     if (std.mem.eql(u8, cmd, "flashnext-nvfp4-tp")) return flashnext_nvfp4_tp_tests.run(gpu);
+     if (std.mem.eql(u8, cmd, "flashnext-fp8-experts")) return flashnext_fp8_experts_tests.run(gpu);
+     if (std.mem.eql(u8, cmd, "moetile")) return @import("moetile_tests.zig").run(gpu);
+diff --git a/zig/tests/cuda/main_usage.zig b/zig/tests/cuda/main_usage.zig
+index e8c5ab9b2..97c64e251 100644
+--- a/zig/tests/cuda/main_usage.zig
++++ b/zig/tests/cuda/main_usage.zig
+@@ -12,6 +12,7 @@ pub const usage =
+     \\  flashnext-windows MODEL IDS_FILE  several streams' windows in one shared verify against each alone
+     \\  flashnext-mtp-parity MODEL IDS_FILE  several streams' MTP heads in one shared pass against each alone
+     \\  flashnext-snap-host  kept states in pinned host memory: device copies both ways, byte for byte; spares reused
++    \\  flashnext-kv-host  a stream's K/V rows on mapped pinned host pages: device writes, memsets and copies reach them
+     \\  flashnext-score MODEL IDS_FILE  decisions' label scores against a plain pass's last row
+     \\  flashnext-model-rank MODEL RANK PORT IDS_FILE [rounds|leave] [MASTER]  full-model rounds == eager rows; leave: the peer is stopped
+     \\  flashnext-rank RANK PORT [sum|eof|timeout|missing|eof-scatter|timeout-scatter|exchange] [MASTER]  two-process collectives, failures, the expert exchange

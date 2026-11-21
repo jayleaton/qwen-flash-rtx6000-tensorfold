@@ -1,0 +1,607 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jay Leaton <58495321+jayleaton@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 13:03:09 +0700
+Subject: [PATCH 29/46] flashnext cuda: a discrete card's kept states reuse
+ freed pinned buffers (cuda.HostSpares, shared with qwen3_5)
+
+---
+ zig/src/cuda/host_spares.zig                  | 76 +++++++++++++++++++
+ zig/src/cuda/root.zig                         |  1 +
+ zig/src/families/flashnext/cuda_disk.zig      |  2 +-
+ zig/src/families/flashnext/cuda_lanes.zig     | 18 ++---
+ .../families/flashnext/cuda_lanes_load.zig    |  4 +-
+ .../flashnext/cuda_lanes_restore_test.zig     |  2 +-
+ .../families/flashnext/cuda_lanes_snap.zig    | 21 ++++-
+ .../flashnext/cuda_paging_snap_test.zig       |  8 +-
+ zig/src/families/flashnext/cuda_prompt.zig    | 10 ++-
+ .../families/flashnext/cuda_rank_engine.zig   |  4 +-
+ zig/src/families/flashnext/cuda_snap.zig      | 51 +++++++++----
+ zig/src/families/qwen3_5/cuda_spares.zig      | 73 +-----------------
+ zig/tests/cuda/flashnext_snap_host_tests.zig  | 19 +++--
+ zig/tests/cuda/main_usage.zig                 |  2 +-
+ 14 files changed, 175 insertions(+), 116 deletions(-)
+ create mode 100644 zig/src/cuda/host_spares.zig
+
+diff --git a/zig/src/cuda/host_spares.zig b/zig/src/cuda/host_spares.zig
+new file mode 100644
+index 000000000..1a27bb25e
+--- /dev/null
++++ b/zig/src/cuda/host_spares.zig
+@@ -0,0 +1,76 @@
++//! Freed pinned host buffers, kept whole for the next kept state or disk recall of the same size.
++const HostBuffer = @import("memory.zig").HostBuffer;
++const Driver = @import("driver.zig").Driver;
++
++/// Freed pinned buffers, oldest first; one comes back only once no copy into or out of it can still be queued.
++pub const HostSpares = struct {
++    bufs: [cap]HostBuffer = undefined,
++    n: usize = 0,
++    /// Buffers mapped into the device's address space (HostBuffer.allocMapped), which device copies reach directly.
++    mapped: bool = false,
++
++    /// The most buffers kept; the prompt cache's budget trims them further (`trim`).
++    pub const cap = 2;
++
++    /// The newest spare of exactly `len` bytes.
++    fn find(s: *const HostSpares, len: usize) ?usize {
++        var i = s.n;
++        while (i > 0) {
++            i -= 1;
++            if (s.bufs[i].bytes.len == len) return i;
++        }
++        return null;
++    }
++
++    fn remove(s: *HostSpares, i: usize) HostBuffer {
++        const host = s.bufs[i];
++        for (i..s.n - 1) |j| s.bufs[j] = s.bufs[j + 1];
++        s.n -= 1;
++        return host;
++    }
++
++    /// Whether a spare of exactly `len` bytes waits.
++    pub fn fits(s: *const HostSpares, len: usize) bool {
++        return s.find(len) != null;
++    }
++
++    /// A buffer of `len` bytes: a spare of that size, else newly pinned memory.
++    pub fn take(s: *HostSpares, d: *const Driver, len: usize) !HostBuffer {
++        const i = s.find(len) orelse return if (s.mapped) HostBuffer.allocMapped(d, len) else HostBuffer.alloc(d, len);
++        return s.remove(i);
++    }
++
++    /// A drained buffer back (no copy queued into or out of it); a full list frees its oldest.
++    pub fn give(s: *HostSpares, host: HostBuffer) void {
++        if (s.n == cap) {
++            var old = s.remove(0);
++            old.free();
++        }
++        s.bufs[s.n] = host;
++        s.n += 1;
++    }
++
++    /// The spares' bytes.
++    pub fn bytes(s: *const HostSpares) u64 {
++        var n: u64 = 0;
++        for (s.bufs[0..s.n]) |b| n += b.bytes.len;
++        return n;
++    }
++
++    /// Spares freed, the largest first, until at most `room` bytes stay.
++    pub fn trim(s: *HostSpares, room: u64) void {
++        while (s.bytes() > room) {
++            var big: usize = 0;
++            for (s.bufs[1..s.n], 1..) |b, i| if (b.bytes.len > s.bufs[big].bytes.len) {
++                big = i;
++            };
++            var old = s.remove(big);
++            old.free();
++        }
++    }
++
++    /// Every spare freed: with the engine, after the prompt cache dropped its states.
++    pub fn deinit(s: *HostSpares) void {
++        s.trim(0);
++    }
++};
+diff --git a/zig/src/cuda/root.zig b/zig/src/cuda/root.zig
+index b6476817f..87d168d22 100644
+--- a/zig/src/cuda/root.zig
++++ b/zig/src/cuda/root.zig
+@@ -11,6 +11,7 @@ pub const Error = @import("driver.zig").Error;
+ pub const Context = @import("context.zig").Context;
+ pub const DeviceBuffer = @import("memory.zig").DeviceBuffer;
+ pub const HostBuffer = @import("memory.zig").HostBuffer;
++pub const HostSpares = @import("host_spares.zig").HostSpares;
+ pub const memory = @import("memory.zig");
+ pub const download_stage = @import("download_stage.zig");
+ pub const memory_receipt = @import("memory_receipt.zig");
+diff --git a/zig/src/families/flashnext/cuda_disk.zig b/zig/src/families/flashnext/cuda_disk.zig
+index 2334f80de..55682c970 100644
+--- a/zig/src/families/flashnext/cuda_disk.zig
++++ b/zig/src/families/flashnext/cuda_disk.zig
+@@ -81,7 +81,7 @@ pub fn View(comptime F: type) type {
+ 
+         /// A kept state's memory for `at` tokens with the head's rows if this server drafts, filled by `scatter`.
+         pub fn blank(c: *Target, at: u32) !*State {
+-            return snap.prepare(c.gpa, c.engine.driver, c.engine.kept_host, at, .{ 0, 0 }, c.head != null, .full);
++            return snap.prepare(c.gpa, c.engine.driver, c.engine.keptOn(), at, .{ 0, 0 }, c.head != null, .full);
+         }
+ 
+         /// A state from a stream that did not draft lacks the head's rows this server's parts name: it stays off disk.
+diff --git a/zig/src/families/flashnext/cuda_lanes.zig b/zig/src/families/flashnext/cuda_lanes.zig
+index 3fd905840..e84feb63b 100644
+--- a/zig/src/families/flashnext/cuda_lanes.zig
++++ b/zig/src/families/flashnext/cuda_lanes.zig
+@@ -39,6 +39,10 @@ pub fn Namespace(comptime Tri: type) type {
+         pub const snap_save = snaps.save;
+         pub const snap_restore = snaps.restore;
+         pub const snap_drop = snaps.drop;
++        /// A discrete card's freed pinned buffers: in the cache's budget, taken by the next state of their size.
++        pub const snap_spare = snaps.spare;
++        pub const snap_trim = snaps.trim;
++        pub const snap_reuses = snaps.reuses;
+         pub const kept_view = @import("cuda_disk.zig").View(@This()); // their disk image (native/cuda_kept.zig)
+         /// TF_FLASHNEXT_KV_PAGES: the pool's lanes, the pages of a request's rows and a drafted window (kvl).
+         pub const window_rows = kvl.window_rows;
+@@ -99,17 +103,11 @@ pub fn Namespace(comptime Tri: type) type {
+         };
+ 
+         /// Device bytes of the checkpoint: the n-gram tables stay mapped, the MTP head counts; 0 if unread.
+-        pub fn deviceWeightBytes(gpa: std.mem.Allocator, io: std.Io, dir: []const u8) u64 {
+-            return bytes.deviceWeightBytes(gpa, io, dir);
+-        }
+-        pub fn placementWeightBytes(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, world: usize, rank: usize, drafts: bool) !u64 {
+-            return bytes.placementWeightBytes(gpa, io, dir, world, rank, drafts);
+-        }
+-
++        pub const deviceWeightBytes = bytes.deviceWeightBytes;
++        pub const placementWeightBytes = bytes.placementWeightBytes;
+         /// The tower's weights and one call's scratch, which rank zero holds beside the text weights with --vision.
+-        pub fn visionBytes(a: std.mem.Allocator, io: std.Io, dir: []const u8) !u64 {
+-            return bytes.visionBytes(a, io, dir);
+-        }
++        pub const visionBytes = bytes.visionBytes;
++
+         pub fn healthy(ptr: *anyopaque) bool {
+             if (of(ptr).ranks) |r| return r.healthy();
+             return true;
+diff --git a/zig/src/families/flashnext/cuda_lanes_load.zig b/zig/src/families/flashnext/cuda_lanes_load.zig
+index bf803c5a1..086b217e4 100644
+--- a/zig/src/families/flashnext/cuda_lanes_load.zig
++++ b/zig/src/families/flashnext/cuda_lanes_load.zig
+@@ -64,7 +64,7 @@ pub fn open(comptime F: type, gpa: std.mem.Allocator, io: std.Io, ctx: *const cu
+     own.engine = try prompt.Engine.initRank(gpa, io, driver, &own.stream, dir, o.tp, o.rank);
+     errdefer own.engine.deinit();
+     own.engine.chunk = chunk;
+-    own.engine.kept_host = try @import("cuda_snap.zig").onHost(ctx);
++    own.engine.kept = if (try @import("cuda_snap.zig").onHost(ctx)) .{ .mapped = true } else null;
+     if (own.ranks) |r| {
+         r.engine = own.engine;
+         own.engine.collective = &r.collective;
+@@ -128,7 +128,7 @@ pub fn open(comptime F: type, gpa: std.mem.Allocator, io: std.Io, ctx: *const cu
+         .learns = if (o.slide) own else null,
+         .learn_bytes = if (o.slide) @import("cuda_train.zig").memory() else 0,
+         .target = own,
+-        .host_snaps = own.engine.kept_host,
++        .host_snaps = own.engine.kept != null,
+         .own_glue = own.set == null,
+         .follow = if (o.rank != 0) F.follow else null,
+     };
+diff --git a/zig/src/families/flashnext/cuda_lanes_restore_test.zig b/zig/src/families/flashnext/cuda_lanes_restore_test.zig
+index a7598a3ff..615ad748d 100644
+--- a/zig/src/families/flashnext/cuda_lanes_restore_test.zig
++++ b/zig/src/families/flashnext/cuda_lanes_restore_test.zig
+@@ -152,7 +152,7 @@ fn follower(comptime Cuda: type, frames: []const wire.Header, setup: *const fn (
+     engine.chunk = 16;
+     engine.heads = .full;
+     engine.round_graph = .{};
+-    engine.kept_host = false;
++    engine.kept = null;
+     var pair: [2]std.posix.socket_t = undefined;
+     if (std.c.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0, &pair) != 0) return error.SocketPair;
+     defer _ = std.c.close(pair[0]);
+diff --git a/zig/src/families/flashnext/cuda_lanes_snap.zig b/zig/src/families/flashnext/cuda_lanes_snap.zig
+index 84abde430..f12ad0690 100644
+--- a/zig/src/families/flashnext/cuda_lanes_snap.zig
++++ b/zig/src/families/flashnext/cuda_lanes_snap.zig
+@@ -26,7 +26,7 @@ pub fn Snaps(comptime Cuda: type) type {
+             const inpass = forms.in_pass and self.ranks == null and l.seq.media == null and forms.gdn_fused;
+             for (s.reuse.marks) |m| if (m > at and m < stop0) {
+                 if (inpass and n < parts.max_marks) {
+-                    if (snap.prepare(self.gpa, self.engine.driver, self.engine.kept_host, m, historyAt(l.seq.history, ids, at, m), l.draft != null, l.seq.heads)) |p| {
++                    if (snap.prepare(self.gpa, self.engine.driver, self.engine.keptOn(), m, historyAt(l.seq.history, ids, at, m), l.draft != null, l.seq.heads)) |p| {
+                         l.prepared[n] = p;
+                         marks[n] = .{ .at = m, .base = p.buf.ptr };
+                         n += 1;
+@@ -58,7 +58,22 @@ pub fn Snaps(comptime Cuda: type) type {
+         }
+ 
+         pub fn bytes(ptr: *anyopaque, at: u32) u64 {
+-            return snap.bytes(at, of(ptr).head != null, of(ptr).engine.heads);
++            return snap.keptBytes(at, of(ptr).head != null, of(ptr).engine.heads, of(ptr).engine.kept != null);
++        }
++
++        /// The freed pinned buffers kept for the next host state (none on an integrated GPU).
++        pub fn spare(ptr: *anyopaque) u64 {
++            return if (of(ptr).engine.kept) |s| s.bytes() else 0;
++        }
++
++        pub fn trim(ptr: *anyopaque, room: u64) void {
++            if (of(ptr).engine.keptOn()) |s| s.trim(room);
++        }
++
++        /// Whether a state at `at` takes a spare: a host state, with a spare of its rounded size.
++        pub fn reuses(ptr: *anyopaque, at: u32) bool {
++            const s = of(ptr).engine.keptOn() orelse return false;
++            return s.fits(bytes(ptr, at));
+         }
+ 
+         /// The owner stream's state, its prompt pass standing at `at` (a drafting stream's with the head's rows).
+@@ -75,7 +90,7 @@ pub fn Snaps(comptime Cuda: type) type {
+             // pending DeltaNet rows into the states first: a snapshot holds them as they stand
+             if (l.draft) |*d| try self.ops().flushLate(&l.seq, d);
+             if (self.ranks) |r| return try r.save(&l.seq, if (l.draft) |*d| d else null);
+-            return try snap.save(self.gpa, self.engine.driver, self.engine.kept_host, self.stream, &l.seq, if (l.draft) |*d| d else null);
++            return try snap.save(self.gpa, self.engine.driver, self.engine.keptOn(), self.stream, &l.seq, if (l.draft) |*d| d else null);
+         }
+ 
+         pub fn restore(ptr: *anyopaque, owner: ?*anyopaque, saved: *anyopaque) anyerror!void {
+diff --git a/zig/src/families/flashnext/cuda_paging_snap_test.zig b/zig/src/families/flashnext/cuda_paging_snap_test.zig
+index 3726a03f6..901d5d15f 100644
+--- a/zig/src/families/flashnext/cuda_paging_snap_test.zig
++++ b/zig/src/families/flashnext/cuda_paging_snap_test.zig
+@@ -82,7 +82,7 @@ test "paged snapshots: save and restore keep contiguous order across partial shu
+     f.ids = .{ 7, 2, 11, 0 };
+     f.init(&d);
+     var seq = f.seq(&d);
+-    const kept = try snap.save(std.testing.allocator, &d, false, stream, &seq, null);
++    const kept = try snap.save(std.testing.allocator, &d, null, stream, &seq, null);
+     defer snap.drop(std.testing.allocator, stream, kept);
+     const saved = Fake.copies;
+     const n = Fake.n;
+@@ -128,7 +128,7 @@ test "paged snapshots: a failed copy drains before freeing the snapshot destinat
+     var seq = f.seq(&d);
+     Fake.fail_copy = 5;
+     Fake.fail_wait = true;
+-    try std.testing.expectError(error.NotReady, snap.save(std.testing.allocator, &d, false, stream, &seq, null));
++    try std.testing.expectError(error.NotReady, snap.save(std.testing.allocator, &d, null, stream, &seq, null));
+     try std.testing.expect(!Fake.pending and !Fake.early_free);
+ }
+ 
+@@ -139,7 +139,7 @@ test "paged snapshots: drop requires context proof when its stream wait fails" {
+     f.ids = .{ 7, 2, 11, 0 };
+     f.init(&d);
+     var seq = f.seq(&d);
+-    const kept = try snap.save(std.testing.allocator, &d, false, stream, &seq, null);
++    const kept = try snap.save(std.testing.allocator, &d, null, stream, &seq, null);
+     Fake.pending = true;
+     Fake.fail_wait = true;
+     snap.drop(std.testing.allocator, stream, kept);
+@@ -160,7 +160,7 @@ test "paged snapshots: the pooled MTP head occupies the thirteenth layer with th
+     var head = try Draft.initIn(std.testing.allocator, &d, 200, 8, 16, &p, 0xa000_0000, Draft.runBytes(8, 16));
+     defer head.deinit();
+     head.len = seq.fed;
+-    const kept = try snap.save(std.testing.allocator, &d, false, stream, &seq, &head);
++    const kept = try snap.save(std.testing.allocator, &d, null, stream, &seq, &head);
+     defer snap.drop(std.testing.allocator, stream, kept);
+     const saved = Fake.copies;
+     const n = Fake.n;
+diff --git a/zig/src/families/flashnext/cuda_prompt.zig b/zig/src/families/flashnext/cuda_prompt.zig
+index 42c3a8f6c..40553ad02 100644
+--- a/zig/src/families/flashnext/cuda_prompt.zig
++++ b/zig/src/families/flashnext/cuda_prompt.zig
+@@ -125,8 +125,8 @@ pub const Engine = struct {
+     busy_chunk: usize = batch.default_chunk,
+     /// The heads every model layer holds on this rank, which each stream's caches take (the MTP head's are full).
+     heads: Heads = .full,
+-    /// Kept prompt states in mapped pinned host memory (cuda_snap.onHost: a discrete card), else in device memory.
+-    kept_host: bool = false,
++    /// A discrete card's freed pinned buffers, its kept states in mapped host memory (cuda_snap.onHost); null: device.
++    kept: ?cuda.HostSpares = null,
+     round_graph: round_graph.Cache = .{},
+     graphs: @import("cuda_window_graph.zig").Graphs = .{}, // drafted windows, draft-head pieces, rollbacks on one GPU
+     image_factory: ?*@import("cuda_images.zig").Vision = null,
+@@ -221,7 +221,13 @@ pub const Engine = struct {
+         return e;
+     }
+ 
++    /// Where kept states go: the spares a discrete card's pinned states come from and return to; null: device memory.
++    pub fn keptOn(e: *Engine) ?*cuda.HostSpares {
++        return if (e.kept) |*s| s else null;
++    }
++
+     pub fn deinit(e: *Engine) void {
++        if (e.kept) |*s| s.deinit();
+         e.round_graph.clear();
+         e.graphs.clear(e.gpa);
+         e.pockets.deinit();
+diff --git a/zig/src/families/flashnext/cuda_rank_engine.zig b/zig/src/families/flashnext/cuda_rank_engine.zig
+index e29868020..5a1f080d9 100644
+--- a/zig/src/families/flashnext/cuda_rank_engine.zig
++++ b/zig/src/families/flashnext/cuda_rank_engine.zig
+@@ -265,7 +265,7 @@ pub const Session = struct {
+ 
+     /// The leader's copy, the head's rows in it with `d`; the peer has no head, and first flushes its pending rows.
+     pub fn save(s: *Session, q: *prompt.Seq, d: ?*mtp.Draft) !*snaps.Snap {
+-        const kept = try snaps.save(s.gpa, s.engine.driver, s.engine.kept_host, s.engine.stream.*, q, d);
++        const kept = try snaps.save(s.gpa, s.engine.driver, s.engine.keptOn(), s.engine.stream.*, q, d);
+         errdefer snaps.drop(s.gpa, s.engine.stream.*, kept);
+         kept.rank_id = s.next_object;
+         s.next_object = std.math.add(u64, s.next_object, 1) catch return error.BadRankFrame;
+@@ -391,7 +391,7 @@ pub const Session = struct {
+                     const ops: mtp.Ops(Tri) = .{ .e = s.engine, .tri = tri, .h = undefined };
+                     try ops.flushLate(q, w); // the state holds them as the leader's does
+                 }
+-                const kept = try snaps.save(s.gpa, s.engine.driver, s.engine.kept_host, s.engine.stream.*, q, null);
++                const kept = try snaps.save(s.gpa, s.engine.driver, s.engine.keptOn(), s.engine.stream.*, q, null);
+                 errdefer snaps.drop(s.gpa, s.engine.stream.*, kept);
+                 try s.saved.put(s.gpa, h.arg, kept);
+             },
+diff --git a/zig/src/families/flashnext/cuda_snap.zig b/zig/src/families/flashnext/cuda_snap.zig
+index c4308527e..0f56afa01 100644
+--- a/zig/src/families/flashnext/cuda_snap.zig
++++ b/zig/src/families/flashnext/cuda_snap.zig
+@@ -31,13 +31,24 @@ pub fn bytes(at: usize, head: bool, h: Heads) usize {
+     return own + if (head) attnBytes(at, head_heads) else 0;
+ }
+ 
++/// Host states' storage rounds up to this, so a freed buffer serves the next state within its band of tokens.
++pub const host_grain: usize = 32 << 20;
++
++/// Bytes a state's storage takes: in pinned host memory (`host`), `bytes` rounded up to `host_grain`.
++pub fn keptBytes(at: usize, head: bool, h: Heads, host: bool) usize {
++    const n = bytes(at, head, h);
++    return if (host) std.mem.alignForward(usize, n, host_grain) else n;
++}
++
+ /// One kept state; `head`: it holds the MTP head's cache over the same rows, which a drafting stream needs.
+ pub const Snap = struct {
+     rank_id: u64 = 0,
+     /// What the device copies reach: its own device buffer, or a borrowed view of `host`'s mapped pages.
+     buf: cuda.DeviceBuffer,
+-    /// The state's mapped pinned host memory (a discrete card's), freed on drop; null: `buf` owns device memory.
++    /// The state's mapped pinned host memory (a discrete card's); null: `buf` owns device memory.
+     host: ?cuda.HostBuffer = null,
++    /// Where `host` goes once drained: the engine's spares.
++    spares: ?*cuda.HostSpares = null,
+     at: usize,
+     history: [2]i64,
+     head: bool,
+@@ -71,17 +82,21 @@ pub fn onHost(ctx: *const cuda.Context) !bool {
+     return try ctx.attribute(.integrated) == 0;
+ }
+ 
+-/// `n` bytes of device memory, or of mapped pinned host memory (`host`) that the same device-to-device copies reach.
+-fn room(driver: *const cuda.Driver, n: usize, host: bool) !struct { cuda.DeviceBuffer, ?cuda.HostBuffer } {
+-    if (!host) return .{ try cuda.DeviceBuffer.alloc(driver, n), null };
+-    var pinned = try cuda.HostBuffer.allocMapped(driver, n);
++/// `n` bytes of device memory, or (`spares`) mapped pinned host memory the same copies reach, a spare when one fits.
++fn room(driver: *const cuda.Driver, n: usize, spares: ?*cuda.HostSpares) !struct { cuda.DeviceBuffer, ?cuda.HostBuffer } {
++    const s = spares orelse return .{ try cuda.DeviceBuffer.alloc(driver, n), null };
++    std.debug.assert(s.mapped);
++    var pinned = try s.take(driver, std.mem.alignForward(usize, n, host_grain));
+     errdefer pinned.free();
+     return .{ .{ .d = driver, .ptr = try pinned.device(), .len = n, .borrowed = true }, pinned };
+ }
+ 
+ fn release(gpa: std.mem.Allocator, snap: *Snap) void {
+     snap.buf.free();
+-    if (snap.host) |*h| h.free();
++    if (snap.host) |h| if (snap.spares) |s| s.give(h) else {
++        var own = h;
++        own.free();
++    };
+     gpa.destroy(snap);
+ }
+ 
+@@ -157,10 +172,10 @@ fn move(stream: cuda.Stream, seq: *prompt.Seq, d: ?*Draft, base: u64, at: usize,
+ }
+ 
+ /// A copy of `seq` (and of the head's cache, with `d`) as it stands after `seq.fed` tokens.
+-pub fn save(gpa: std.mem.Allocator, driver: *const cuda.Driver, host: bool, stream: cuda.Stream, seq: *prompt.Seq, d: ?*Draft) !*Snap {
++pub fn save(gpa: std.mem.Allocator, driver: *const cuda.Driver, spares: ?*cuda.HostSpares, stream: cuda.Stream, seq: *prompt.Seq, d: ?*Draft) !*Snap {
+     const at = seq.fed;
+     if (d) |h| if (h.len != at or h.drafted != 0) return error.NotAtMark;
+-    const snap = try prepare(gpa, driver, host, at, seq.history, d != null, seq.heads);
++    const snap = try prepare(gpa, driver, spares, at, seq.history, d != null, seq.heads);
+     errdefer release(gpa, snap);
+     errdefer cuda.completion.drain(driver, stream, "a failed snapshot save did not drain");
+     try move(stream, seq, d, snap.buf.ptr, at, .save);
+@@ -169,11 +184,11 @@ pub fn save(gpa: std.mem.Allocator, driver: *const cuda.Driver, host: bool, stre
+ }
+ 
+ /// A kept state for position `at` that a pass running past it fills (Hooks.marks); `finish` adds the attention rows.
+-pub fn prepare(gpa: std.mem.Allocator, driver: *const cuda.Driver, host: bool, at: usize, history: [2]i64, head: bool, heads: Heads) !*Snap {
++pub fn prepare(gpa: std.mem.Allocator, driver: *const cuda.Driver, spares: ?*cuda.HostSpares, at: usize, history: [2]i64, head: bool, heads: Heads) !*Snap {
+     const snap = try gpa.create(Snap);
+     errdefer gpa.destroy(snap);
+-    const buf, const pinned = try room(driver, bytes(at, head, heads), host);
+-    snap.* = .{ .buf = buf, .host = pinned, .at = at, .history = history, .head = head, .heads = heads };
++    const buf, const pinned = try room(driver, bytes(at, head, heads), spares);
++    snap.* = .{ .buf = buf, .host = pinned, .spares = if (pinned != null) spares else null, .at = at, .history = history, .head = head, .heads = heads };
+     return snap;
+ }
+ 
+@@ -277,7 +292,7 @@ const Placing = struct {
+     }
+ };
+ 
+-test "a discrete card keeps states in mapped pinned host memory, an integrated GPU in device memory as before" {
++test "a discrete card keeps states in mapped pinned host memory, pinned once for every state of a band; an integrated GPU in device memory" {
+     var d: cuda.Driver = .{ .lib = undefined, .api = undefined };
+     d.api.cuDeviceGetAttribute = Placing.attribute;
+     d.api.cuMemAlloc_v2 = Placing.alloc;
+@@ -293,16 +308,24 @@ test "a discrete card keeps states in mapped pinned host memory, an integrated G
+         Placing.counts = .{};
+         const host = try onHost(&ctx);
+         try std.testing.expectEqual(integrated == 0, host);
++        var spares: cuda.HostSpares = .{ .mapped = true };
++        const kept_on = if (host) &spares else null;
+         const before = cuda.usage(false).device;
+-        const kept = try prepare(std.testing.allocator, &d, host, 8, .{ 1, 2 }, true, .full);
++        const kept = try prepare(std.testing.allocator, &d, kept_on, 8, .{ 1, 2 }, true, .full);
+         // the device copies reach the state at buf.ptr either way: the host's mapped address, or its device buffer
+         try std.testing.expectEqual(@as(u64, if (host) 0x6000_0000 else 0x8000_0000), kept.buf.ptr);
+         try std.testing.expectEqual(bytes(8, true, .full), kept.buf.len);
+         try std.testing.expectEqual(host, kept.host != null and kept.buf.borrowed);
+         try std.testing.expectEqual(before + if (host) 0 else kept.buf.len, cuda.usage(false).device);
+         drop(std.testing.allocator, stream, kept);
++        // a later state of the same band takes the freed buffer: no second pin
++        const again = try prepare(std.testing.allocator, &d, kept_on, 100, .{ 1, 2 }, true, .full);
++        drop(std.testing.allocator, stream, again);
++        try std.testing.expectEqual(if (host) keptBytes(100, true, .full, true) else 0, spares.bytes());
++        spares.deinit();
+         const c = Placing.counts;
+-        try std.testing.expectEqual([4]usize{ @intFromBool(!host), @intFromBool(!host), @intFromBool(host), @intFromBool(host) }, [4]usize{ c.alloc, c.free, c.pin, c.unpin });
++        const dev: usize = if (host) 0 else 2;
++        try std.testing.expectEqual([4]usize{ dev, dev, @intFromBool(host), @intFromBool(host) }, [4]usize{ c.alloc, c.free, c.pin, c.unpin });
+         try std.testing.expectEqual(host, c.mapped);
+     }
+ }
+diff --git a/zig/src/families/qwen3_5/cuda_spares.zig b/zig/src/families/qwen3_5/cuda_spares.zig
+index cc075123e..ef859a38e 100644
+--- a/zig/src/families/qwen3_5/cuda_spares.zig
++++ b/zig/src/families/qwen3_5/cuda_spares.zig
+@@ -1,78 +1,9 @@
+ //! Qwen3.5 CUDA kept states' freed pinned buffers, kept whole for the next save or disk recall of the same size.
+-const std = @import("std");
+ const cuda = @import("cuda");
+ const reuse = @import("cuda_reuse.zig");
+ 
+-/// Freed pinned buffers, oldest first; one comes back only once no copy into or out of it can still be queued.
+-pub const Spares = struct {
+-    bufs: [cap]cuda.HostBuffer = undefined,
+-    n: usize = 0,
+-
+-    /// The most buffers kept; the prompt cache's budget trims them further (`trim`).
+-    pub const cap = 2;
+-
+-    /// The newest spare of exactly `len` bytes.
+-    fn find(s: *const Spares, len: usize) ?usize {
+-        var i = s.n;
+-        while (i > 0) {
+-            i -= 1;
+-            if (s.bufs[i].bytes.len == len) return i;
+-        }
+-        return null;
+-    }
+-
+-    fn remove(s: *Spares, i: usize) cuda.HostBuffer {
+-        const host = s.bufs[i];
+-        for (i..s.n - 1) |j| s.bufs[j] = s.bufs[j + 1];
+-        s.n -= 1;
+-        return host;
+-    }
+-
+-    /// Whether a spare of exactly `len` bytes waits.
+-    pub fn fits(s: *const Spares, len: usize) bool {
+-        return s.find(len) != null;
+-    }
+-
+-    /// A buffer of `len` bytes: a spare of that size, else newly pinned memory.
+-    pub fn take(s: *Spares, d: *const cuda.Driver, len: usize) !cuda.HostBuffer {
+-        const i = s.find(len) orelse return cuda.HostBuffer.alloc(d, len);
+-        return s.remove(i);
+-    }
+-
+-    /// A drained buffer back (no copy queued into or out of it); a full list frees its oldest.
+-    pub fn give(s: *Spares, host: cuda.HostBuffer) void {
+-        if (s.n == cap) {
+-            var old = s.remove(0);
+-            old.free();
+-        }
+-        s.bufs[s.n] = host;
+-        s.n += 1;
+-    }
+-
+-    /// The spares' bytes.
+-    pub fn bytes(s: *const Spares) u64 {
+-        var n: u64 = 0;
+-        for (s.bufs[0..s.n]) |b| n += b.bytes.len;
+-        return n;
+-    }
+-
+-    /// Spares freed, the largest first, until at most `room` bytes stay.
+-    pub fn trim(s: *Spares, room: u64) void {
+-        while (s.bytes() > room) {
+-            var big: usize = 0;
+-            for (s.bufs[1..s.n], 1..) |b, i| if (b.bytes.len > s.bufs[big].bytes.len) {
+-                big = i;
+-            };
+-            var old = s.remove(big);
+-            old.free();
+-        }
+-    }
+-
+-    /// Every spare freed: with the engine, after the prompt cache dropped its states.
+-    pub fn deinit(s: *Spares) void {
+-        s.trim(0);
+-    }
+-};
++/// Freed pinned buffers, oldest first (cuda.HostSpares): plain pinned memory the copies stage through.
++pub const Spares = cuda.HostSpares;
+ 
+ /// A host copy's `len` bytes: from `spares` when the copy has a list, else newly pinned.
+ pub fn pin(spares: ?*Spares, d: *const cuda.Driver, len: usize) !cuda.HostBuffer {
+diff --git a/zig/tests/cuda/flashnext_snap_host_tests.zig b/zig/tests/cuda/flashnext_snap_host_tests.zig
+index 0e4eb73d5..fc4f0e287 100644
+--- a/zig/tests/cuda/flashnext_snap_host_tests.zig
++++ b/zig/tests/cuda/flashnext_snap_host_tests.zig
+@@ -8,11 +8,19 @@ const snap = flash.snap;
+ pub fn run(gpu: check.Gpu) !void {
+     const chosen = try snap.onHost(gpu.ctx);
+     std.debug.print("flashnext-snap-host: this card keeps states {s}\n", .{if (chosen) "in pinned host memory" else "on the device"});
+-    for ([_]usize{ 8192, 32768 }) |at| for ([_]bool{ true, false }) |host| try one(gpu, at, host);
++    var spares: cuda.HostSpares = .{ .mapped = true };
++    defer spares.deinit();
++    // each state twice: the second host state of a band takes the first one's freed buffer
++    for ([_]usize{ 8192, 32768 }) |at| for ([_]bool{ true, false }) |host| for (0..2) |i| {
++        const reused = try one(gpu, at, if (host) &spares else null);
++        try check.expect(reused == (host and i == 1), "state at {d}, pass {d}: spare taken {}", .{ at, i, reused });
++    };
+     check.pass("flashnext-snap-host: saved and restored states equal their source", .{});
+ }
+ 
+-fn one(gpu: check.Gpu, at: usize, host: bool) !void {
++fn one(gpu: check.Gpu, at: usize, spares: ?*cuda.HostSpares) !bool {
++    const host = spares != null;
++    const reused = if (spares) |x| x.fits(snap.keptBytes(at, true, .full, true)) else false;
+     const d = gpu.d;
+     const n = snap.bytes(at, true, .full);
+     const want = try gpu.gpa.alloc(u8, n);
+@@ -26,7 +34,7 @@ fn one(gpu: check.Gpu, at: usize, host: bool) !void {
+     var stream = try cuda.Stream.init(d, true);
+     defer stream.deinit();
+     const t0 = check.now(gpu.io);
+-    const st = try snap.prepare(gpu.gpa, d, host, at, .{ 0, 0 }, true, .full);
++    const st = try snap.prepare(gpu.gpa, d, spares, at, .{ 0, 0 }, true, .full);
+     const t1 = check.now(gpu.io);
+     try check.expect((st.host != null) == host, "state at {d}: placed {s}", .{ at, if (st.host != null) "on host" else "on device" });
+     try d.check(d.api.cuMemcpyDtoDAsync_v2(st.buf.ptr, src.ptr, n, stream.handle), "save copy");
+@@ -42,9 +50,10 @@ fn one(gpu: check.Gpu, at: usize, host: bool) !void {
+     try dst.download(0, got);
+     try check.sameBytes("restored state", got, want);
+     const gib = @as(f64, @floatFromInt(n)) / (1 << 30);
+-    std.debug.print("  at {d} {s}: {d:.3} GiB, place {d:.1} ms, save {d:.2} GiB/s, restore {d:.2} GiB/s, drop {d:.1} ms\n", .{
+-        at, if (host) "host" else "device", gib, ms(t1 - t0), gib / s(t2 - t1), gib / s(t3 - t2), ms(t4 - t3),
++    std.debug.print("  at {d} {s}{s}: {d:.3} GiB, place {d:.1} ms, save {d:.2} GiB/s, restore {d:.2} GiB/s, drop {d:.1} ms\n", .{
++        at, if (host) "host" else "device", if (reused) " (spare)" else "", gib, ms(t1 - t0), gib / s(t2 - t1), gib / s(t3 - t2), ms(t4 - t3),
+     });
++    return reused;
+ }
+ 
+ fn ms(ns: i96) f64 {
+diff --git a/zig/tests/cuda/main_usage.zig b/zig/tests/cuda/main_usage.zig
+index f1efe057d..3022f5a1e 100644
+--- a/zig/tests/cuda/main_usage.zig
++++ b/zig/tests/cuda/main_usage.zig
+@@ -11,7 +11,7 @@ pub const usage =
+     \\  flashnext-window-rank MODEL RANK PORT IDS_FILE  two-rank serial/window and rollback parity
+     \\  flashnext-windows MODEL IDS_FILE  several streams' windows in one shared verify against each alone
+     \\  flashnext-mtp-parity MODEL IDS_FILE  several streams' MTP heads in one shared pass against each alone
+-    \\  flashnext-snap-host  kept states in pinned host memory: device copies both ways, byte for byte
++    \\  flashnext-snap-host  kept states in pinned host memory: device copies both ways, byte for byte; spares reused
+     \\  flashnext-score MODEL IDS_FILE  decisions' label scores against a plain pass's last row
+     \\  flashnext-model-rank MODEL RANK PORT IDS_FILE [rounds|leave] [MASTER]  full-model rounds == eager rows; leave: the peer is stopped
+     \\  flashnext-rank RANK PORT [sum|eof|timeout|missing|eof-scatter|timeout-scatter|exchange] [MASTER]  two-process collectives, failures, the expert exchange

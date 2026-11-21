@@ -1,0 +1,281 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jay Leaton <58495321+jayleaton@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 15:44:27 +0700
+Subject: [PATCH 45/46] flashnext: split fn_row_best over 32 blocks a row for
+ the MTP rows
+
+fn_row_best runs one 1024-thread block per row, so a one-row draft step
+fills one SM for about 30 us. fn_row_best_max and fn_row_best_sum do the
+same two passes over (row, warp) blocks of 32 threads: each thread reads
+the same strided values and each warp does the same shuffles, so the
+best, its first id and the log-sum-exp keep their bits. The row's last
+block (an atomic ticket) folds the 32 warp sums as warp 0 did.
+
+Head.best uses the split for rows up to round_rows; the contract test
+checks the split output byte for byte against fn_row_best.
+---
+ zig/kernels/cuda/flashnext_mtp.cu             | 56 +++++++++++++++++++
+ .../core/contract/flashnext_cuda_records.zig  |  2 +
+ zig/src/families/flashnext/cuda_mtp.zig       | 38 ++++++++++++-
+ .../flashnext/cuda_mtp_nonfinite_fixture.zig  |  1 +
+ zig/tests/cuda/contract_row_best.zig          | 35 ++++++++++++
+ zig/tests/cuda/contract_tests.zig             |  2 +-
+ 6 files changed, 132 insertions(+), 2 deletions(-)
+
+diff --git a/zig/kernels/cuda/flashnext_mtp.cu b/zig/kernels/cuda/flashnext_mtp.cu
+index a6f6c047c..010e1b453 100644
+--- a/zig/kernels/cuda/flashnext_mtp.cu
++++ b/zig/kernels/cuda/flashnext_mtp.cu
+@@ -69,6 +69,62 @@ extern "C" __global__ void __launch_bounds__(1024) fn_row_best(const __nv_bfloat
+     }
+ }
+ 
++// fn_row_best's first pass, block (row, warp) as its warp: part [rows, 32, 2] = each warp's best and id bits.
++extern "C" __global__ void __launch_bounds__(32) fn_row_best_max(const __nv_bfloat16* __restrict__ L, int V, long long ld,
++                                                                 float* __restrict__ part) {
++    using namespace fn_mtp;
++    const int r = blockIdx.x, warp = blockIdx.y, lane = threadIdx.x;
++    const __nv_bfloat16* row = L + static_cast<long long>(r) * ld;
++    float v = -CUDART_INF_F;
++    int at = 0x7fffffff;
++    for (int i = warp * 32 + lane; i < V; i += 1024) {
++        const float x = __bfloat162float(row[i]);
++        if (x > v) {
++            v = x;
++            at = i;
++        }
++    }
++    for (int o = 16; o; o >>= 1) better(v, at, __shfl_xor_sync(0xffffffffu, v, o), __shfl_xor_sync(0xffffffffu, at, o));
++    if (lane == 0) {
++        part[(r * 32 + warp) * 2 + 0] = v;
++        part[(r * 32 + warp) * 2 + 1] = __int_as_float(at);
++    }
++}
++
++// fn_row_best's second pass, same bits: warp sums into sums [rows, 32]; a row's last block (done = 0) folds them.
++extern "C" __global__ void __launch_bounds__(32) fn_row_best_sum(const __nv_bfloat16* __restrict__ L, int V, long long ld,
++                                                                 const float* __restrict__ part, float* sums,
++                                                                 unsigned int* done, float* __restrict__ out) {
++    using namespace fn_mtp;
++    const int r = blockIdx.x, warp = blockIdx.y, lane = threadIdx.x;
++    const __nv_bfloat16* row = L + static_cast<long long>(r) * ld;
++    float v = part[(r * 32 + lane) * 2 + 0];
++    int at = __float_as_int(part[(r * 32 + lane) * 2 + 1]);
++    for (int o = 16; o; o >>= 1) better(v, at, __shfl_xor_sync(0xffffffffu, v, o), __shfl_xor_sync(0xffffffffu, at, o));
++    const float m = __shfl_sync(0xffffffffu, v, 0);
++    const int top_at = __shfl_sync(0xffffffffu, at, 0);
++    float sum = 0.0f;
++    for (int i = warp * 32 + lane; i < V; i += 1024) sum += expf(__bfloat162float(row[i]) - m);
++    for (int o = 16; o; o >>= 1) sum += __shfl_xor_sync(0xffffffffu, sum, o);
++    unsigned int ticket = 0;
++    if (lane == 0) {
++        sums[r * 32 + warp] = sum;
++        __threadfence();
++        ticket = atomicAdd(&done[r], 1u);
++    }
++    if (__shfl_sync(0xffffffffu, ticket, 0) != 31u) return;
++    __threadfence();
++    sum = reinterpret_cast<volatile float*>(sums)[r * 32 + lane];
++    for (int o = 16; o; o >>= 1) sum += __shfl_xor_sync(0xffffffffu, sum, o);
++    if (lane == 0) {
++        out[r * 4 + 0] = m;
++        out[r * 4 + 1] = m + logf(sum);
++        out[r * 4 + 2] = __int_as_float(top_at);
++        out[r * 4 + 3] = 0.0f;
++        done[r] = 0u;
++    }
++}
++
+ namespace fn_mtp {
+ // A bf16 value's order as an unsigned key (larger value, larger key); -0 as +0, so equal values tie as drawRow's do.
+ static __device__ __forceinline__ unsigned int order_key(unsigned short u) {
+diff --git a/zig/src/core/contract/flashnext_cuda_records.zig b/zig/src/core/contract/flashnext_cuda_records.zig
+index 2506e7f76..a44a6ebce 100644
+--- a/zig/src/core/contract/flashnext_cuda_records.zig
++++ b/zig/src/core/contract/flashnext_cuda_records.zig
+@@ -30,6 +30,8 @@ pub const cuda = [_]CudaRecord{
+     .{ .launch = .{ .name = "flashnext_attn fn_qsa_scores", .symbol = "fn_qsa_scores", .image = "flashnext_attn", .threads = 256 }, .usage = .{ .{ .regs = 40, .static = 4096, .bound = 256 }, .{ .regs = 46, .static = 4096, .bound = 256 }, .{ .regs = 46, .static = 4096, .bound = 256 }, .{ .regs = 48, .static = 4096, .bound = 256 }, .{ .regs = 48, .static = 4096, .bound = 256 } } },
+     .{ .launch = .{ .name = "flashnext_batch fn_qsa_select", .symbol = "fn_qsa_select", .image = "flashnext_batch", .threads = 1024 }, .usage = .{ .{ .regs = 32, .static = 1168, .bound = 1024 }, .{ .regs = 50, .static = 1168, .bound = 1024 }, .{ .regs = 50, .static = 1168, .bound = 1024 }, .{ .regs = 44, .static = 1168, .bound = 1024 }, .{ .regs = 40, .static = 1168, .bound = 1024 } } },
+     .{ .launch = .{ .name = "flashnext_mtp fn_row_best", .symbol = "fn_row_best", .image = "flashnext_mtp", .threads = 1024 }, .usage = .{ .{ .regs = 17, .static = 392, .bound = 1024 }, .{ .regs = 17, .static = 392, .bound = 1024 }, .{ .regs = 17, .static = 392, .bound = 1024 }, .{ .regs = 21, .static = 392, .bound = 1024 }, .{ .regs = 21, .static = 392, .bound = 1024 } } },
++    .{ .launch = .{ .name = "flashnext_mtp fn_row_best_max", .symbol = "fn_row_best_max", .image = "flashnext_mtp", .threads = 32 }, .usage = .{ .{ .regs = 38, .static = 0, .bound = 32 }, .{ .regs = 36, .static = 0, .bound = 32 }, .{ .regs = 36, .static = 0, .bound = 32 }, .{ .regs = 31, .static = 0, .bound = 32 }, .{ .regs = 31, .static = 0, .bound = 32 } } },
++    .{ .launch = .{ .name = "flashnext_mtp fn_row_best_sum", .symbol = "fn_row_best_sum", .image = "flashnext_mtp", .threads = 32 }, .usage = .{ .{ .regs = 27, .static = 0, .bound = 32 }, .{ .regs = 27, .static = 0, .bound = 32 }, .{ .regs = 27, .static = 0, .bound = 32 }, .{ .regs = 36, .static = 0, .bound = 32 }, .{ .regs = 36, .static = 0, .bound = 32 } } },
+     .{ .launch = .{ .name = "flashnext_hc fn_shared_scatter", .symbol = "fn_shared_scatter", .image = "flashnext_hc", .threads = 256 }, .usage = .{ .{ .regs = 12, .static = 0, .bound = 0 }, .{ .regs = 12, .static = 0, .bound = 0 }, .{ .regs = 12, .static = 0, .bound = 0 }, .{ .regs = 14, .static = 0, .bound = 0 }, .{ .regs = 14, .static = 0, .bound = 0 } } },
+     .{ .launch = .{ .name = "flashnext_hc fn_shared_swiglu", .symbol = "fn_shared_swiglu", .image = "flashnext_hc", .threads = 256 }, .usage = .{ .{ .regs = 17, .static = 0, .bound = 0 }, .{ .regs = 18, .static = 0, .bound = 0 }, .{ .regs = 18, .static = 0, .bound = 0 }, .{ .regs = 18, .static = 0, .bound = 0 }, .{ .regs = 18, .static = 0, .bound = 0 } } },
+     .{ .launch = .{ .name = "flashnext_batch fn_ep_picks", .symbol = "fn_ep_picks", .image = "flashnext_batch", .threads = 256 }, .usage = .{ .{ .regs = 10, .static = 0, .bound = 0 }, .{ .regs = 10, .static = 0, .bound = 0 }, .{ .regs = 10, .static = 0, .bound = 0 }, .{ .regs = 14, .static = 0, .bound = 0 }, .{ .regs = 14, .static = 0, .bound = 0 } } },
+diff --git a/zig/src/families/flashnext/cuda_mtp.zig b/zig/src/families/flashnext/cuda_mtp.zig
+index 4d6f0424b..ec169772e 100644
+--- a/zig/src/families/flashnext/cuda_mtp.zig
++++ b/zig/src/families/flashnext/cuda_mtp.zig
+@@ -212,6 +212,9 @@ pub const Head = struct {
+     service: lanes.proposal_head.Service,
+     module: cuda.Module,
+     best_fn: cuda.Function,
++    /// fn_row_best_max and fn_row_best_sum: fn_row_best's passes over 32 blocks a row (best and split_bytes scratch).
++    split_fns: [2]cuda.Function,
++    split: ?cuda.DeviceBuffer,
+     draw_batch: @import("cuda_draw_batch.zig").Batch,
+     topk_fn: cuda.Function, // fn_row_topk: a row's top_k candidates as drawRow ranks them (cuda_mtp_draw.zig)
+ 
+@@ -262,6 +265,12 @@ pub const Head = struct {
+         h.module = try cuda.Module.load(driver, cuda.kernels.flashnext_mtp);
+         errdefer h.module.unload();
+         h.best_fn = try h.module.function("fn_row_best");
++        h.split_fns = .{ try h.module.function("fn_row_best_max"), try h.module.function("fn_row_best_sum") };
++        const zeros = try gpa.alloc(u8, split_bytes);
++        defer gpa.free(zeros);
++        @memset(zeros, 0); // the per-row counters start, and are left, at 0
++        h.split = try cuda.DeviceBuffer.fromHost(driver, zeros);
++        errdefer h.split.?.free();
+         h.topk_fn = try h.module.function("fn_row_topk");
+         h.draw_batch = try @import("cuda_draw_batch.zig").Batch.init(gpa, driver, batch_on, h.ids.len);
+         return h;
+@@ -274,6 +283,7 @@ pub const Head = struct {
+ 
+     pub fn deinit(h: *Head) void {
+         h.draw_batch.deinit(h.gpa);
++        if (h.split) |*b| b.free();
+         h.module.unload();
+         h.draft.free();
+         h.artifact.deinit();
+@@ -300,6 +310,28 @@ pub const Head = struct {
+         _ = try pass.lane(input, sums, h.draft, out, pass.s.dummy, rows, 1);
+     }
+ 
++    fn bestSplit(h: *const Head, stream: cuda.Stream, scratch: u64, scores: u64, v: usize, ld: usize, rows: usize, out: u64) !void {
++        const part = scratch;
++        const sums = part + round_rows * 32 * 8;
++        const done = sums + round_rows * 32 * 4;
++        const grid: cuda.launch.Dim3 = .{ .x = @intCast(rows), .y = 32 };
++        var a: cuda.Args = .{};
++        a.add(scores);
++        a.add(cint(v));
++        a.add(@as(c_longlong, @intCast(ld)));
++        a.add(part);
++        try cuda.launch.launch(h.split_fns[0], .{ .grid = grid, .block = .{ .x = 32 } }, stream, &a);
++        var b: cuda.Args = .{};
++        b.add(scores);
++        b.add(cint(v));
++        b.add(@as(c_longlong, @intCast(ld)));
++        b.add(part);
++        b.add(sums);
++        b.add(done);
++        b.add(out);
++        try cuda.launch.launch(h.split_fns[1], .{ .grid = grid, .block = .{ .x = 32 } }, stream, &b);
++    }
++
+     /// Each of `rows` rows' `k` best of its first `v` values (fn_row_topk): bf16 bits to out_v, columns to out_c.
+     pub fn topk(h: *const Head, stream: cuda.Stream, scores: u64, v: usize, ld: usize, rows: usize, k: usize, out_v: u64, out_c: u64) !void {
+         var a: cuda.Args = .{};
+@@ -312,8 +344,9 @@ pub const Head = struct {
+         try cuda.launch.launch(h.topk_fn, .{ .grid = .{ .x = @intCast(rows) }, .block = .{ .x = 1024 } }, stream, &a);
+     }
+ 
+-    /// fn_row_best over `rows` rows of `v` scores `ld` apart: [rows, 4] fp32 at `out` (best, log-sum-exp, id bits).
++    /// fn_row_best over `rows` rows of `v` scores `ld` apart into [rows, 4] fp32 at `out`; split up to round_rows rows.
+     pub fn best(h: *const Head, stream: cuda.Stream, scores: u64, v: usize, ld: usize, rows: usize, out: u64) !void {
++        if (h.split) |b| if (rows > 0 and rows <= round_rows) return h.bestSplit(stream, b.ptr, scores, v, ld, rows, out);
+         var a: cuda.Args = .{};
+         a.add(scores);
+         a.add(cint(v));
+@@ -323,6 +356,9 @@ pub const Head = struct {
+     }
+ };
+ 
++/// The split best's scratch: each warp's best and id bits, its exponent sum, then a counter a row (round_rows rows).
++pub const split_bytes: usize = round_rows * 32 * 8 + round_rows * 32 * 4 + round_rows * 4;
++
+ /// Device bytes the head's weights take beyond the main model's; `fp8`: block-FP8 routed experts (headFp8).
+ pub fn headBytes(fp8: bool) usize {
+     const weights = 3 * wt.moe_w * dims;
+diff --git a/zig/src/families/flashnext/cuda_mtp_nonfinite_fixture.zig b/zig/src/families/flashnext/cuda_mtp_nonfinite_fixture.zig
+index d8baa94dc..ff4283e46 100644
+--- a/zig/src/families/flashnext/cuda_mtp_nonfinite_fixture.zig
++++ b/zig/src/families/flashnext/cuda_mtp_nonfinite_fixture.zig
+@@ -186,6 +186,7 @@ pub fn headIds(d: *cuda.Driver, ids: []const u32) !mtp.Head {
+     h.service = try @import("lanes").proposal_head.Service.legacy(gpa, &h.artifact);
+     h.draw_batch = .{ .scores = .{ .d = d, .ptr = 0xA000, .len = @import("cuda_draft_draw.zig").scoreBytes(ids.len) }, .device = .{ .d = d, .ptr = 0x9000, .len = @import("cuda_draw_batch.zig").bytes }, .host = &Device.batch_host, .on = true };
+     h.best_fn = .{ .d = d, .handle = @ptrFromInt(1) };
++    h.split = null;
+     h.topk_fn = .{ .d = d, .handle = @ptrFromInt(2) };
+     return h;
+ }
+diff --git a/zig/tests/cuda/contract_row_best.zig b/zig/tests/cuda/contract_row_best.zig
+index e63acda28..fabe27a5b 100644
+--- a/zig/tests/cuda/contract_row_best.zig
++++ b/zig/tests/cuda/contract_row_best.zig
+@@ -15,6 +15,10 @@ pub const Best = struct {
+     input: u64 = 0,
+     output: u64 = 0,
+     probe: u64 = 0,
++    /// fn_row_best_max and fn_row_best_sum: the same reduction over 32 blocks a row, which must match it bit for bit.
++    split: ?[2]cuda.Function = null,
++    scratch: u64 = 0,
++    twin: u64 = 0,
+ 
+     pub fn deinit(self: *Best) void {
+         self.rig.gpu.gpa.free(self.bits);
+@@ -39,6 +43,10 @@ pub const Best = struct {
+         self.input = try self.rig.input(std.mem.sliceAsBytes(self.bits));
+         self.output = try self.rig.output(self.count() * 4);
+         self.probe = try self.rig.scratch(16);
++        if (self.split != null) {
++            self.scratch = try self.rig.scratch(shape.rows * 32 * 12 + shape.rows * 4);
++            self.twin = try self.rig.scratch(self.count() * 4);
++        }
+         return true;
+     }
+ 
+@@ -52,6 +60,28 @@ pub const Best = struct {
+         try self.rig.s.synchronize();
+     }
+ 
++    fn launchSplit(self: *Best, fns: [2]cuda.Function) !void {
++        const rows = self.shape.rows;
++        const sums = self.scratch + rows * 32 * 8;
++        const grid: cuda.launch.Dim3 = .{ .x = @intCast(rows), .y = 32 };
++        var args: cuda.Args = .{};
++        args.add(self.input);
++        args.add(@as(c_int, @intCast(self.shape.k)));
++        args.add(@as(c_longlong, @intCast(self.shape.k + 17)));
++        args.add(self.scratch);
++        try cuda.launch.launch(fns[0], .{ .grid = grid, .block = .{ .x = 32 } }, self.rig.s, &args);
++        var more: cuda.Args = .{};
++        more.add(self.input);
++        more.add(@as(c_int, @intCast(self.shape.k)));
++        more.add(@as(c_longlong, @intCast(self.shape.k + 17)));
++        more.add(self.scratch);
++        more.add(sums);
++        more.add(sums + rows * 32 * 4);
++        more.add(self.twin);
++        try cuda.launch.launch(fns[1], .{ .grid = grid, .block = .{ .x = 32 } }, self.rig.s, &more);
++        try self.rig.s.synchronize();
++    }
++
+     pub fn run(self: *Best) !void {
+         try self.launch(self.input, self.output, self.shape.rows);
+     }
+@@ -73,6 +103,11 @@ pub const Best = struct {
+         const actual = try a.dupe(u8, try self.rig.outputBytes());
+         defer a.free(actual);
+         if (ref.check(self.bits, self.shape, actual)) |why| return why;
++        if (self.split) |fns| {
++            try self.launchSplit(fns);
++            if (!std.mem.eql(u8, actual, try self.rig.bytes(self.twin, actual.len)))
++                return "the split reduction differs from fn_row_best's bits";
++        }
+         if (gate == .shapes) for (0..self.shape.rows) |row| {
+             try self.launch(self.input + row * (self.shape.k + 17) * 2, self.probe, 1);
+             if (!std.mem.eql(u8, actual[row * 16 ..][0..16], try self.rig.bytes(self.probe, 16)))
+diff --git a/zig/tests/cuda/contract_tests.zig b/zig/tests/cuda/contract_tests.zig
+index 15137feea..2dd538fff 100644
+--- a/zig/tests/cuda/contract_tests.zig
++++ b/zig/tests/cuda/contract_tests.zig
+@@ -293,7 +293,7 @@ fn registered(gpu: check.Gpu, only: []const []const u8, t0: *i96) !g.Tally {
+     for (&shifts) |*shift| try kernels.append(a, shift.kernel());
+     var mtp = try cuda.Module.load(gpu.d, kk.flashnext_mtp);
+     defer mtp.unload();
+-    var best = best_k.Best{ .rig = .{ .gpu = gpu, .s = s }, .f = try mtp.function("fn_row_best") };
++    var best = best_k.Best{ .rig = .{ .gpu = gpu, .s = s }, .f = try mtp.function("fn_row_best"), .split = .{ try mtp.function("fn_row_best_max"), try mtp.function("fn_row_best_sum") } };
+     defer best.deinit();
+     try kernels.append(a, best.kernel());
+     var selections: [2]qsa_k.Select = undefined;

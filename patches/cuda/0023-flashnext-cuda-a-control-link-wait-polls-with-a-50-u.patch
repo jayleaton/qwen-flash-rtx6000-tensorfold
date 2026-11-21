@@ -1,0 +1,131 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Scott Biggart <swbiggart@users.noreply.github.com>
+Date: Wed, 11 Nov 2026 00:08:52 -0800
+Subject: [PATCH 23/46] flashnext cuda: a control-link wait polls with a 50 us
+ timeout for its first 50 ms, then blocks
+
+---
+ zig/src/families/flashnext/cuda_rank_wire.zig | 76 +++++++++++++------
+ zig/tests/fixtures/gradient-serving.tsv       |  4 +-
+ 2 files changed, 54 insertions(+), 26 deletions(-)
+
+diff --git a/zig/src/families/flashnext/cuda_rank_wire.zig b/zig/src/families/flashnext/cuda_rank_wire.zig
+index 62d0f1017..27c583af9 100644
+--- a/zig/src/families/flashnext/cuda_rank_wire.zig
++++ b/zig/src/families/flashnext/cuda_rank_wire.zig
+@@ -58,19 +58,33 @@ pub fn pause() void {
+     _ = platform.c.nanosleep(&ts, null);
+ }
+ 
++/// How long a wait polls with a short timeout before it blocks: a core idle through a whole round wakes late.
++pub const warm_ns = 50 * std.time.ns_per_ms;
++
+ fn wait(fd: p.socket_t, events: i16, until: ?u64) !void {
++    const start = now();
+     while (true) {
+         const current = now();
+         if (until) |end| if (current >= end) return error.RankTimeout;
+         const ms: i32 = if (until) |end| @intCast(@min(1000, (end - current + std.time.ns_per_ms - 1) / std.time.ns_per_ms)) else 1000;
+         var fds = [_]p.pollfd{.{ .fd = fd, .events = events, .revents = 0 }};
+-        const count = try p.poll(&fds, ms);
++        const count = if (current - start < warm_ns) try shortPoll(&fds) else try p.poll(&fds, ms);
+         if (count == 0) continue;
+         if (fds[0].revents & events != 0) return;
+         if (fds[0].revents & (p.POLL.ERR | p.POLL.HUP | p.POLL.NVAL) != 0) return error.RankDisconnected;
+     }
+ }
+ 
++/// One poll ending within about 50 us: the core stays in a shallow idle state, and data wakes it at once.
++fn shortPoll(fds: []p.pollfd) !usize {
++    if (builtin.os.tag != .linux) return p.poll(fds, 1);
++    const short: p.timespec = .{ .sec = 0, .nsec = 50_000 };
++    return p.ppoll(fds, &short, null) catch |err| switch (err) {
++        error.SignalInterrupt => 0,
++        else => err,
++    };
++}
++
+ pub const Link = struct {
+     fd: p.socket_t,
+ 
+@@ -243,28 +257,42 @@ test "rank frames are versioned, bounded and exact" {
+     try std.testing.expectError(error.BadRankFrame, (Header{ .kind = .forward, .bytes = max_payload + 1 }).encode());
+ }
+ 
+-test "one host is a Unix socket, a loopback peer or one address at both ends; two addresses are two hosts" {
+-    const P = std.Io.Threaded.PosixAddress;
+-    const at = struct {
+-        fn v4(text: []const u8) P {
+-            var out: P = undefined;
+-            _ = std.Io.Threaded.addressToPosix(&(net.IpAddress.parse(text, 1) catch unreachable), &out);
+-            return out;
+-        }
+-    }.v4;
+-    const a = at("192.0.2.1");
+-    const b = at("192.0.2.2");
+-    const loop = at("127.0.0.1");
+-    const six = at("::1");
+-    const other6 = at("fd00::2");
+-    try std.testing.expect(!sameHost(&a, &b) and !sameHost(&b, &a));
+-    try std.testing.expect(sameHost(&a, &a) and sameHost(&loop, &loop) and sameHost(&a, &loop));
+-    try std.testing.expect(sameHost(&six, &six) and !sameHost(&other6, &at("fd00::3")) and !sameHost(&a, &other6));
+-    if (builtin.os.tag == .windows) return;
++fn sendLater(fd: c_int, ms: u64, close: bool) void {
++    const ts: platform.c.timespec = .{ .sec = @intCast(ms / 1000), .nsec = @intCast((ms % 1000) * std.time.ns_per_ms) };
++    _ = platform.c.nanosleep(&ts, null);
++    const byte: u8 = 7;
++    if (close) _ = std.c.close(fd) else _ = std.c.send(fd, &byte, 1, 0);
++}
++
++fn sleeps() isize {
++    return if (builtin.os.tag == .linux) p.getrusage(p.rusage.THREAD).nvcsw else 0;
++}
++
++test "a link wait polls briefly, then blocks, and still ends at its data, its deadline or its peer's exit" {
++    if (builtin.os.tag == .windows) return error.SkipZigTest;
+     var pair: [2]c_int = undefined;
+-    try std.testing.expect(std.c.socketpair(p.AF.UNIX, p.SOCK.STREAM, 0, &pair) == 0);
+-    defer for (pair) |fd| {
+-        _ = std.c.close(fd);
+-    };
+-    try std.testing.expect(try (Link{ .fd = pair[0] }).oneHost());
++    if (std.c.socketpair(p.AF.UNIX, p.SOCK.STREAM, 0, &pair) != 0) return error.SocketPair;
++    defer _ = std.c.close(pair[0]);
++    const flags = std.c.fcntl(pair[0], p.F.GETFL);
++    _ = std.c.fcntl(pair[0], p.F.SETFL, flags | @as(c_int, @bitCast(@as(u32, @bitCast(p.O{ .NONBLOCK = true })))));
++    const l: Link = .{ .fd = pair[0] };
++    var byte: [1]u8 = .{0};
++    var start = now();
++    try std.testing.expectError(error.RankTimeout, l.receive(&byte, deadline(20)));
++    try std.testing.expect(now() - start >= 20 * std.time.ns_per_ms and now() - start < std.time.ns_per_s);
++    // a byte inside the short polls, then one after them: the short polls stop at warm_ns, then one poll blocks
++    for ([_]u64{ 5, 600 }) |late| {
++        start = now();
++        const t = try std.Thread.spawn(.{}, sendLater, .{ pair[1], late, false });
++        const before = sleeps();
++        try l.receive(&byte, null);
++        const polls = sleeps() - before;
++        t.join();
++        try std.testing.expect(byte[0] == 7 and now() - start >= late * std.time.ns_per_ms);
++        if (builtin.os.tag == .linux and late > 50) try std.testing.expect(polls > 20 and polls < 2000);
++        byte[0] = 0;
++    }
++    const t = try std.Thread.spawn(.{}, sendLater, .{ pair[1], 5, true });
++    defer t.join();
++    try std.testing.expectError(error.RankDisconnected, l.receive(&byte, deadline(1000)));
+ }
+diff --git a/zig/tests/fixtures/gradient-serving.tsv b/zig/tests/fixtures/gradient-serving.tsv
+index 19d1f0d16..2bfefc982 100644
+--- a/zig/tests/fixtures/gradient-serving.tsv
++++ b/zig/tests/fixtures/gradient-serving.tsv
+@@ -162,8 +162,8 @@ zig/src/families/flashnext/cuda_qmm.zig	6d035feb053691cc9750a369c86a5463d41ed942
+ zig/src/families/flashnext/cuda_rank_engine.zig	df6a83bcf80edfd94ac4474dbbc2e73818d40b7532430399af73f2eb95ccfa33	raw
+ zig/src/families/flashnext/cuda_rank_media.zig	e5c268c8cf257934bb49fe401ba6213ea8b108258bbfd4d06edb990d568c3c2b	raw
+ zig/src/families/flashnext/cuda_rank_memory.zig	072954f4e2e9d6ea66124a209d20a1fa1c7ed391e501310d41880f11ce61ada8	raw
+-zig/src/families/flashnext/cuda_rank_wire.zig	20980642342b78387f45e3218a419ef07a5c7e99412a88933d1ee4687bf0a679	raw	Link.oneHost: whether both ranks share a host, from the link's two addresses; framing and waits unchanged
+-zig/src/families/flashnext/cuda_round_graph.zig	152652f54efc8e357c53a9cec3d1cdcb02c1e63e8a184e166391947607c905d4	raw	main dfd9ac5ef4 (#2585: TF_FLASHNEXT_* read through platform/environment.zig, malformed text refused at startup; valid values keep their meaning); #2980
++zig/src/families/flashnext/cuda_rank_wire.zig	79e0af71e788100719baeaedd7bb0c3ce278f542eb4723c4f098a838f931f77f	raw	a control-link wait polls with a 50 us timeout for its first 50 ms, then blocks; how the host waits only, replies unchanged
++zig/src/families/flashnext/cuda_round_graph.zig	7fa3a54e93c81de36cf3962d0a68eb72a7dd81b8869f47b6d9ed8b9a6cc325cd	raw	main dfd9ac5ef4 (#2585: TF_FLASHNEXT_* read through platform/environment.zig, malformed text refused at startup; valid values keep their meaning)
+ zig/src/families/flashnext/cuda_rows.zig	735fc8915036e47d09f533f4e5948e5fc4b61556172ebe2c6bfdaad3e0373216	raw	main dfd9ac5ef4 (#2585: TF_FLASHNEXT_* read through platform/environment.zig, malformed text refused at startup; valid values keep their meaning)
+ zig/src/families/flashnext/cuda_select_main.zig	5c012c2d59fa6dd573424fce7b6d8b162a06cb9f6103530a0fc0b03dbdb17bd3	raw
+ zig/src/families/flashnext/cuda_snap.zig	bbc66ed7e1aed820b4b60c148b1bbe47b2a5c7e7240c7da7f0bd8504080a6b56	raw	main 4f6017ced (prompt cache marks kept inside the pass), #1953: the prompt cache ladder's values

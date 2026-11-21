@@ -1,0 +1,14 @@
+# engine checkouts and downloaded weights: built or downloaded locally, never committed
+engine*/
+flash-fp8*/
+*.safetensors
+rank1.log
+
+# private names for scripts/check-public.sh
+.check-public.local
+
+# editors / OS
+.vscode/
+.idea/
+*.swp
+.DS_Store

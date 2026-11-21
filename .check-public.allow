@@ -1,0 +1,2 @@
+# upstream TensorFold's spark25 model family (Spark2.5), quoted as diff context in patches/cuda
+\bspark25(\.native|-pages)?\b

@@ -1,0 +1,41 @@
+qwen-flash-rtx6000-tensorfold
+Copyright 2026 Jay Leaton (https://x.com/jayleaton)
+
+This project's scripts, configs, patches and documentation are licensed under the Apache License, Version 2.0 (see
+LICENSE). If you redistribute this project or a modified version of it, keep this NOTICE file and the copyright line
+above, and state what you changed (Apache-2.0, section 4).
+
+This project builds on third-party work that keeps its own license:
+
+TensorFold
+  https://github.com/ashhart/TensorFold
+  Fetched at build time at the commit in config/cuda/tensorfold.rev; not included here. The files in patches/ are
+  modifications of TensorFold source, authored as each patch's From line states (Scott Biggart, ashhart, Jay Leaton).
+  The changes are their authors' work, offered under Apache-2.0; the TensorFold code they modify, and quote as diff
+  context, stays under TensorFold's license, so keep TensorFold's copyright and permission notices with any copy of a patched
+  tree. TensorFold's NOTICE, reproduced verbatim:
+  ------------------------------------------------------------------------------------------------------------------
+  TensorFold
+  Copyright 2026 TensorFold contributors
+  https://github.com/ashhart/TensorFold
+
+  TensorFold is licensed under the Apache License, Version 2.0 (LICENSE) from 0.6.0.
+  Releases up to 0.5.0 were MIT-licensed, and code written before 0.6.0 keeps its
+  MIT notice in LICENSES/MIT.txt. Third-party code and its licenses are listed in
+  THIRD_PARTY_NOTICES.md.
+  ------------------------------------------------------------------------------------------------------------------
+
+MiaAI-Lab
+  https://github.com/MiaAI-Lab/Qwen3.8-Flash-Next-RTX-PRO-6000-TernsorFold (commit 57d815c2c)
+  Patches 0035-0036 follow MiaAI-Lab's patch 0016 (the shared expert on a side stream), MIT License, Copyright (c) 2026
+  MiaAI-Lab. The series records this in the engine's THIRD_PARTY_NOTICES.md; the MIT text is in the engine's
+  LICENSES/Mia-FlashNext-MIT.txt.
+
+Qwen3.8-Flash-Next-FP8
+  https://huggingface.co/Qwen/Qwen3.8-Flash-Next-FP8 (revision 7fb48d708ca6cd8eeed8f4db0433be18af96984f)
+  By the Qwen team, Qwen Community License 1.0. Not included: each user downloads the checkpoint under the terms of
+  its LICENSE. config/weights lists its published file hashes.
+
+Also credited, not included:
+  - NCCL (https://github.com/NVIDIA/nccl), BSD-3-Clause: installed by the user.
+  - xgrammar (https://github.com/mlc-ai/xgrammar), Apache License 2.0: built by the user as libtfgrammar when asked.

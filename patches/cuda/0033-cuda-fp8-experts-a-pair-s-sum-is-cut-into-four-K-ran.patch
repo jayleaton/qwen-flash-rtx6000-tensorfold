@@ -1,0 +1,192 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jay Leaton <58495321+jayleaton@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 22:26:34 +0700
+Subject: [PATCH 33/46] cuda fp8 experts: a pair's sum is cut into four K
+ ranges, one a decode warp; the prompt kernel folds at the same cuts
+
+The decode kernel's time followed each warp's serial walk over K (67.7 us for gate/up at 2560 columns at every
+grid size; 35.2 us with half of K walked), so a block's four warps now take one unit's four K ranges and add
+them in range order. The prompt kernel folds its running sum at the same scale-block cuts, so both forms keep
+one sum order; it is a new order for every block-FP8 expert.
+
+Measured on 2x RTX PRO 6000, Flash Next FP8 at --tp 2: gate/up 67.7 -> 23.7 us median, routed experts
+4.25 -> 2.35 ms a pass; code 244.1 -> 252.8 and chat 154.0 -> 174.7 tok/s at one stream (different tokens);
+cold 32K prompt 4,096 -> 4,043 tok/s. flashnext-fp8-experts passes; concurrent == alone and drafted == plain
+hold; NVFP4 hashes still equal the one-card reference. Not run: kernel-contract, host tests.
+---
+ zig/kernels/cuda/fp8_experts.cu         | 66 +++++++++++++++++++++----
+ zig/src/cuda/experts.zig                |  2 +-
+ zig/tests/fixtures/gradient-serving.tsv |  4 +-
+ 3 files changed, 60 insertions(+), 12 deletions(-)
+
+diff --git a/zig/kernels/cuda/fp8_experts.cu b/zig/kernels/cuda/fp8_experts.cu
+index 10c2492ba..5aea813c7 100644
+--- a/zig/kernels/cuda/fp8_experts.cu
++++ b/zig/kernels/cuda/fp8_experts.cu
+@@ -11,6 +11,10 @@ namespace tf_fp8_experts {
+ constexpr int LANE4 = 2;
+ constexpr int BLOCK4 = 32 * LANE4;
+ constexpr int PER_SCALE = 4;
++// K ranges a pair's sum is cut into at scale-block starts: each range sums from zero, the ranges add in order.
++constexpr int KSPLIT = 4;
++
++__device__ __forceinline__ int k_cut(int SG, int s) { return ((SG * s) / KSPLIT) * PER_SCALE; }
+ 
+ __device__ __forceinline__ uint4 ld_nc(const uint4* p) { return tf_common::ld_nc(p); }
+ 
+@@ -55,7 +59,7 @@ __device__ __forceinline__ void compute_stage(float (&part)[M][NTW][4], const St
+ }
+ 
+ template <int M>
+-__device__ __forceinline__ void k_loop(float (&acc)[M][1][NTW][4], const uint4* blk, const float* sc, int KG,
++__device__ __forceinline__ void k_loop(float (&acc)[M][1][NTW][4], const uint4* blk, const float* sc, int G0, int KG,
+                                        int lane, int t, const __nv_bfloat16* x0, const __nv_bfloat16* x1, bool v0,
+                                        bool v1, int sstride) {
+   constexpr int D = 2;
+@@ -63,8 +67,8 @@ __device__ __forceinline__ void k_loop(float (&acc)[M][1][NTW][4], const uint4*
+   float part[M][NTW][4];
+ #pragma unroll
+   for (int d = 0; d < D; ++d)
+-    if (d < KG) load_stage<M>(st[d], blk, d, lane, t, x0, x1, v0, v1);
+-  for (int g0 = 0; g0 < KG; g0 += D) {
++    if (G0 + d < KG) load_stage<M>(st[d], blk, G0 + d, lane, t, x0, x1, v0, v1);
++  for (int g0 = G0; g0 < KG; g0 += D) {
+ #pragma unroll
+     for (int d = 0; d < D; ++d) {
+       const int g = g0 + d;
+@@ -99,10 +103,13 @@ __global__ void __launch_bounds__(WARPS * 32)
+                       const float* __restrict__ scale, int KG, int NB, const int* __restrict__ items,
+                       const int* __restrict__ counts, const int* __restrict__ members, void* __restrict__ out, int N,
+                       float limit, int skip) {
+-  const int lane = threadIdx.x & 31, gq = lane >> 2, t = lane & 3;
++  static_assert(WARPS == KSPLIT, "a block's warps take one unit's K ranges");
++  __shared__ float sums[KSPLIT][32][M * NTW * 4];
++  const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, gq = lane >> 2, t = lane & 3;
+   const int units = __ldg(counts) * NB;
+   const int SG = KG / PER_SCALE, NR = (NB * COLS) / 128;
+-  for (int unit = blockIdx.x * WARPS + (threadIdx.x >> 5); unit < units; unit += gridDim.x * WARPS) {
++  const int g_lo = k_cut(SG, warp), g_hi = warp + 1 == KSPLIT ? KG : k_cut(SG, warp + 1);
++  for (int unit = blockIdx.x; unit < units; unit += gridDim.x) {
+     const int it = unit / NB, cb = unit - it * NB;
+     const int e = __ldg(items + 3 * it), first = __ldg(items + 3 * it + 1), cnt = __ldg(items + 3 * it + 2);
+     if (e == skip) continue;
+@@ -120,8 +127,29 @@ __global__ void __launch_bounds__(WARPS * 32)
+       for (int m = 0; m < M; ++m)
+ #pragma unroll
+         for (int j = 0; j < NTW; ++j) acc[m][0][j][0] = acc[m][0][j][1] = acc[m][0][j][2] = acc[m][0][j][3] = 0.f;
+-      k_loop<M>(acc, blk, sc, KG, lane, t, x0, x1, v0, v1, NR * SG);
+-      epilogue<EPI, M, 1>(acc, 0, out, N, cb * COLS + 2 * t, pr0, pr1, v0, v1, limit);
++      k_loop<M>(acc, blk, sc, g_lo, g_hi, lane, t, x0, x1, v0, v1, NR * SG);
++#pragma unroll
++      for (int m = 0; m < M; ++m)
++#pragma unroll
++        for (int j = 0; j < NTW; ++j)
++#pragma unroll
++          for (int q = 0; q < 4; ++q) sums[warp][lane][(m * NTW + j) * 4 + q] = acc[m][0][j][q];
++      __syncthreads();
++      if (warp == 0) {
++#pragma unroll
++        for (int m = 0; m < M; ++m)
++#pragma unroll
++          for (int j = 0; j < NTW; ++j)
++#pragma unroll
++            for (int q = 0; q < 4; ++q) {
++              float v = 0.f;
++#pragma unroll
++              for (int s = 0; s < KSPLIT; ++s) v += sums[s][lane][(m * NTW + j) * 4 + q];
++              acc[m][0][j][q] = v;
++            }
++        epilogue<EPI, M, 1>(acc, 0, out, N, cb * COLS + 2 * t, pr0, pr1, v0, v1, limit);
++      }
++      __syncthreads();  // warp 0 has read this row's sums before the next row's replace them
+     }
+   }
+ }
+@@ -190,13 +218,29 @@ __global__ void __launch_bounds__(PWARPS * 32, PMIN)
+       cp_commit();
+     }
+     float acc[M][RT][NTW][4];
++    float tot[M][RT][NTW][4];
+     float part[M][RT][NTW][4];
+ #pragma unroll
+     for (int m = 0; m < M; ++m)
+ #pragma unroll
+       for (int r = 0; r < RT; ++r)
+ #pragma unroll
+-        for (int j = 0; j < NTW; ++j) acc[m][r][j][0] = acc[m][r][j][1] = acc[m][r][j][2] = acc[m][r][j][3] = 0.f;
++        for (int j = 0; j < NTW; ++j)
++#pragma unroll
++          for (int q = 0; q < 4; ++q) acc[m][r][j][q] = tot[m][r][j][q] = 0.f;
++    auto fold = [&]() {
++#pragma unroll
++      for (int m = 0; m < M; ++m)
++#pragma unroll
++        for (int r = 0; r < RT; ++r)
++#pragma unroll
++          for (int j = 0; j < NTW; ++j)
++#pragma unroll
++            for (int q = 0; q < 4; ++q) {
++              tot[m][r][j][q] += acc[m][r][j][q];
++              acc[m][r][j][q] = 0.f;
++            }
++    };
+     const bool live = rw * RT * 16 < cnt;
+     for (int g = 0; g < KG; ++g) {
+       cp_wait<PSTAGES - 2>();
+@@ -204,6 +248,9 @@ __global__ void __launch_bounds__(PWARPS * 32, PMIN)
+       if (g + PSTAGES - 1 < KG) stage(g + PSTAGES - 1);
+       cp_commit();
+       if (!live) continue;
++#pragma unroll
++      for (int s = 1; s < KSPLIT; ++s)
++        if (g == k_cut(SG, s)) fold();
+       if (g % PER_SCALE == 0) {
+ #pragma unroll
+         for (int m = 0; m < M; ++m)
+@@ -253,9 +300,10 @@ __global__ void __launch_bounds__(PWARPS * 32, PMIN)
+     }
+     cp_wait<0>();
+     if (live) {
++      fold();
+ #pragma unroll
+       for (int r = 0; r < RT; ++r)
+-        epilogue<EPI, M, RT>(acc, r, out, N, cb * COLS + 2 * t, pr0[r], pr1[r], v0[r], v1[r], limit);
++        epilogue<EPI, M, RT>(tot, r, out, N, cb * COLS + 2 * t, pr0[r], pr1[r], v0[r], v1[r], limit);
+     }
+   }
+ }
+diff --git a/zig/src/cuda/experts.zig b/zig/src/cuda/experts.zig
+index 3f7bb4de9..d55bba414 100644
+--- a/zig/src/cuda/experts.zig
++++ b/zig/src/cuda/experts.zig
+@@ -291,7 +291,7 @@ pub const Fp8Experts = struct {
+         const n = if (gate) l.width else l.dims;
+         const pi: usize = @intFromBool(prompt);
+         const ei: usize = @backingInt(epi);
+-        const grid: usize = if (prompt) @min(items * (nb / @as(usize, if (gate) 2 else 4)), e.resident[pi][ei]) else @min((items * nb + 3) / 4, e.resident[pi][ei]);
++        const grid: usize = if (prompt) @min(items * (nb / @as(usize, if (gate) 2 else 4)), e.resident[pi][ei]) else @min(items * nb, e.resident[pi][ei]);
+         if (grid < 1) return;
+         var a: launch_.Args = .{};
+         a.add(in.x);
+diff --git a/zig/tests/fixtures/gradient-serving.tsv b/zig/tests/fixtures/gradient-serving.tsv
+index 1db4168ba..0c3e07a00 100644
+--- a/zig/tests/fixtures/gradient-serving.tsv
++++ b/zig/tests/fixtures/gradient-serving.tsv
+@@ -15,7 +15,7 @@ zig/kernels/cuda/flashnext_batch.cu	95260b964fb633d23df28970672d87688f21cdd9073e
+ zig/kernels/cuda/flashnext_gdn.cu	c7b9712626778d452e18234e2dfc3b26f8112618cdc492957c4b5f5454d64126	raw
+ zig/kernels/cuda/flashnext_hc.cu	54fa2cfa22e483341835f6349cf0a8f508459ed1b65804728cb1358ac82b24f1	raw	main 5c7cf5c117, d88c1ed57d (sum_rn and rms_scale shared; same SASS)
+ zig/kernels/cuda/flashnext_mtp.cu	5d213b1b4a1d0588eea3acb4633a0c8bc4d9bdf6f27485604452a3b603677a09	raw	#2927
+-zig/kernels/cuda/fp8_experts.cu	156aa7337b41c67d200d8b58a24422cc96cfa032c9fd0711080f09ddc733baee	raw
++zig/kernels/cuda/fp8_experts.cu	66e4b1b7d881a534bd1d72515b2a05104355feee4f6e92fe1b1bad9a547e2891	raw	F6: block-FP8 expert sums cut into 4 K ranges (a decode warp a range, the prompt kernel folding at the same cuts), a unit a block; a new sum order for every FP8 expert, measured on Flash Next at --tp 2
+ zig/kernels/cuda/gdn.cu	e5ef9dcce75c478e59e476d2fa8747baee2317bd283b0756f125ea050dad9228	raw
+ zig/kernels/cuda/glm_glue.cu	74e69a7c20827d498c190334fffaa896f2a4f05e107fdf9d2d34b09b55a1c75c	raw	#2722 (one added line, the include of glm_index_decode.cuh: the decode select's scan and merge)
+ zig/kernels/cuda/glm_glue_attn.cuh	a8c16ed0c54130689d19386de84217aac232c007effafdb6c7fc149ac7188051	raw	main 42735f94f0 (#2335: MLA bodies to common/mla.cuh; glm_glue SASS identical on five SMs); dependent launches: each kernel opens with glm_pdl::enter() (glm_pdl.cuh)
+@@ -89,7 +89,7 @@ zig/src/cuda/cublaslt.zig	d87f865fc03cf94bdcbe83504f74a6e569d70c10ca792b675122e9
+ zig/src/cuda/driver.zig	f20856bd06afe9365ab9ca1bc39800ccb260ade2704197c033e1344a0c8dd742	raw	commits e9bf05ffd, b923e554c, b2c75a98a; series patches 14-runtime-foundation.patch; HELD: must be re-qualified by the LW device gates on the 1.1.1 candidate
+ zig/src/cuda/embed_rows.zig	3fa5e28ab46b4daef2c820b3ad3f7d331bc77f55ea340a7a3cac64b21584c5f4	raw	#3471: Gemma 4 holds its tied embedding once; token rows read the head's 4-bit tiles; replies unchanged
+ zig/src/cuda/exlr8.zig	1e2164096ae949a8a9a4903df82c7c0c184a6f5e1ba5ba4423038a42b0633fc6	raw
+-zig/src/cuda/experts.zig	8bfc2f15a742cceba87dd7eb8e80f3f1b4e3f7eb323b557eb1bb4bf5a9fed440	raw	main 3768bc0168 (#2843: grouped EXL3 experts launched and sized at the caller's tile and pair count; no kernel source change), #1630 (a bf16 format: its Grouped member, decode and prompt arms and prompt tile; other formats unchanged)
++zig/src/cuda/experts.zig	357116cdb9445295813eef0c9a8e1bca92b9967059cda47f0e4d6a1fb5513eb5	raw	F6: block-FP8 expert sums cut into 4 K ranges (a decode warp a range, the prompt kernel folding at the same cuts), a unit a block; a new sum order for every FP8 expert, measured on Flash Next at --tp 2
+ zig/src/cuda/fp8.zig	a9caf312cb451dc95572b493e69ae211dd1e8b5be5b2c48cae3febd5d9327143	raw	series patches 65-pr-1024.patch; HELD: must be re-qualified by the LW device gates on the 1.1.1 candidate
+ zig/src/cuda/graph.zig	17639aaef0298c934b3f5ad3511925169c096ae57ede8ebee655faa838844f7b	raw
+ zig/src/cuda/grouped.zig	5fa1f39394b701eab59383bc7ed214ea3e17652a1229236df49f5281e6e764b5	raw	commits e1be0806d; HELD: must be re-qualified by the LW device gates on the 1.1.1 candidate
