@@ -1,9 +1,54 @@
 # Performance
 
-Two RTX PRO 6000 Blackwell Server Edition cards (97,887 MiB each, 600 W limit, PCIe Gen5 x16, both on NUMA node 0,
+Stack E's sections below: two RTX PRO 6000 Blackwell Server Edition cards (97,887 MiB each, 600 W limit, PCIe Gen5 x16,
+both on NUMA node 0,
 peer-to-peer read and write OK, 38.9 GiB/s each way), 2x Xeon 6520P, driver 620.70.06, NCCL 2.32.6, FP8 checkpoint
 `Qwen/Qwen3.8-Flash-Next-FP8@7fb48d70`, `--tp 2`, ranks on 127.0.0.1, each under
 `numactl --cpunodebind=0 --preferred=0`.
+
+## The profiles (2026-11-24, patches to 0076)
+
+- **Host:** a rented host with 2x RTX PRO 6000 Blackwell Workstation Edition (600 W, one NUMA node, topology NODE,
+  peer-to-peer 53.8 / 53.5 GB/s, 1 GiB `cudaMemcpyPeer`).
+  - AMD Threadripper 9960X (24 cores), governor `schedutil`, driver 595.99.02, NCCL 2.32.6.
+  - Both ranks under `numactl --cpunodebind=0`, on 127.0.0.1.
+- **Cells:** each cell boots its own server.
+  - `bench_openai` (greedy code and chat, 256 tokens), cold 8K and 32K prompts (`bench_cache --require-cold`), then
+    `bench_concurrent --alone --serial` at 1, 4 and 16 streams.
+  - Run with `--prompt-cache-gib 0`, so every prompt is cold.
+  - The cold 128K prompt runs on its own boot at `--context 139264 --parallel 4`.
+- **Order:** the `tp2` pair ran as R C C R and the `pp2` pair as P PF PF P. Stack E (one boot of the 0046 build at
+  49,152 x 16, plus one at 139,264 x 4 for 128K) ran in the same sitting.
+
+| tok/s | cold 8K | cold 32K | cold 128K | code x1 | code x4 | code x16 | chat x1 | chat x4 | chat x16 |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| stack E (0046 build) | 5,349 | 5,397 | 5,264 | 357.5 | 847.8 | 1,143.7 | 246.0 | 598.3 | 1,024.1 |
+| RC-tp2 = stack E + `OWNER_SLOTS` + `GDN_SPLIT` | 7,122 | 7,150 | 6,940 | 358.8 | 851.0 | 1,138.3 | 245.8 | 597.3 | 1,021.2 |
+| **`tp2-fast`** = RC-tp2 + the seven decode fixes | 7,118 | 7,128 | 6,938 | **374.2** | **915.5** | 1,214.1 | **259.2** | **644.4** | 1,120.1 |
+| RC-pp2 = stack E env + `--pp 2` + `GDN_SPLIT` | 9,700 | 14,868 | 16,036 | 306.4 | 853.9 | 1,211.0 | 207.7 | 596.5 | 1,207.7 |
+| **`pp2-prefill`** = RC-pp2 + the four `--pp 2` fixes | **9,736** | **14,807** | **15,964** | 304.5 | 867.2 | **1,293.4** | 209.5 | 604.0 | **1,258.8** |
+
+The A-B-B-A rounds, `tp2-fast` against RC-tp2 (code / chat):
+
+| cell | R | `tp2-fast` | R | `tp2-fast` vs R |
+| --- | --- | --- | --- | --- |
+| x1 | 359.4 / 246.4 | 374.3 / 260.0, 374.1 / 258.5 | 358.1 / 245.1 | +4.3% / +5.5% |
+| x4 | 855.3 / 600.6 | 913.4 / 644.9, 917.6 / 643.9 | 846.8 / 594.0 | +7.6% / +7.9% |
+| x16 | 1,140.1 / 1,021.7 | 1,213.8 / 1,123.3, 1,214.4 / 1,116.9 | 1,136.6 / 1,020.7 | +6.7% / +9.7% |
+| cold 32K | 7,169 | 7,129, 7,128 | 7,130 | -0.3% |
+
+- **`tp2-fast` against RC-tp2:** every decode sign held in both rounds.
+- **`pp2-prefill` against RC-pp2:**
+  - code and chat x16 gain +6.8% and +4.2%, and x4 gains +1.6% and +1.3%; every sign held;
+  - one stream moves −0.6% and +0.9%, so there is no sign;
+  - cold 8K / 32K / 128K move +0.4%, −0.4% and −0.4%.
+- **Each `tp2` fix alone,** one cell each on a slower host (Server Edition, `powersave` governor, a code x1 base of
+  281-293):
+  - each switch was within that host's single-cell noise; together they are the +4.3% above;
+  - the batched rollback replay and spinning waits are host-side, so they may read larger on a slow host.
+- **Not shipped:** `TF_FLASHNEXT_OUTPROJ_KSPLIT` (0076, off) on top of `tp2-fast` gives code x1 398.3 (+11.0% over
+  RC-tp2), chat 238.9 (−2.8%), x16 +15.8% / +6.2%. It changes the tokens (54% of a code reply matches) and is not in a
+  profile.
 
 ## Method
 
@@ -46,7 +91,8 @@ streams, level prefill.
 | stack E without `TF_FLASHNEXT_ATTN_LANES` (A-B-B-A on the stack E binary) | 318.8 / 319.0 | 1,003 / 950, 1,003 / 952 | `TF_FLASHNEXT_ATTN_LANES=1`: +1.3% / +1.6% at x8 / x16 (1,016 / 966 against 1,003 / 951), chat x16 +1.6%, level at 1 stream and in prefill; hashes equal in all four arms |
 
 Stack D itself (env `NCCL_P2P_LEVEL=SYS TF_FLASHNEXT_CHUNK_SOLO=8192 TF_FLASHNEXT_DRAFTS_GREEDY=12
-TF_FLASHNEXT_DRAFT_HEAD=affine4 TF_FLASHNEXT_SHARED_SIDE=1 TF_FLASHNEXT_SHARED_SIDE_SPLIT=1`) measured 296.7 / 204.5 tok/s
+TF_FLASHNEXT_DRAFT_HEAD=affine4 TF_FLASHNEXT_SHARED_SIDE=1 TF_FLASHNEXT_SHARED_SIDE_SPLIT=1`) measured 296.7 / 204.5
+tok/s
 at one stream (greedy code / chat), sampled 236.2 / 169.9, cold prefill 4,394 / 4,424 at 8K / 32K, and 4,330 tok/s on
 a cold 128K prompt (TTFT 30.3 s). Its levers, each from A-B-B-A rows:
 

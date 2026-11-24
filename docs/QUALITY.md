@@ -1,8 +1,33 @@
 # Quality
 
+## Soaks of `tp2-fast` and `pp2-prefill` (2026-11-24)
+
+Each profile for 30 minutes on the Workstation Edition host in [PERFORMANCE](PERFORMANCE.md):
+- every 5 minutes, the fixed probes: greedy code and chat (token hashes against the recipe's) and one cold 32K prompt;
+- in between, load: code and chat at 1, 4 and 16 streams.
+
+| check | `tp2-fast` | `pp2-prefill` |
+| --- | --- | --- |
+| verdict | STABLE | STABLE |
+| probes, load rounds | 7, 143 | 7, 146 |
+| probe hashes (code, chat, cold 32K) | constant `153389030f94`, `147305861125`, `ddadf33e7860` | the same |
+| failed requests, rank exits, engine errors | 0, no, none | 0, no, none |
+| code x1 mean (min-max), drift last third against first | 375.1 (355.8-378.1), -0.1% | 304.2 (299.7-305.7), +0.0% |
+| code x16 mean, drift | 1,215.1, -0.1% | 1,283.9, +0.2% |
+
+## Quality suite and kernel checks (2026-11-24)
+
+- **The 228-item greedy suite:** RC-tp2 scores 213/228 (gsm8k 95/100, mmlu 90/100, instructions 20/20, long context 8/8)
+  on both hosts measured. Every profile's probe tokens equal RC-tp2's and stack E's.
+- **Not shipped:** `TF_FLASHNEXT_OUTPROJ_KSPLIT`, which changes the tokens, scores 214/228.
+- **On the GPU, `tf-cuda-test route-rows`:** the spread router logits and the fused top-k and plan are byte-equal to the
+  kernels they replace.
+- **The kernel contract:** it passes gates 1-4 on `tf_route_logits_spread`, `fn_hcn_down_act`, `fn_hcn_up1` and the
+  head's `row_best` merge.
+
 ## Soak
 
-Stack E, the profile in `config/cuda/`, 35.1 minutes of mixed-length traffic: 30 passes over 16 prompts (8K-32K
+Stack E (`PROFILE=stack-e`), 35.1 minutes of mixed-length traffic: 30 passes over 16 prompts (8K-32K
 prompts among short code ones, 250 ms apart) at 1, 8 and 16 streams, greedy and sampled (temperature 0.7); every third
 pass also checks each concurrent reply against its alone run and its `"draft": false` reply.
 
@@ -19,7 +44,7 @@ pass also checks each concurrent reply against its alone run and its `"draft": f
 
 FP8 at TP2 on two RTX PRO 6000s against the NVIDIA 4-bit packs at TP1 on one card, with the same evaluation kit,
 thinking budgets and scorer, greedy. "FP8, earlier binary" ran before the FP8 expert kernel's K-split (patch 0033),
-which changes FP8's sum order and so its tokens; stack E is the profile in `config/cuda/`. The HumanEval+ and BFCL runs
+which changes FP8's sum order and so its tokens; stack E is `PROFILE=stack-e`. The HumanEval+ and BFCL runs
 use `--prompt-cache-gib 0` and 8 requests at a 33,024-token window, the same for every FP8 row.
 
 | pack | cards | HumanEval+ (thinking 1024) | BFCL held-out 450 (thinking 512) | top-1 / KL against FP8 | text NLL |
@@ -55,3 +80,40 @@ OpenCode core waves: 2 waves of 5 workflows, thinking 4096, the same tasks and g
 - At 256K the one miss is a snake game: `snake.html` parses, but the play check finds the snake never
   moves. That is the model's output, not a serving fault; the same workflow passes in its other waves.
 - Neither stack E run hit the output limit, and neither rank logged an error.
+
+## OpenCode tool calls on the profiles (2026-11-24)
+
+The same core wave runs on the Workstation Edition host:
+- 5 workflows in parallel: tetris, snake, a 3-turn todo app, numtools and bigcalc;
+- a 30-minute turn cap;
+- greedy (temperature 0) unless noted.
+
+| profile | window x streams | tool calls | tool errors | `oldString` not found | `edit` without `path` | other `edit` mistakes | malformed | history compactions | graded |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| RC-tp2 | 49,152 x 16 | 176 | 6 (3.4%) | 4 | 1 | 1 | 0 | 9 | 5/5 |
+| `tp2-fast` | 49,152 x 16 | 492 | 29 (5.9%) | 26 | 0 | 3 | 1 | 26 | 5/5 |
+| `pp2-prefill` | 49,152 x 16 | 262 | 19 (7.3%) | 16 | 3 | 0 | 0 | 18 | 5/5 |
+| `pp2-prefill`, sampled | 49,152 x 16 | 252 | 8 (3.2%) | 7 | 1 | 0 | 0 | 16 | 4/5 |
+| **`agent`** | 139,264 x 4 | 134 | 6 (4.5%) | **1** | 2 | 3 | 0 | **0** | **5/5** |
+
+- **Same tokens on every profile.**
+  - 10 captured OpenCode requests sent again at temperature 0: the first of each workflow and one long one from each, up
+    to 140 KB of history.
+  - They give the same tokens, token for token, on RC-tp2, `tp2-fast` (alone and under load), `pp2-prefill` and RC-tp2
+    with `--prompt-cache-gib 0`.
+  - The runs above differ only because each workspace path enters the prompt.
+- **`oldString` not found: the model's text, not the parser.**
+  - Each failed edit was replayed against the file as its session left it.
+  - None matched. One differed only in whitespace, where the model moved a mid-line `hud: hud` onto its own line. The
+    rest quote older or paraphrased text.
+  - In the 49,152 runs, 6.1% of calls after a compaction failed, against 1.9% before. At 139,264 there was none.
+- **`edit` without `path`:** the model omitted the key. The raw stream holds no `path` parameter, and each reply ended
+  with `finish_reason=tool_calls` and nothing malformed kept.
+- **No loops:** no run repeated an identical call. The long numtools session re-checked its values after each
+  compaction, finished, and its tests pass.
+- **Malformed:** the one malformed call is a `write` cut by the 24,576-token output limit.
+- **Earlier recipes, the same harness at a 262,144 window (4-bit packs on one card):**
+  - FP4-Local: 1/165 tool errors.
+  - NVFP4: 7/178.
+  - MLX4: 18/206.
+  - The 49,152 runs sit inside that range, and `agent` at its low end.

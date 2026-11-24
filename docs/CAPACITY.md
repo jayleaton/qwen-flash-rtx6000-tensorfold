@@ -22,8 +22,9 @@ FP8 weights at TP2 each rank holds 71.74 GiB of model; stack E's banner at `--co
   errors, waves of 358 s and 548 s ([QUALITY](QUALITY.md#opencode)). Its speed in the A-B-B-A cells has not been
   measured.
 
-To serve a longer window, edit `config/cuda/serve.args`, for example to `--context 131072 --parallel 7`. Stack E's speed
-numbers are for the shipped 49,152-token profile.
+To serve a longer window, use `PROFILE=agent` or `agent-tp2` (139,264 tokens x 4 streams), or edit a profile's
+`config/cuda/profiles/NAME.args`, for example to `--context 131072 --parallel 7`. The speed numbers are for the
+49,152-token profiles, except cold 128K, which ran at 139,264 x 4.
 
 ## The fp8 KV cache (`--kv-cache fp8`): not in this series
 
