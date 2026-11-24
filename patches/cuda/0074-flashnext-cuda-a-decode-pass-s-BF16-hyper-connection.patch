@@ -1,0 +1,596 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jay Leaton <58495321+jayleaton@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 16:08:12 +0700
+Subject: [PATCH 74/76] flashnext cuda: a decode pass's BF16 hyper-connection
+ read-out in two launches instead of five behind TF_FLASHNEXT_READOUT_DECODE
+
+fn_hcn_down_act normalizes the streams in shared memory, runs the down on the qmmf lane's half-tile mma chains with its K slices summed in a cluster in slice order, then applies hc_reduce_act (act, its sums and the inject gates); fn_hcn_up1 is the prompt up+mix body at a 16-row tile. Same bits as fn_hc_normalize_cols, the lane's down, fn_hc_reduce_act, the lane's up and fn_hc_dense_mix8, checked by the read-out kernel contract at 1 to 63 rows. Passes of fewer than 64 rows only (verify windows and the draft head); default off.
+---
+ docs/environment.md                           |   1 +
+ zig/kernels/cuda/flashnext_hcn.cu             |  16 ++
+ zig/kernels/cuda/flashnext_hcn_decode.cuh     | 141 ++++++++++++++++++
+ .../core/contract/flashnext_tile_records.zig  |   2 +
+ zig/src/families/flashnext/cuda_batch.zig     |   2 +
+ .../families/flashnext/cuda_batch_kernels.zig |   2 +
+ .../flashnext/cuda_readout_decode.zig         |  87 +++++++++++
+ .../families/flashnext/cuda_tile_kernels.zig  |  15 ++
+ zig/src/families/flashnext/cuda_tiles.zig     |   2 +
+ zig/src/platform/environment.zig              |   1 +
+ .../platform/environment_flashnext_test.zig   |   4 +-
+ zig/tests/cuda/contract_flashnext_hcn.zig     |  55 +++++--
+ 12 files changed, 315 insertions(+), 13 deletions(-)
+ create mode 100644 zig/kernels/cuda/flashnext_hcn_decode.cuh
+ create mode 100644 zig/src/families/flashnext/cuda_readout_decode.zig
+
+diff --git a/docs/environment.md b/docs/environment.md
+index 4e1bd8fad..2ce82a437 100644
+--- a/docs/environment.md
++++ b/docs/environment.md
+@@ -152,6 +152,7 @@ stops the start with the variable, the supplied text and the accepted forms.
+ | `TF_FLASHNEXT_SHARED_SIDE` | Exactly `0` or `1`; default on |
+ | `TF_FLASHNEXT_SHARED_SIDE_SPLIT` | Exactly `0` or `1`; default off |
+ | `TF_FLASHNEXT_HC_FUSE` | Exactly `0` or `1`; default on |
++| `TF_FLASHNEXT_READOUT_DECODE` | Exactly `0` or `1`; default off. `1`: a CUDA pass of fewer than 64 rows (verify windows, the draft head) runs each BF16 hyper-connection read-out in two launches instead of five (normalize, down, act and gates in one; up and the mix in the other) with the same bits. Give every rank the same value. |
+ | `TF_FLASHNEXT_KEEP_LATE` | Exactly `0` or `1`; unset or blank leaves the choice to the loader |
+ | `TF_FLASHNEXT_DECODE_GRAPH` | Exactly `0` or `1`; default off |
+ | `TF_FLASHNEXT_SPLIT_DENSE` | Exactly `0` or `1`; default on: two ranks split the BF16 dense projections |
+diff --git a/zig/kernels/cuda/flashnext_hcn.cu b/zig/kernels/cuda/flashnext_hcn.cu
+index 70c2be9a0..1b9ce53e2 100644
+--- a/zig/kernels/cuda/flashnext_hcn.cu
++++ b/zig/kernels/cuda/flashnext_hcn.cu
+@@ -1,5 +1,6 @@
+ // Flash Next's BF16 read-out prompt tiles: the down at three row tiles and the up+mix (flashnext_hcn.cuh's bodies).
+ #include "flashnext_hcn.cuh"
++#include "flashnext_hcn_decode.cuh"
+ 
+ #define HCN_DOWN(NAME, MT)                                                                                                 \
+     extern "C" __global__ void __launch_bounds__(hcn::DN_THREADS) NAME(                                                   \
+@@ -19,3 +20,18 @@ extern "C" __global__ void __launch_bounds__(256) fn_hcn_up3(const __nv_bfloat16
+                                                              float* __restrict__ XSM, int M, int D, int NC, float eps) {
+     hcn::upmix_body<3, 5>(ACT, W, H, PSS, SCALE, MIXED, XSM, M, D, NC, eps);
+ }
++
++// Decode rows (TF_FLASHNEXT_READOUT_DECODE): the up+mix a 16-row tile, and the down with the act and gates fused.
++extern "C" __global__ void __launch_bounds__(256) fn_hcn_up1(const __nv_bfloat16* __restrict__ ACT, const uint2* __restrict__ W,
++                                                             const __nv_bfloat16* __restrict__ H, const float* __restrict__ PSS,
++                                                             const float* __restrict__ SCALE, __nv_bfloat16* __restrict__ MIXED,
++                                                             float* __restrict__ XSM, int M, int D, int NC, float eps) {
++    hcn::upmix_body<1, 5>(ACT, W, H, PSS, SCALE, MIXED, XSM, M, D, NC, eps);
++}
++
++extern "C" __global__ void __launch_bounds__(hcn::DD_THREADS) fn_hcn_down_act(
++    const __nv_bfloat16* __restrict__ H, const float* __restrict__ PSS, const float* __restrict__ SCALE,
++    const uint2* __restrict__ W, __nv_bfloat16* __restrict__ ACT, float* __restrict__ XS, __nv_bfloat16* __restrict__ INJ,
++    int M, int N, int K, int SK, int D, int NC, int SS, int LOW, int HAS_INJ, float wscale, float eps) {
++    hcn::down_act_body(H, PSS, SCALE, W, ACT, XS, INJ, M, N, K, SK, D, NC, SS, LOW, HAS_INJ, wscale, eps);
++}
+diff --git a/zig/kernels/cuda/flashnext_hcn_decode.cuh b/zig/kernels/cuda/flashnext_hcn_decode.cuh
+new file mode 100644
+index 000000000..1c6b5c316
+--- /dev/null
++++ b/zig/kernels/cuda/flashnext_hcn_decode.cuh
+@@ -0,0 +1,141 @@
++// Flash Next's BF16 read-out down at decode rows: normalize, the qmmf lane's K slices in a cluster, then hc_reduce_act.
++#pragma once
++
++#include <cooperative_groups.h>
++
++#include "flashnext_hcn.cuh"
++
++namespace hcn {
++
++constexpr int DD_THREADS = 128;  // 4 warps, an n8 tile each: the 32 columns of qmmf's half tile
++constexpr int DD_RING = 8;       // 32-column weight groups in flight
++
++// bytes from the start of shared memory: normed rows, the slice's scales, the weight ring, the rows' scales
++__host__ __device__ constexpr int dd_scales_at(int per) { return 16 * (per * 64 + 8) * 2; }
++__host__ __device__ constexpr int dd_ring_at(int per) { return dd_scales_at(per) + per * 64 * 4; }
++__host__ __device__ constexpr int dd_rinv_at(int per) { return dd_ring_at(per) + DD_RING * 4096; }
++__host__ __device__ constexpr int dd_smem(int per) { return dd_rinv_at(per) + 16 * DN_SS * 4; }
++
++__device__ __forceinline__ float bsilu(float x) { return rbf(tf_glue::tf_silu(x)); }
++
++// CTA (16 rows, 32 columns, slice z): normed rows, the lane's mma chain from zero, slices summed 0..SK-1, act and gates
++__device__ __forceinline__ void down_act_body(const __nv_bfloat16* __restrict__ H, const float* __restrict__ PSS,
++                                              const float* __restrict__ SCALE, const uint2* __restrict__ W,
++                                              __nv_bfloat16* __restrict__ ACT, float* __restrict__ XS,
++                                              __nv_bfloat16* __restrict__ INJ, int M, int N, int K, int SK, int D,
++                                              int NC, int SS, int LOW, int HAS_INJ, float wscale, float eps) {
++    extern __shared__ __align__(128) unsigned char buf[];
++    const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, g8 = lane >> 2, t4 = lane & 3;
++    const int KG = K / 64, per = KG / SK, kw = per * 64, pitch = kw + 8, ct = (N + 31) / 32;
++    const int m0 = (blockIdx.x / ct) * 16, n0 = (blockIdx.x % ct) * 32, slice = blockIdx.z, g0 = slice * per;
++    __nv_bfloat16* As = reinterpret_cast<__nv_bfloat16*>(buf);
++    float* Sc = reinterpret_cast<float*>(buf + dd_scales_at(per));
++    unsigned char* ring = buf + dd_ring_at(per);
++    float* rinv_s = reinterpret_cast<float*>(buf + dd_rinv_at(per));
++
++    // qmmf's half tile: n8 tiles 0-3 or 4-7 of the packed 64-column tile, group g
++    const unsigned char* wsrc = reinterpret_cast<const unsigned char*>(W + static_cast<size_t>(n0 >> 6) * KG * 1024 + ((n0 >> 5) & 1) * 512);
++    auto loadw = [&](int s, int g) {
++        for (int c = tid; c < 256; c += DD_THREADS) cp16(ring + s * 4096 + c * 16, wsrc + static_cast<size_t>(g) * 8192 + c * 16);
++    };
++#pragma unroll
++    for (int s = 0; s < DD_RING - 1; ++s) {
++        if (s < per) loadw(s, g0 + s);
++        commit();
++    }
++    const int chunks = kw / 8;
++    for (int c = tid; c < 16 * chunks; c += DD_THREADS) {
++        const int r = c / chunks, ch = c % chunks;
++        if (m0 + r < M) cp16(As + r * pitch + ch * 8, H + static_cast<size_t>(m0 + r) * K + g0 * 64 + ch * 8);
++        else *reinterpret_cast<uint4*>(As + r * pitch + ch * 8) = make_uint4(0u, 0u, 0u, 0u);
++    }
++    for (int c = tid; c < kw / 4; c += DD_THREADS) cp16(Sc + c * 4, SCALE + g0 * 64 + c * 4);
++    commit();
++    for (int i = tid; i < 16 * SS; i += DD_THREADS)
++        rinv_s[(i / SS) * DN_SS + i % SS] = rinv_of(PSS, min(m0 + i / SS, M - 1), i % SS, NC, SS, D, eps);
++    wait<0>();
++    __syncthreads();
++    // x = bf16(h * rinv[row, stream] * scale[k]), fn_hc_normalize_cols' bits, in place
++    for (int c = tid; c < 16 * chunks; c += DD_THREADS) {
++        const int r = c / chunks, ch = c % chunks;
++        if (m0 + r >= M) continue;
++        uint4* cell = reinterpret_cast<uint4*>(As + r * pitch + ch * 8);
++        const uint4 raw = *cell;
++        const __nv_bfloat16* hv = reinterpret_cast<const __nv_bfloat16*>(&raw);
++        const float rv = rinv_s[r * DN_SS + (g0 * 64 + ch * 8) / D];
++        __nv_bfloat16 o8[8];
++#pragma unroll
++        for (int i = 0; i < 8; ++i) o8[i] = __float2bfloat16_rn(__fmul_rn(__fmul_rn(bf(hv[i]), rv), Sc[ch * 8 + i]));
++        *cell = *reinterpret_cast<const uint4*>(o8);
++    }
++
++    float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
++    for (int it = 0; it < per; ++it) {
++        wait<DD_RING - 2>();
++        __syncthreads();
++        const int next = it + DD_RING - 1;
++        if (next < per) loadw(next % DD_RING, g0 + next);
++        commit();
++        const uint2* pw = reinterpret_cast<const uint2*>(ring + (it % DD_RING) * 4096);
++#pragma unroll
++        for (int kt = 0; kt < 4; ++kt) {
++            // the m16n8k16 A fragment: rows g8 and g8 + 8, columns 2 t4 and 2 t4 + 8 of the k16 step
++            const __nv_bfloat16* pa = As + g8 * pitch + it * 64 + kt * 16 + 2 * t4;
++            uint32_t a[4];
++            a[0] = *reinterpret_cast<const uint32_t*>(pa);
++            a[1] = *reinterpret_cast<const uint32_t*>(pa + 8 * pitch);
++            a[2] = *reinterpret_cast<const uint32_t*>(pa + 8);
++            a[3] = *reinterpret_cast<const uint32_t*>(pa + 8 * pitch + 8);
++            const uint2 b = pw[(warp * 4 + kt) * 32 + lane];
++            mma(acc, a, b.x, b.y);
++        }
++    }
++    wait<0>();
++    __syncthreads();
++    if (SK > 1) {
++#if __CUDA_ARCH__ < 900
++        __trap();
++#else
++        auto cluster = cooperative_groups::this_cluster();
++        float* mine = reinterpret_cast<float*>(buf);
++        if (slice != 0) {
++#pragma unroll
++            for (int e = 0; e < 4; ++e) mine[e * DD_THREADS + tid] = acc[e];
++        }
++        cluster.sync();
++        if (slice == 0) {
++            for (int peer = 1; peer < SK; ++peer) {
++                const float* theirs = cluster.map_shared_rank(mine, peer);
++#pragma unroll
++                for (int e = 0; e < 4; ++e) acc[e] = __fadd_rn(acc[e], theirs[e * DD_THREADS + tid]);
++            }
++        }
++        cluster.sync();
++        if (slice != 0) return;
++#endif
++    }
++    // fn_hc_reduce_act on the lane's fp32 outputs (acc times the weight's scale), a_s on bytes no peer reads now
++    float* a_s = reinterpret_cast<float*>(buf) + 4 * DD_THREADS;
++    const int cols = LOW + (HAS_INJ ? SS : 0);
++#pragma unroll
++    for (int e = 0; e < 4; ++e) {
++        const int rr = g8 + 8 * (e >> 1), row = m0 + rr, col = n0 + warp * 8 + 2 * t4 + (e & 1);
++        if (row >= M || col >= N || col >= cols) continue;
++        const float v = rbf(__fdiv_rn(rbf(__fmul_rn(acc[e], wscale)), static_cast<float>(SS)));
++        if (col < LOW) {
++            const float act = bsilu(v);
++            ACT[static_cast<long long>(row) * LOW + col] = __float2bfloat16_rn(act);
++            a_s[rr * 32 + col - n0] = act;
++        } else {
++            INJ[static_cast<long long>(row) * SS + (col - LOW)] = __float2bfloat16_rn(__fmul_rn(2.0f, bsig(v)));
++        }
++    }
++    __syncthreads();
++    if (n0 + 32 <= LOW && tid < 16 && m0 + tid < M) {
++        float sum = 0.0f;
++        for (int k = 0; k < 32; ++k) sum = __fadd_rn(sum, a_s[tid * 32 + k]);
++        XS[static_cast<long long>(m0 + tid) * (LOW / 32) + n0 / 32] = sum;
++    }
++}
++
++}  // namespace hcn
+diff --git a/zig/src/core/contract/flashnext_tile_records.zig b/zig/src/core/contract/flashnext_tile_records.zig
+index 5d343a7b9..a76a2c447 100644
+--- a/zig/src/core/contract/flashnext_tile_records.zig
++++ b/zig/src/core/contract/flashnext_tile_records.zig
+@@ -37,6 +37,8 @@ pub const cuda = [_]CudaRecord{
+     .{ .launch = .{ .name = "flashnext_hcn fn_hcn_down3", .symbol = "fn_hcn_down3", .image = "flashnext_hcn", .threads = 224, .dynamic = 19968 }, .usage = .{ .{ .regs = 191, .static = 0, .bound = 224 }, .{ .regs = 191, .static = 0, .bound = 224 }, .{ .regs = 191, .static = 0, .bound = 224 }, .{ .regs = 189, .static = 0, .bound = 224 }, .{ .regs = 189, .static = 0, .bound = 224 } } },
+     .{ .launch = .{ .name = "flashnext_hcn fn_hcn_down4", .symbol = "fn_hcn_down4", .image = "flashnext_hcn", .threads = 224, .dynamic = 26624 }, .usage = .{ .{ .regs = 221, .static = 0, .bound = 224 }, .{ .regs = 222, .static = 0, .bound = 224 }, .{ .regs = 222, .static = 0, .bound = 224 }, .{ .regs = 206, .static = 0, .bound = 224 }, .{ .regs = 206, .static = 0, .bound = 224 } } },
+     .{ .launch = .{ .name = "flashnext_hcn fn_hcn_up3", .symbol = "fn_hcn_up3", .image = "flashnext_hcn", .threads = 256, .dynamic = 43776 }, .usage = .{ .{ .regs = 126, .static = 0, .bound = 256 }, .{ .regs = 126, .static = 0, .bound = 256 }, .{ .regs = 126, .static = 0, .bound = 256 }, .{ .regs = 127, .static = 0, .bound = 256 }, .{ .regs = 127, .static = 0, .bound = 256 } } },
++    .{ .launch = .{ .name = "flashnext_hcn fn_hcn_up1", .symbol = "fn_hcn_up1", .image = "flashnext_hcn", .threads = 256, .dynamic = 14592 }, .usage = .{ .{ .regs = 117, .static = 0, .bound = 256 }, .{ .regs = 117, .static = 0, .bound = 256 }, .{ .regs = 117, .static = 0, .bound = 256 }, .{ .regs = 121, .static = 0, .bound = 256 }, .{ .regs = 121, .static = 0, .bound = 256 } } },
++    .{ .launch = .{ .name = "flashnext_hcn fn_hcn_down_act, cluster of 8", .symbol = "fn_hcn_down_act", .image = "flashnext_hcn", .threads = 128, .dynamic = 79616, .opt_in = true, .cluster = 8, .min_sm = 90 }, .usage = .{ .{ .regs = 48, .static = 0, .bound = 128 }, .{ .regs = 48, .static = 0, .bound = 128 }, .{ .regs = 48, .static = 0, .bound = 128 }, .{ .regs = 40, .static = 0, .bound = 128 }, .{ .regs = 40, .static = 0, .bound = 128 } } },
+ };
+ 
+ /// nvcc 13.2's records where it compiles these tiles differently from 13.0.
+diff --git a/zig/src/families/flashnext/cuda_batch.zig b/zig/src/families/flashnext/cuda_batch.zig
+index d8bef3fe3..fc070a69f 100644
+--- a/zig/src/families/flashnext/cuda_batch.zig
++++ b/zig/src/families/flashnext/cuda_batch.zig
+@@ -11,6 +11,7 @@ const load = @import("cuda_prompt_load.zig");
+ const parts = @import("cuda_batch_state.zig");
+ const late = @import("cuda_batch_late.zig");
+ const hc = @import("cuda_batch_hc.zig");
++const decode = @import("cuda_readout_decode.zig");
+ const gdn_lanes = @import("cuda_batch_gdn_lanes.zig");
+ const batch_lanes = @import("cuda_batch_lanes.zig");
+ const tiles = @import("cuda_tiles.zig");
+@@ -201,6 +202,7 @@ pub fn Pass(comptime Tri: type) type {
+             const xs_act = s.xs_act + r0 * (low / 32) * 4;
+             if (hc_w.down.native != null) {
+                 if (std.meta.eql(keep, HcKeep{}) and hc.promptFused(self, hc_w, n)) return tiles.readoutFused(self.tri, self.k, self.stream, self.s, hc_w, r0, n);
++                if (std.meta.eql(keep, HcKeep{}) and decode.takes(self, hc_w, n)) return decode.readout(self, hc_w, r0, n);
+                 try self.tri.hcNormalize(h, pss, hc_w.scale.ptr, norm, eps, n, dims, streams);
+                 return hc.readoutNative(self, hc_w, r0, n);
+             }
+diff --git a/zig/src/families/flashnext/cuda_batch_kernels.zig b/zig/src/families/flashnext/cuda_batch_kernels.zig
+index ac15aedb5..8ccb94675 100644
+--- a/zig/src/families/flashnext/cuda_batch_kernels.zig
++++ b/zig/src/families/flashnext/cuda_batch_kernels.zig
+@@ -51,6 +51,7 @@ pub const Forms = struct {
+     readout_rows: usize = 64, // TF_FLASHNEXT_READOUT_ROWS (maxInt: never)
+     fact_rows: usize = 64, // TF_FLASHNEXT_FACT_ROWS (maxInt: never)
+     readout_fused: bool = false, // TF_FLASHNEXT_READOUT_FUSED
++    readout_decode: bool = false, // TF_FLASHNEXT_READOUT_DECODE
+ 
+     pub fn resolve() Forms {
+         return .{
+@@ -61,6 +62,7 @@ pub const Forms = struct {
+             .readout_rows = @import("cuda_chunk.zig").readoutTileRows(),
+             .fact_rows = @import("cuda_nvfp4_tile.zig").factRows(),
+             .readout_fused = @import("readout_fused.zig").on(),
++            .readout_decode = @import("cuda_readout_decode.zig").on(),
+         };
+     }
+ };
+diff --git a/zig/src/families/flashnext/cuda_readout_decode.zig b/zig/src/families/flashnext/cuda_readout_decode.zig
+new file mode 100644
+index 000000000..723b7ba1b
+--- /dev/null
++++ b/zig/src/families/flashnext/cuda_readout_decode.zig
+@@ -0,0 +1,87 @@
++//! TF_FLASHNEXT_READOUT_DECODE: a decode pass's BF16 read-out in two launches with the five launches' bits.
++const cuda = @import("cuda");
++const wt = @import("cuda_prompt_wt.zig");
++const tiles = @import("cuda_tiles.zig");
++const tk = @import("cuda_tile_kernels.zig");
++
++const dims = wt.dims;
++const streams = wt.streams;
++const wide = wt.wide;
++const low = wt.low;
++const eps = wt.eps;
++const pss_n = (dims / 256) * streams;
++
++/// Rows below which a pass takes it: from 64 rows the writeback carries the normalize (TF_FLASHNEXT_HC_FUSE).
++pub const max_rows: usize = 64;
++
++/// The setting as the startup check accepted it: unset, blank or 0 is off.
++pub fn on() bool {
++    // the startup check refused every malformed value already, so a plain default stands here
++    return @import("sys").environment.read(bool, "TF_FLASHNEXT_READOUT_DECODE", false) catch false;
++}
++
++fn cint(v: usize) c_int {
++    return @intCast(v);
++}
++
++fn cdiv(a: usize, b: usize) usize {
++    return (a + b - 1) / b;
++}
++
++/// K groups of 64 a down slice holds, when the down's K slices meet as the qmmf lane's do at these rows, else null.
++pub fn slicePer(lane: cuda.qmmf.Lane, down: cuda.qmmf.Weight, n: usize) ?usize {
++    const p = cuda.qmmf.planFor(n, down, lane.clusters);
++    if (p.fused or p.reduce or p.sk > 8 or down.k % 64 != 0) return null;
++    const groups = down.k / 64;
++    if (groups % p.sk != 0) return null;
++    const per = groups / p.sk;
++    return if (tk.hcdDownSmem(per) <= tk.hcd_down_smem) per else null;
++}
++
++/// Whether n rows of hc_w take the two launches: the setting, decode rows, the fused tiles' BF16 shapes.
++pub fn takes(pass: anytype, hc_w: wt.HcW, n: usize) bool {
++    if (!pass.k.forms.readout_decode or n == 0 or n >= max_rows or !tiles.nativeFused(hc_w)) return false;
++    if (!pass.tri.readoutTilesOwned() or low % 32 != 0 or streams > 8) return false;
++    if (cuda.qmmf.slices(hc_w.up.native.?) != 1) return false;
++    return slicePer(pass.k.native_lane, hc_w.down.native.?, n) != null;
++}
++
++/// fn_hcn_down_act: rows normed from h, the down in slices of `per` groups (a cluster), act, its sums and the gates.
++pub fn launchDown(t: *const tk.TileKernels, stream: cuda.Stream, h: u64, pss: u64, scale: u64, down: cuda.qmmf.Weight, per: usize, act: u64, xs: u64, inj: u64, n: usize, has_inj: usize) !void {
++    const sk = down.k / 64 / per;
++    var a: cuda.Args = .{};
++    for ([_]u64{ h, pss, scale, down.codes, act, xs, inj }) |v| a.add(v);
++    for ([_]usize{ n, down.n, down.k, sk, dims, dims / 256, streams, low, has_inj }) |v| a.add(cint(v));
++    a.add(down.scale);
++    a.add(eps);
++    try cuda.launch.launch(t.hcd_down, .{
++        .grid = .{ .x = @intCast(cdiv(n, 16) * cdiv(down.n, 32)), .y = 1, .z = @intCast(sk) },
++        .block = .{ .x = 128 },
++        .shared = tk.hcdDownSmem(per),
++        .cluster = if (sk > 1) .{ .x = 1, .y = 1, .z = @intCast(sk) } else null,
++    }, stream, &a);
++}
++
++/// fn_hcn_up1: act times the BF16 up, gated onto the rows normed from h, mixed, with the mixed rows' 32-column sums.
++pub fn launchUp(t: *const tk.TileKernels, stream: cuda.Stream, act: u64, up: cuda.qmmf.Weight, h: u64, pss: u64, scale: u64, mixed: u64, xsm: u64, n: usize) !void {
++    var b: cuda.Args = .{};
++    for ([_]u64{ act, up.codes, h, pss, scale, mixed, xsm }) |v| b.add(v);
++    for ([_]usize{ n, dims, dims / 256 }) |v| b.add(cint(v));
++    b.add(eps);
++    try cuda.launch.launch(t.hcn_up1, .{ .grid = .{ .x = @intCast(cdiv(n, 16) * (dims / 32)) }, .block = .{ .x = 256 }, .shared = tk.hcnUpSmem(1) }, stream, &b);
++}
++
++/// The read-out over rows [r0, r0 + n) in two launches: the down with act and gates, then the up with the mix.
++pub fn readout(pass: anytype, hc_w: wt.HcW, r0: usize, n: usize) !void {
++    const s = pass.s;
++    const down = hc_w.down.native orelse return error.UnexpectedTensor;
++    const up = hc_w.up.native orelse return error.UnexpectedTensor;
++    const per = slicePer(pass.k.native_lane, down, n) orelse return error.UnexpectedTensor;
++    const h = s.h + r0 * wide * 2;
++    const pss = s.pss + r0 * pss_n * 4;
++    const act = s.act + r0 * low * 2;
++    const xs_act = s.xs_act + r0 * (low / 32) * 4;
++    const inj = if (hc_w.has_inj == 1) s.inj + r0 * streams * 2 else act;
++    try launchDown(&pass.k.tiles, pass.stream, h, pss, hc_w.scale.ptr, down, per, act, xs_act, inj, n, hc_w.has_inj);
++    try launchUp(&pass.k.tiles, pass.stream, act, up, h, pss, hc_w.scale.ptr, s.mixed + r0 * dims * 2, s.xsm + r0 * (dims / 32) * 4, n);
++}
+diff --git a/zig/src/families/flashnext/cuda_tile_kernels.zig b/zig/src/families/flashnext/cuda_tile_kernels.zig
+index 4ebebc610..f4711588a 100644
+--- a/zig/src/families/flashnext/cuda_tile_kernels.zig
++++ b/zig/src/families/flashnext/cuda_tile_kernels.zig
+@@ -20,6 +20,16 @@ pub const hcn_down_names = [_][:0]const u8{ "fn_hcn_down2", "fn_hcn_down3", "fn_
+ pub const hcn_down_mt = [_]usize{ 2, 3, 4 };
+ pub const hcn_up_name: [:0]const u8 = "fn_hcn_up3";
+ pub const hcn_up_mt: usize = 3;
++/// Decode rows' read-out (TF_FLASHNEXT_READOUT_DECODE): the down with act and gates in a cluster, the up+mix at mt 1.
++pub const hcd_down_name: [:0]const u8 = "fn_hcn_down_act";
++pub const hcn_up1_name: [:0]const u8 = "fn_hcn_up1";
++
++/// hcn::dd_smem: a slice's normed rows (padded by 8) and scales, eight 32-column weight groups, the rows' scales.
++pub fn hcdDownSmem(per: usize) u32 {
++    return @intCast(16 * (per * 64 + 8) * 2 + per * 64 * 4 + 8 * 4096 + 16 * 8 * 4);
++}
++/// The down's shared bytes allowed at load: slices of up to 20 groups (Flash Next's 10240 columns in 8 slices).
++pub const hcd_down_smem: u32 = hcdDownSmem(20);
+ 
+ /// hcn::DnShape's shared bytes: three stages of 16 * mt rows of 64 columns, and the rows' scales.
+ pub fn hcnDownSmem(mt: usize) u32 {
+@@ -41,6 +51,8 @@ pub const TileKernels = struct {
+     hcn_mod: cuda.Module,
+     hcn_down: [hcn_down_names.len]cuda.Function,
+     hcn_up: cuda.Function,
++    hcd_down: cuda.Function,
++    hcn_up1: cuda.Function,
+     /// The device's SMs, over which the fused read-out picks its down tile.
+     sms: usize,
+     fexp_mod: cuda.Module,
+@@ -75,6 +87,9 @@ pub const TileKernels = struct {
+         }
+         k.hcn_up = try k.hcn_mod.function(hcn_up_name);
+         try k.hcn_up.allowDynamicShared(hcnUpSmem(hcn_up_mt));
++        k.hcd_down = try k.hcn_mod.function(hcd_down_name);
++        try k.hcd_down.allowDynamicShared(hcd_down_smem);
++        k.hcn_up1 = try k.hcn_mod.function(hcn_up1_name);
+         var dev: c_int = 0;
+         var sms: c_int = 0;
+         try d.check(d.api.cuCtxGetDevice(&dev), "cuCtxGetDevice");
+diff --git a/zig/src/families/flashnext/cuda_tiles.zig b/zig/src/families/flashnext/cuda_tiles.zig
+index bd5171946..3e2a14646 100644
+--- a/zig/src/families/flashnext/cuda_tiles.zig
++++ b/zig/src/families/flashnext/cuda_tiles.zig
+@@ -4,6 +4,8 @@ const cuda = @import("cuda");
+ const wt = @import("cuda_prompt_wt.zig");
+ const parts = @import("cuda_batch_state.zig");
+ const tk = @import("cuda_tile_kernels.zig");
++/// The decode rows' two-launch read-out (TF_FLASHNEXT_READOUT_DECODE), which its kernel contract launches.
++pub const decode = @import("cuda_readout_decode.zig");
+ 
+ const dims = wt.dims;
+ const streams = wt.streams;
+diff --git a/zig/src/platform/environment.zig b/zig/src/platform/environment.zig
+index ad5927139..d8f4c7e8a 100644
+--- a/zig/src/platform/environment.zig
++++ b/zig/src/platform/environment.zig
+@@ -221,6 +221,7 @@ pub const rules = [_]Rule{
+     .{ .name = "TF_FLASHNEXT_SHARED_SIDE_SPLIT", .scope = .flashnext, .kind = .flag, .forms = "0 or 1 (default 0)" },
+     .{ .name = "TF_FLASHNEXT_HC_FUSE", .scope = .flashnext, .kind = .flag, .forms = "0 or 1 (default 1)" },
+     .{ .name = "TF_FLASHNEXT_READOUT_FUSED", .scope = .flashnext, .kind = .flag, .forms = "0 or 1 (default 0)" },
++    .{ .name = "TF_FLASHNEXT_READOUT_DECODE", .scope = .flashnext, .kind = .flag, .forms = "0 or 1 (default 0; 1: a pass under 64 rows runs the BF16 read-out in two launches, same bits); give every rank the same" },
+     .{ .name = "TF_FLASHNEXT_KEEP_LATE", .scope = .flashnext, .kind = .flag, .forms = "0 or 1 (unset or blank leaves it unset)" },
+     .{ .name = "TF_FLASHNEXT_DECODE_GRAPH", .scope = .flashnext, .kind = .flag, .forms = "0 or 1 (default 0)" },
+     .{ .name = "TF_FLASHNEXT_SPLIT_DENSE", .scope = .flashnext, .kind = .flag, .forms = "0 or 1 (default 1)" },
+diff --git a/zig/src/platform/environment_flashnext_test.zig b/zig/src/platform/environment_flashnext_test.zig
+index 02b8cfec3..a4b6ab01a 100644
+--- a/zig/src/platform/environment_flashnext_test.zig
++++ b/zig/src/platform/environment_flashnext_test.zig
+@@ -33,13 +33,13 @@ fn check(name: []const u8, raw: []const u8, valid: bool) !void {
+     try t.expect(std.mem.endsWith(u8, why.?, e.rule(name).forms));
+ }
+ 
+-test "Flash Next strict env: the table holds all 55 settings: 38 switches, 12 integers, 2 reals, 3 structured" {
++test "Flash Next strict env: the table holds all 56 settings: 39 switches, 12 integers, 2 reals, 3 structured" {
+     var counts: [4]usize = @splat(0);
+     for (e.rules) |r| if (r.scope == .flashnext) {
+         try t.expect(std.mem.startsWith(u8, r.name, "TF_FLASHNEXT_"));
+         counts[@backingInt(group(r))] += 1;
+     };
+-    try t.expectEqual([4]usize{ 38, 12, 2, 3 }, counts);
++    try t.expectEqual([4]usize{ 39, 12, 2, 3 }, counts);
+ }
+ 
+ test "Flash Next strict env: unset and blank settings both read as the caller's default" {
+diff --git a/zig/tests/cuda/contract_flashnext_hcn.zig b/zig/tests/cuda/contract_flashnext_hcn.zig
+index f073dc3bc..0be27d1fd 100644
+--- a/zig/tests/cuda/contract_flashnext_hcn.zig
++++ b/zig/tests/cuda/contract_flashnext_hcn.zig
+@@ -1,4 +1,4 @@
+-//! The fused BF16 read-out's tiles under the contract: each bit-equal to the launches it replaces, with two controls.
++//! The fused BF16 read-out's prompt and decode tiles under the contract: each bit-equal to the launches it replaces.
+ const std = @import("std");
+ const cuda = @import("cuda");
+ const core = @import("core");
+@@ -20,7 +20,7 @@ const nc = dims / 256;
+ const eps: f32 = 1e-6;
+ const most = 3072;
+ 
+-pub const Kind = enum { down, up };
++pub const Kind = enum { down, up, decode_down, decode_up };
+ pub const Fault = enum { none, rz, raw };
+ pub const Entry = struct { name: []const u8, kind: Kind, di: usize = 1, fault: Fault = .none };
+ 
+@@ -29,6 +29,8 @@ pub const entries = [_]Entry{
+     .{ .name = "cuda flashnext fn_hcn_down3 (normalize and fp32 down, 48-row tiles)", .kind = .down, .di = 1 },
+     .{ .name = "cuda flashnext fn_hcn_down4 (normalize and fp32 down, 64-row tiles)", .kind = .down, .di = 2 },
+     .{ .name = "cuda flashnext fn_hcn_up3 (bf16 up, gates and the four-stream mix)", .kind = .up },
++    .{ .name = "cuda flashnext fn_hcn_down_act (normalize, down in a cluster, act and gates, decode rows)", .kind = .decode_down },
++    .{ .name = "cuda flashnext fn_hcn_up1 (bf16 up, gates and the four-stream mix, decode rows)", .kind = .decode_up },
+     .{ .name = "control: fn_hcn_down3 rounding its normed rows toward zero", .kind = .down, .fault = .rz },
+     .{ .name = "control: fn_hcn_up3 gating its up rows before their bf16 rounding", .kind = .up, .fault = .raw },
+ };
+@@ -37,6 +39,17 @@ fn noSums(_: c.Shape) usize {
+     return 0;
+ }
+ 
++const prompt_rows = [_]c.Shape{ .{ .rows = 768, .n = dims, .k = 1 }, .{ .rows = 769, .n = dims, .k = 1 }, .{ .rows = 1000, .n = dims, .k = 1 }, .{ .rows = 1536, .n = dims, .k = 1 }, .{ .rows = 2053, .n = dims, .k = 1 }, .{ .rows = 3072, .n = dims, .k = 1 } };
++const decode_rows = [_]c.Shape{ .{ .rows = 1, .n = dims, .k = 1 }, .{ .rows = 7, .n = dims, .k = 1 }, .{ .rows = 13, .n = dims, .k = 1 }, .{ .rows = 16, .n = dims, .k = 1 }, .{ .rows = 25, .n = dims, .k = 1 }, .{ .rows = 63, .n = dims, .k = 1 } };
++
++fn replaces(k: Kind) []const u8 {
++    return switch (k) {
++        .down => "fn_hc_normalize, then the qmmf lane's fp32 down",
++        .decode_down => "fn_hc_normalize, the qmmf lane's fp32 down, then fn_hc_reduce_act",
++        .up, .decode_up => "the qmmf lane's bf16 up, then fn_hc_dense_mix over fn_hc_normalize's rows",
++    };
++}
++
+ pub fn spec(e: Entry) c.Spec {
+     return .{
+         .name = e.name,
+@@ -44,8 +57,8 @@ pub fn spec(e: Entry) c.Spec {
+         .depth = noSums,
+         .out = .raw,
+         .nan = .{ .stated = "every output byte equal to the launches it replaces, planted non-finite rows included" },
+-        .replaces = if (e.kind == .down) "fn_hc_normalize, then the qmmf lane's fp32 down" else "the qmmf lane's bf16 up, then fn_hc_dense_mix over fn_hc_normalize's rows",
+-        .served = &.{ .{ .rows = 768, .n = dims, .k = 1 }, .{ .rows = 769, .n = dims, .k = 1 }, .{ .rows = 1000, .n = dims, .k = 1 }, .{ .rows = 1536, .n = dims, .k = 1 }, .{ .rows = 2053, .n = dims, .k = 1 }, .{ .rows = 3072, .n = dims, .k = 1 } },
++        .replaces = replaces(e.kind),
++        .served = if (e.kind == .decode_down or e.kind == .decode_up) &decode_rows else &prompt_rows,
+     };
+ }
+ 
+@@ -65,8 +78,9 @@ pub const Hcn = struct {
+     norm: u64 = 0,
+     up: u64 = 0,
+     part: u64 = 0,
+-    lens: [2]usize = @splat(0),
+-    outs: [2]u64 = @splat(0),
++    dn: u64 = 0,
++    lens: [3]usize = @splat(0),
++    outs: [3]u64 = @splat(0),
+     nout: usize = 0,
+     base: u64 = 0,
+     seen: std.ArrayList(u8) = .empty,
+@@ -89,6 +103,9 @@ pub const Hcn = struct {
+         self.shape = shape;
+         const m = shape.rows;
+         if (m == 0 or m > most or shape.n != dims) return false;
++        const downs = self.entry.kind == .down or self.entry.kind == .decode_down;
++        if ((self.entry.kind == .decode_down or self.entry.kind == .decode_up) and m >= flash.tiles.decode.max_rows) return false;
++        if (self.entry.kind == .decode_down and tiles.decode.slicePer(self.lane.*, cuda.modelopt.bf16Weight(0, n_down, wide), m) == null) return false;
+         const a = self.rig.gpu.gpa;
+         var prng = std.Random.DefaultPrng.init(seed ^ 0x68636e);
+         const r = prng.random();
+@@ -109,11 +126,11 @@ pub const Hcn = struct {
+         const scale = try a.alloc(f32, wide);
+         defer a.free(scale);
+         for (scale) |*x| x.* = 0.5 + r.float(f32);
+-        const rows: usize = if (self.entry.kind == .down) n_down else wide;
+-        const k: usize = if (self.entry.kind == .down) wide else low;
++        const rows: usize = if (downs) n_down else wide;
++        const k: usize = if (downs) wide else low;
+         const wt = try a.alloc(u16, rows * k);
+         defer a.free(wt);
+-        const spread: f32 = if (self.entry.kind == .down) 0.04 else 0.4;
++        const spread: f32 = if (downs) 0.04 else 0.4;
+         for (wt) |*x| x.* = c.toBf16((r.float(f32) * 2 - 1) * spread);
+         const packed_w = try a.alloc(u16, cuda.nvfp4.padded(rows) * k);
+         defer a.free(packed_w);
+@@ -126,6 +143,12 @@ pub const Hcn = struct {
+         if (self.entry.kind == .down) {
+             try self.out(m * n_down * 4); // the down's fp32 rows
+             self.part = try self.rig.scratch(8 * m * n_down * 4);
++        } else if (self.entry.kind == .decode_down) {
++            try self.out(m * low * 2); // act
++            try self.out(m * (low / 32) * 4); // its 32-column sums
++            try self.out(m * streams * 2); // the inject gates
++            self.dn = try self.rig.scratch(m * n_down * 4);
++            self.part = try self.rig.scratch(8 * m * n_down * 4);
+         } else {
+             const act = try a.alloc(u16, m * low);
+             defer a.free(act);
+@@ -154,6 +177,11 @@ pub const Hcn = struct {
+             const f = self.ctl orelse self.t.hcn_down[self.entry.di];
+             return tiles.fusedDown(f, tk.hcn_down_mt[self.entry.di], s, self.h, self.pss, self.scale, self.w, o[0], m, eps);
+         }
++        if (self.entry.kind == .decode_down) {
++            const per = tiles.decode.slicePer(self.lane.*, self.w, m) orelse return error.UnexpectedTensor;
++            return tiles.decode.launchDown(self.t, s, self.h, self.pss, self.scale, self.w, per, o[0], o[1], o[2], m, 1);
++        }
++        if (self.entry.kind == .decode_up) return tiles.decode.launchUp(self.t, s, self.act, self.w, self.h, self.pss, self.scale, o[0], o[1], m);
+         try tiles.fusedUpMix(self.ctl orelse self.t.hcn_up, s, self.act, self.w, self.h, self.pss, self.scale, o[0], o[1], m, eps);
+     }
+ 
+@@ -162,6 +190,10 @@ pub const Hcn = struct {
+         const s = self.rig.s;
+         try self.glue.hcNormalize(s, self.h, self.pss, self.scale, self.norm, eps, m, dims, streams);
+         if (self.entry.kind == .down) return self.lane.matmulF32(s, self.norm, wide, m, self.w, o[0], self.part);
++        if (self.entry.kind == .decode_down) {
++            try self.lane.matmulF32(s, self.norm, wide, m, self.w, self.dn, self.part);
++            return self.glue.hcReduceAct(s, self.dn, o[0], o[1], o[2], 1, m, streams, low, n_down, 1);
++        }
+         try self.lane.matmul(s, self.act, low, m, self.w, self.up, 0);
+         try self.glue.hcDenseMix(s, self.up, self.norm, o[0], o[1], m, dims, streams);
+     }
+@@ -174,7 +206,7 @@ pub const Hcn = struct {
+     /// The scratch the replaced launches write: the outputs' layout back to back, poisoned like them (0xff).
+     fn baseline(self: *Hcn) ![]const u8 {
+         var at = self.base;
+-        var o: [2]u64 = undefined;
++        var o: [3]u64 = undefined;
+         var total: usize = 0;
+         for (self.lens[0..self.nout], 0..) |l, i| {
+             o[i] = at;
+@@ -258,7 +290,8 @@ pub const Set = struct {
+                 .raw => raw,
+             },
+         };
+-        for (&set.items) |*x| try list.append(a, x.kernel());
++        // the decode down's slices meet in a cluster: devices without clusters keep the five launches
++        for (&set.items) |*x| if (x.entry.kind != .decode_down or set.lane.clusters) try list.append(a, x.kernel());
+         return set;
+     }
+ 
+-- 
+2.56.0
+

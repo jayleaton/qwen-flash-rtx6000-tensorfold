@@ -1,0 +1,64 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jay Leaton <58495321+jayleaton@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 15:28:36 +0700
+Subject: [PATCH 63/76] flashnext cuda: TF_FLASHNEXT_KV_HOST is refused by name
+ at --pp 2
+
+Its mapped host pages and the device room `overflow` spends both count every
+attention layer's K/V rows, where a pipeline stage's sequence holds its own
+layers' alone. The load refuses the pair before any weight moves.
+---
+ docs/environment.md                               | 2 +-
+ zig/src/families/flashnext/cuda_lanes_explain.zig | 3 ++-
+ zig/src/families/flashnext/cuda_lanes_load.zig    | 1 +
+ 3 files changed, 4 insertions(+), 2 deletions(-)
+
+diff --git a/docs/environment.md b/docs/environment.md
+index b52fa1449..886cc626b 100644
+--- a/docs/environment.md
++++ b/docs/environment.md
+@@ -137,7 +137,7 @@ stops the start with the variable, the supplied text and the accepted forms.
+ | `TF_FLASHNEXT_LANE_PARTS` | Exactly `0` or `1`; default on |
+ | `TF_FLASHNEXT_KEEP_INPASS` | Exactly `0` or `1`; default on |
+ | `TF_FLASHNEXT_KEPT` | `host` or `device`; default `host` on a discrete card, `device` on an integrated GPU. Where kept prompt states go: `host` is mapped pinned host memory, which `--prompt-cache-gib` then budgets. Give every rank the same value. |
+-| `TF_FLASHNEXT_KV_HOST` | `off`, `overflow` or `all`; default `off`. Where a new stream's attention K/V rows go: `all` places every stream's on mapped pinned host pages (slower over PCIe, measured by the cost cells), `overflow` only once the granted device room is spent. Indexer keys, pooled rows and the DeltaNet state stay on the device. Refused with `TF_FLASHNEXT_KV_PAGES`. Give every rank the same value. |
++| `TF_FLASHNEXT_KV_HOST` | `off`, `overflow` or `all`; default `off`. Where a new stream's attention K/V rows go: `all` places every stream's on mapped pinned host pages (slower over PCIe, measured by the cost cells), `overflow` only once the granted device room is spent. Indexer keys, pooled rows and the DeltaNet state stay on the device. Refused with `TF_FLASHNEXT_KV_PAGES` and at `--pp 2`. Give every rank the same value. |
+ | `TF_FLASHNEXT_FIRST_EARLY` | Exactly `0` or `1`; default on |
+ | `TF_FLASHNEXT_GPU_TOPK` | Exactly `0` or `1`; default on |
+ | `TF_FLASHNEXT_GDN_FUSED` | Exactly `0` or `1`; default on |
+diff --git a/zig/src/families/flashnext/cuda_lanes_explain.zig b/zig/src/families/flashnext/cuda_lanes_explain.zig
+index 672f5149a..70f217cc0 100644
+--- a/zig/src/families/flashnext/cuda_lanes_explain.zig
++++ b/zig/src/families/flashnext/cuda_lanes_explain.zig
+@@ -6,6 +6,7 @@ pub fn open(err: anyerror) ?[]const u8 {
+         error.FlashNextRanksOverTwo => "Flash Next on CUDA runs on one GPU or at --tp 2 (two ranks): serve with --tp 1 or --tp 2",
+         error.FlashNextRanksNeedModelopt => "--tp 2 splits Flash Next's ModelOpt and block-FP8 checkpoints only; serve this MLX checkpoint on one GPU, without --tp",
+         error.FlashNextRanksOnCapturedGlue => "--tp 2 runs Flash Next's own glue, not a captured set: set TENSORFOLD_CUDA_KERNELS=native, or serve on one GPU",
++        error.FlashNextKvHostOnStages => "TF_FLASHNEXT_KV_HOST places every layer's K/V rows, not a --pp 2 stage's: unset it",
+         error.BadFlashNextKvPages, error.BadFlashNextPageTest, error.FlashNextPagesUnsupported, error.UnsupportedCheckpoint => explain(err),
+         error.UnsupportedLearningFormat, error.TrainingOnCapturedGlue => explain(err),
+         else => null,
+@@ -31,7 +32,7 @@ pub fn explain(err: anyerror) ?[]const u8 {
+ 
+ test "--tp refusals at load are worded, and a request's words stay out of a load's" {
+     const t = @import("std").testing;
+-    for ([_]anyerror{ error.FlashNextRanksOverTwo, error.FlashNextRanksNeedModelopt, error.FlashNextRanksOnCapturedGlue }) |e|
++    for ([_]anyerror{ error.FlashNextRanksOverTwo, error.FlashNextRanksNeedModelopt, error.FlashNextRanksOnCapturedGlue, error.FlashNextKvHostOnStages }) |e|
+         try t.expect(open(e) != null);
+     try t.expectEqualStrings(explain(error.UnsupportedLearningFormat).?, open(error.UnsupportedLearningFormat).?);
+     // generic errors other load paths raise at one GPU too, and a request's out-of-memory, keep cuda.zig's own words
+diff --git a/zig/src/families/flashnext/cuda_lanes_load.zig b/zig/src/families/flashnext/cuda_lanes_load.zig
+index b5d1867cb..0223975d2 100644
+--- a/zig/src/families/flashnext/cuda_lanes_load.zig
++++ b/zig/src/families/flashnext/cuda_lanes_load.zig
+@@ -37,6 +37,7 @@ pub fn open(comptime F: type, gpa: std.mem.Allocator, io: std.Io, ctx: *const cu
+     const kv_host = @import("cuda_kv_host.zig");
+     kv_host.mode = kv_host.readMode();
+     if (kv_host.mode != .off and page_tokens > 0) return error.FlashNextKvHostUnsupported;
++    if (kv_host.mode != .off and o.pp != 1) return error.FlashNextKvHostOnStages; // its pages hold every layer's rows
+     // pending DeltaNet rows run on one GPU only: TF_FLASHNEXT_KEEP_LATE=1 with tensor parallel is refused
+     const Draft = @import("cuda_mtp_draft.zig").Draft;
+     const late_fits = world == 1;
+-- 
+2.56.0
+

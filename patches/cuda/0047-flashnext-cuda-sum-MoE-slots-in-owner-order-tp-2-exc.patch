@@ -1,0 +1,1129 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jay Leaton <58495321+jayleaton@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 05:34:10 +0700
+Subject: [PATCH 47/76] flashnext cuda: sum MoE slots in owner order; --tp 2
+ exchanges one hidden-size row a layer
+
+Each owner's slots (routed experts below or from 256, the shared slot's column halves) are summed as
+one fma chain in slot order, then added once, in fn_moe_sum and both MoE writebacks. At --tp 2 with
+the shared expert split by columns, each rank sums its own owner's chain and one FP32 all-reduce of
+the hidden rows adds the other's, so TP2 keeps TP1's bits while sending 10 KiB a row a layer.
+---
+ zig/kernels/cuda/flashnext_batch.cu           |  14 +-
+ zig/kernels/cuda/flashnext_hc.cu              |  43 ++---
+ zig/kernels/cuda/flashnext_owner_sum.cuh      |  17 ++
+ zig/src/families/flashnext/cuda_batch.zig     |   4 +-
+ zig/src/families/flashnext/cuda_batch_hc.zig  |   4 +-
+ .../families/flashnext/cuda_batch_head.zig    |   1 +
+ zig/src/families/flashnext/cuda_batch_moe.zig |  15 +-
+ zig/src/families/flashnext/cuda_glue.zig      |  37 ++--
+ zig/src/families/flashnext/cuda_launch.zig    |  18 ++
+ .../flashnext/cuda_moe_exchange_test.zig      |  10 +-
+ .../flashnext/cuda_moe_hidden_sum.zig         |  24 +++
+ .../flashnext/cuda_moe_hidden_sum_test.zig    |  90 ++++++++++
+ .../families/flashnext/cuda_moe_native.zig    |   6 +-
+ .../families/flashnext/cuda_prompt_step.zig   |  12 +-
+ zig/src/families/flashnext/cuda_rows.zig      |  14 +-
+ zig/tests/cuda/contract_flashnext_wbnorm.zig  |  14 +-
+ .../cuda/contract_flashnext_writeback.zig     |  28 ++-
+ zig/tests/cuda/flashnext_exchange_tests.zig   |  14 +-
+ zig/tests/cuda/flashnext_hc_tests.zig         |   5 +-
+ zig/tests/cuda/flashnext_hidden_sum_tests.zig | 162 ++++++++++++++++++
+ zig/tests/cuda/flashnext_rank_tests.zig       |   6 +-
+ zig/tests/cuda/main_usage.zig                 |   2 +-
+ 22 files changed, 457 insertions(+), 83 deletions(-)
+ create mode 100644 zig/kernels/cuda/flashnext_owner_sum.cuh
+ create mode 100644 zig/src/families/flashnext/cuda_moe_hidden_sum.zig
+ create mode 100644 zig/src/families/flashnext/cuda_moe_hidden_sum_test.zig
+ create mode 100644 zig/tests/cuda/flashnext_hidden_sum_tests.zig
+
+diff --git a/zig/kernels/cuda/flashnext_batch.cu b/zig/kernels/cuda/flashnext_batch.cu
+index 6936ff983..a2300fc2a 100644
+--- a/zig/kernels/cuda/flashnext_batch.cu
++++ b/zig/kernels/cuda/flashnext_batch.cu
+@@ -4,6 +4,7 @@
+ #include <stdint.h>
+ #include "common/reduce.cuh"
+ #include "common/act.cuh"
++#include "flashnext_owner_sum.cuh"
+ 
+ // out[i] = the sum of the sk slices' part[s][i] in order, rounded once (qmm.cu's reduce_kernel): bf16 if out_bf16.
+ extern "C" __global__ void fn_sum_slices(const float* __restrict__ part, void* __restrict__ out, int out_bf16,
+@@ -557,15 +558,14 @@ extern "C" __global__ void __launch_bounds__(1024) fn_qsa_select_lanes(const flo
+     fn_qsa_select_body(sc, LI + LI[4 * MAX + blockIdx.x], ids, nkr, spr, nb, idw, top, ratio);
+ }
+ 
+-// Training or a live pocket requests the ordered FP32 expert sum.
+-extern "C" __global__ void fn_moe_sum(const float* __restrict__ y, const float* __restrict__ wts, float* __restrict__ out,
+-                                      int d, int slots) {
++// The FP32 expert sum in owner order (fn_owner_sum): both owners' chains added, or one owner's alone for --tp 2.
++extern "C" __global__ void fn_moe_sum(const float* __restrict__ y, const float* __restrict__ wts,
++                                      const int* __restrict__ picks, float* __restrict__ out, int d, int slots, int split,
++                                      int part) {
+     const int r = blockIdx.x, col = blockIdx.y * blockDim.x + threadIdx.x;
+     if (col >= d) return;
+-    float acc = 0.0f;
+-    for (int k = 0; k < slots; ++k)
+-        acc = __fmaf_rn(y[(static_cast<long long>(r) * slots + k) * d + col], wts[r * slots + k], acc);
+-    out[static_cast<long long>(r) * d + col] = acc;
++    out[static_cast<long long>(r) * d + col] =
++        fn_owner_sum(y, wts, picks, static_cast<long long>(r) * slots, slots, d, col, split, part);
+ }
+ 
+ // dst [rows, width] (rows dst_pitch apart) = the columns src [rows, width] (src_pitch apart), 16-bit values.
+diff --git a/zig/kernels/cuda/flashnext_hc.cu b/zig/kernels/cuda/flashnext_hc.cu
+index 928e6fdc4..e5a102e26 100644
+--- a/zig/kernels/cuda/flashnext_hc.cu
++++ b/zig/kernels/cuda/flashnext_hc.cu
+@@ -8,6 +8,7 @@
+ #include "common/fold.cuh"
+ #include "common/glue_math.cuh"
+ #include "common/qmm_frag.cuh"
++#include "flashnext_owner_sum.cuh"
+ 
+ using namespace tf_glue;
+ 
+@@ -60,8 +61,9 @@ using namespace fn_hc;
+ template <int MODE>
+ __device__ __forceinline__ void hc_writeback(const __nv_bfloat16* H, __nv_bfloat16* HOUT, float* __restrict__ PSS,
+                                              const float* __restrict__ BR, const __nv_bfloat16* __restrict__ INJ,
+-                                             const float* __restrict__ Y, const float* __restrict__ WTS, long long RS, int D,
+-                                             int S, int TOPK, int SLOTS, int WORLD) {
++                                             const float* __restrict__ Y, const float* __restrict__ WTS,
++                                             const int* __restrict__ PICKS, long long RS, int D, int S, int TOPK, int SLOTS,
++                                             int SPLIT, int WORLD) {
+     constexpr int MAXS = 8;
+     __shared__ float red[8][MAXS];
+     const int r = blockIdx.x, c = blockIdx.y, nc = D / 256;
+@@ -72,12 +74,7 @@ __device__ __forceinline__ void hc_writeback(const __nv_bfloat16* H, __nv_bfloat
+         for (int k = 1; k < WORLD; ++k) acc = __fadd_rn(acc, BR[k * RS + static_cast<long long>(r) * D + d]);
+         branch = rbf(acc);
+     } else if constexpr (MODE == 2) {
+-        float acc = 0.0f;
+-        for (int k = 0; k <= TOPK; ++k) {
+-            const long long at = static_cast<long long>(r) * SLOTS + k;
+-            acc = __fmaf_rn(Y[at * D + d], WTS[at], acc);
+-        }
+-        branch = rbf(acc);
++        branch = rbf(fn_owner_sum(Y, WTS, PICKS, static_cast<long long>(r) * SLOTS, TOPK + 1, D, d, SPLIT, -1));
+     }
+     const int warp = threadIdx.x >> 5;
+     for (int s = 0; s < S; ++s) {
+@@ -99,19 +96,20 @@ __device__ __forceinline__ void hc_writeback(const __nv_bfloat16* H, __nv_bfloat
+ }
+ 
+ extern "C" __global__ void __launch_bounds__(256) fn_hc_writeback0(const __nv_bfloat16* H, float* PSS, int D, int S) {
+-    hc_writeback<0>(H, nullptr, PSS, nullptr, nullptr, nullptr, nullptr, 0, D, S, 0, 1, 1);
++    hc_writeback<0>(H, nullptr, PSS, nullptr, nullptr, nullptr, nullptr, nullptr, 0, D, S, 0, 1, 0, 1);
+ }
+ 
+ extern "C" __global__ void __launch_bounds__(256) fn_hc_writeback_moe(const __nv_bfloat16* H, __nv_bfloat16* HOUT, float* PSS,
+                                                                       const __nv_bfloat16* INJ, const float* Y,
+-                                                                      const float* WTS, int D, int S, int TOPK, int SLOTS) {
+-    hc_writeback<2>(H, HOUT, PSS, nullptr, INJ, Y, WTS, 0, D, S, TOPK, SLOTS, 1);
++                                                                      const float* WTS, const int* PICKS, int D, int S,
++                                                                      int TOPK, int SLOTS, int SPLIT) {
++    hc_writeback<2>(H, HOUT, PSS, nullptr, INJ, Y, WTS, PICKS, 0, D, S, TOPK, SLOTS, SPLIT, 1);
+ }
+ 
+ extern "C" __global__ void __launch_bounds__(256) fn_hc_writeback_slices(const __nv_bfloat16* H, __nv_bfloat16* HOUT, float* PSS,
+                                                                          const float* BR, const __nv_bfloat16* INJ,
+                                                                          long long RS, int D, int S, int WORLD) {
+-    hc_writeback<4>(H, HOUT, PSS, BR, INJ, nullptr, nullptr, RS, D, S, 0, 1, WORLD);
++    hc_writeback<4>(H, HOUT, PSS, BR, INJ, nullptr, nullptr, nullptr, RS, D, S, 0, 1, 0, WORLD);
+ }
+ 
+ // hc_writeback<MODE> then fn_hc_normalize in one block a row, slices summed and added in their order: the same bits.
+@@ -119,8 +117,9 @@ template <int MODE, int NC, int S>
+ __device__ __forceinline__ void hc_writeback_norm(const __nv_bfloat16* H, __nv_bfloat16* HOUT, float* __restrict__ PSS,
+                                                   const float* __restrict__ BR, const __nv_bfloat16* __restrict__ INJ,
+                                                   const float* __restrict__ Y, const float* __restrict__ WTS,
+-                                                  const float* __restrict__ SCALE, __nv_bfloat16* __restrict__ NORM,
+-                                                  long long RS, float eps, int TOPK, int SLOTS, int WORLD) {
++                                                  const int* __restrict__ PICKS, const float* __restrict__ SCALE,
++                                                  __nv_bfloat16* __restrict__ NORM, long long RS, float eps, int TOPK,
++                                                  int SLOTS, int SPLIT, int WORLD) {
+     constexpr int D = NC * 256;
+     __shared__ float red[NC][8][S];
+     __shared__ float rinv[S];
+@@ -135,12 +134,7 @@ __device__ __forceinline__ void hc_writeback_norm(const __nv_bfloat16* H, __nv_b
+             for (int k = 1; k < WORLD; ++k) acc = __fadd_rn(acc, BR[k * RS + static_cast<long long>(r) * D + d]);
+             branch = rbf(acc);
+         } else if constexpr (MODE == 2) {
+-            float acc = 0.0f;
+-            for (int k = 0; k <= TOPK; ++k) {
+-                const long long at = static_cast<long long>(r) * SLOTS + k;
+-                acc = __fmaf_rn(Y[at * D + d], WTS[at], acc);
+-            }
+-            branch = rbf(acc);
++            branch = rbf(fn_owner_sum(Y, WTS, PICKS, static_cast<long long>(r) * SLOTS, TOPK + 1, D, d, SPLIT, -1));
+         }
+ #pragma unroll
+         for (int s = 0; s < S; ++s) {
+@@ -179,17 +173,18 @@ __device__ __forceinline__ void hc_writeback_norm(const __nv_bfloat16* H, __nv_b
+ 
+ // Flash Next's shape: 2560 columns (10 slices), 4 streams.
+ extern "C" __global__ void __launch_bounds__(256) fn_hc_writeback_norm0(const __nv_bfloat16* H, float* PSS, const float* SCALE, __nv_bfloat16* NORM, float eps) {
+-    hc_writeback_norm<0, 10, 4>(H, nullptr, PSS, nullptr, nullptr, nullptr, nullptr, SCALE, NORM, 0, eps, 0, 1, 1);
++    hc_writeback_norm<0, 10, 4>(H, nullptr, PSS, nullptr, nullptr, nullptr, nullptr, nullptr, SCALE, NORM, 0, eps, 0, 1, 0, 1);
+ }
+ 
+ extern "C" __global__ void __launch_bounds__(256) fn_hc_writeback_norm_moe(const __nv_bfloat16* H, __nv_bfloat16* HOUT, float* PSS, const __nv_bfloat16* INJ,
+-    const float* Y, const float* WTS, const float* SCALE, __nv_bfloat16* NORM, float eps, int TOPK, int SLOTS) {
+-    hc_writeback_norm<2, 10, 4>(H, HOUT, PSS, nullptr, INJ, Y, WTS, SCALE, NORM, 0, eps, TOPK, SLOTS, 1);
++    const float* Y, const float* WTS, const int* PICKS, const float* SCALE, __nv_bfloat16* NORM, float eps, int TOPK, int SLOTS,
++    int SPLIT) {
++    hc_writeback_norm<2, 10, 4>(H, HOUT, PSS, nullptr, INJ, Y, WTS, PICKS, SCALE, NORM, 0, eps, TOPK, SLOTS, SPLIT, 1);
+ }
+ 
+ extern "C" __global__ void __launch_bounds__(256) fn_hc_writeback_norm_slices(const __nv_bfloat16* H, __nv_bfloat16* HOUT, float* PSS, const float* BR,
+     const __nv_bfloat16* INJ, long long RS, const float* SCALE, __nv_bfloat16* NORM, float eps, int WORLD) {
+-    hc_writeback_norm<4, 10, 4>(H, HOUT, PSS, BR, INJ, nullptr, nullptr, SCALE, NORM, RS, eps, 0, 1, WORLD);
++    hc_writeback_norm<4, 10, 4>(H, HOUT, PSS, BR, INJ, nullptr, nullptr, nullptr, SCALE, NORM, RS, eps, 0, 1, 0, WORLD);
+ }
+ 
+ // qmm._qmm_hcdown, block (16 rows, 64 columns, K slice): the slice's normed rows times the down rows, fp32 to PART.
+diff --git a/zig/kernels/cuda/flashnext_owner_sum.cuh b/zig/kernels/cuda/flashnext_owner_sum.cuh
+new file mode 100644
+index 000000000..12a71e7a7
+--- /dev/null
++++ b/zig/kernels/cuda/flashnext_owner_sum.cuh
+@@ -0,0 +1,17 @@
++// Flash Next's MoE slot sum in owner order, the same bits at --tp 1 and --tp 2 under any exchange.
++#pragma once
++
++// Slots first..first+n-1 of y times wts, owner 1 from expert `split` or shared column d / 2; part 0/1: one chain.
++__device__ __forceinline__ float fn_owner_sum(const float* __restrict__ y, const float* __restrict__ wts,
++                                              const int* __restrict__ picks, long long first, int n, int d, int col,
++                                              int split, int part) {
++    float a0 = 0.0f, a1 = 0.0f;
++    for (int k = 0; k < n; ++k) {
++        const long long at = first + k;
++        const bool one = k == n - 1 ? col >= d / 2 : picks[at] >= split;
++        const float v = y[at * d + col], w = wts[at];
++        if (one) a1 = __fmaf_rn(v, w, a1);
++        else a0 = __fmaf_rn(v, w, a0);
++    }
++    return part == 0 ? a0 : part == 1 ? a1 : __fadd_rn(a0, a1);
++}
+diff --git a/zig/src/families/flashnext/cuda_batch.zig b/zig/src/families/flashnext/cuda_batch.zig
+index d0f693fc8..bbdcb150f 100644
+--- a/zig/src/families/flashnext/cuda_batch.zig
++++ b/zig/src/families/flashnext/cuda_batch.zig
+@@ -180,9 +180,7 @@ pub fn Pass(comptime Tri: type) type {
+                 try self.tri.hcWriteback(h, h, pss, s.moe_f32 + r0 * dims * 4, "*fp32", inj, dummy, "*bf16", dummy, "*bf16", rs, n, dims, streams, 4, 1, 1, 1);
+                 return;
+             }
+-            const y = s.y + r0 * slots * dims * 4;
+-            const wts = s.wts + r0 * slots * 4;
+-            try self.tri.hcWriteback(h, h, pss, dummy, "*bf16", inj, y, "*fp32", wts, "*fp32", rs, n, dims, streams, 2, 10, 11, 1);
++            try self.tri.hcWritebackMoe(h, h, pss, inj, @import("cuda_batch_moe.zig").slotsAt(s, r0), n, dims, streams);
+         }
+ 
+         /// A read-out over rows [r0, r0 + n) of the streams: mixed and its group sums, and the inject gates.
+diff --git a/zig/src/families/flashnext/cuda_batch_hc.zig b/zig/src/families/flashnext/cuda_batch_hc.zig
+index 312f9898c..649e7317f 100644
+--- a/zig/src/families/flashnext/cuda_batch_hc.zig
++++ b/zig/src/families/flashnext/cuda_batch_hc.zig
+@@ -45,9 +45,7 @@ pub fn writebackNorm(pass: anytype, hc_w: wt.HcW, r0: usize, n: usize) !void {
+         pass.pending_f32 = false;
+         return pass.tri.hcWritebackNorm(h, h, pss, s.moe_f32 + r0 * dims * 4, inj, dummy, dummy, scale, norm, eps, rs, n, dims, streams, 4, 1, 1, 1);
+     }
+-    const y = s.y + r0 * slots * dims * 4;
+-    const wts = s.wts + r0 * slots * 4;
+-    try pass.tri.hcWritebackNorm(h, h, pss, dummy, inj, y, wts, scale, norm, eps, rs, n, dims, streams, 2, 10, 11, 1);
++    try pass.tri.hcWritebackNormMoe(h, h, pss, inj, @import("cuda_batch_moe.zig").slotsAt(s, r0), scale, norm, eps, n);
+ }
+ 
+ /// A native read-out over rows [r0, r0 + n) whose normed rows are in: down, act and gates, up, the mix.
+diff --git a/zig/src/families/flashnext/cuda_batch_head.zig b/zig/src/families/flashnext/cuda_batch_head.zig
+index a20a788bb..ad4a9e63f 100644
+--- a/zig/src/families/flashnext/cuda_batch_head.zig
++++ b/zig/src/families/flashnext/cuda_batch_head.zig
+@@ -61,6 +61,7 @@ pub fn head(self: anytype, logits_host: ?[]u8) !void {
+                 try self.copy(s.inj, s.inj + r * streams * 2, streams * 2);
+                 try self.copy(s.y, s.y + r * slots * dims * 4, slots * dims * 4);
+                 try self.copy(s.wts, s.wts + r * slots * 4, slots * 4);
++                try self.copy(s.picks, s.picks + r * slots * 4, slots * 4);
+                 if (self.pending_f32) try self.copy(s.moe_f32, s.moe_f32 + r * dims * 4, dims * 4);
+             }
+             if (self.hooks.streams == 0) try self.writeback(0, 1);
+diff --git a/zig/src/families/flashnext/cuda_batch_moe.zig b/zig/src/families/flashnext/cuda_batch_moe.zig
+index 992607e5f..7aac5b2e5 100644
+--- a/zig/src/families/flashnext/cuda_batch_moe.zig
++++ b/zig/src/families/flashnext/cuda_batch_moe.zig
+@@ -19,14 +19,27 @@ pub fn moeAdds(self: anytype, layer: usize, keep: LayerKeep) !void {
+     self.pending_f32 = true;
+ }
+ 
+-/// moe_f32's rows [r0, r0 + rows): each row's slots of y times its weights, summed in slot order (fn_moe_sum).
++/// moe_f32's rows [r0, r0 + rows): each row's slots of y times its weights, both owners' chains added (fn_moe_sum).
+ pub fn sumSlots(self: anytype, r0: usize, rows: usize) !void {
++    return sumPart(self, r0, rows, -1);
++}
++
++/// sumSlots with `part` 0 or 1: that owner's chain alone, which --tp 2's all-reduce adds to the other's.
++pub fn sumPart(self: anytype, r0: usize, rows: usize, part: i32) !void {
+     const s = self.s;
+     var a: cuda.Args = .{};
+     a.add(s.y + r0 * slots * dims * 4);
+     a.add(s.wts + r0 * slots * 4);
++    a.add(s.picks + r0 * slots * 4);
+     a.add(s.moe_f32 + r0 * dims * 4);
+     a.add(batch.cint(dims));
+     a.add(batch.cint(slots));
++    a.add(batch.cint(@import("cuda_moe_hidden_sum.zig").split));
++    a.add(part);
+     try cuda.launch.launch(self.k.moe_sum, .{ .grid = .{ .x = @intCast(rows), .y = dims / 256 }, .block = .{ .x = 256 } }, self.stream, &a);
+ }
++
++/// The scratch's MoE slots from row r0, as the owner-order writeback reads them.
++pub fn slotsAt(s: anytype, r0: usize) @import("cuda_glue.zig").Slots {
++    return .{ .y = s.y + r0 * slots * dims * 4, .wts = s.wts + r0 * slots * 4, .picks = s.picks + r0 * slots * 4, .count = slots, .split = @import("cuda_moe_hidden_sum.zig").split };
++}
+diff --git a/zig/src/families/flashnext/cuda_glue.zig b/zig/src/families/flashnext/cuda_glue.zig
+index 9a1b01c41..a6a6ab990 100644
+--- a/zig/src/families/flashnext/cuda_glue.zig
++++ b/zig/src/families/flashnext/cuda_glue.zig
+@@ -30,6 +30,9 @@ fn cdiv(a: usize, b: usize) usize {
+ /// flashnext_attn.cu's Pg, each cache launch's `pg`: its table, elements and positions a page (pt 0: contiguous).
+ pub const Pg = extern struct { pt: u64 = 0, ps: i64 = 0, ptok: c_int = 0 };
+ 
++/// A pass's MoE slots: fp32 y [rows, count, dims], weights and expert ids [rows, count], owner 1's first expert.
++pub const Slots = struct { y: u64, wts: u64, picks: u64, count: usize, split: usize };
++
+ /// The native kernels, by their extern "C" names.
+ const Fns = struct {
+     wb0: cuda.Function,
+@@ -463,6 +466,7 @@ pub const Glue = struct {
+ 
+     /// hcWriteback then hcNormalize with `scale` into `norm`, one block a row: Flash Next's 2560 columns and 4 streams.
+     pub fn hcWritebackNorm(g: *const Glue, s: cuda.Stream, h: u64, hout: u64, pss: u64, branch: u64, inj: u64, y: u64, wts: u64, scale: u64, norm: u64, eps: f32, rs: usize, rows: usize, dims: usize, streams: usize, mode: usize, topk: usize, slots: usize, world: usize) !void {
++        _ = .{ y, wts, topk, slots };
+         if (dims != 2560 or streams != 4) return error.RowShape;
+         var a: cuda.Args = .{};
+         const grid: [3]usize = .{ rows, 1, 1 };
+@@ -472,12 +476,6 @@ pub const Glue = struct {
+                 a.add(eps);
+                 try go(g.f.wbn0, s, grid, 256, 0, &a);
+             },
+-            2 => {
+-                ptrs(&a, &.{ h, hout, pss, inj, y, wts, scale, norm });
+-                a.add(eps);
+-                ints(&a, &.{ topk, slots });
+-                try go(g.f.wbn_moe, s, grid, 256, 0, &a);
+-            },
+             4 => {
+                 ptrs(&a, &.{ h, hout, pss, branch, inj });
+                 a.add(@as(i64, @intCast(rs)));
+@@ -490,8 +488,28 @@ pub const Glue = struct {
+         }
+     }
+ 
+-    /// Mode 0: the streams' sums; 2: the MoE slots (fp32 y and weights) written back; 4: `world` fp32 K slices.
++    /// The MoE slots (fp32 y, weights, expert ids) summed in owner order (flashnext_owner_sum.cuh) and written back.
++    pub fn hcWritebackMoe(g: *const Glue, s: cuda.Stream, h: u64, hout: u64, pss: u64, inj: u64, slot: Slots, rows: usize, dims: usize, streams: usize) !void {
++        if (dims % 256 != 0 or streams > 8) return error.RowShape;
++        var a: cuda.Args = .{};
++        ptrs(&a, &.{ h, hout, pss, inj, slot.y, slot.wts, slot.picks });
++        ints(&a, &.{ dims, streams, slot.count - 1, slot.count, slot.split });
++        try go(g.f.wb_moe, s, .{ rows, dims / 256, 1 }, 256, 0, &a);
++    }
++
++    /// hcWritebackMoe then hcNormalize with `scale` into `norm`, one block a row of 2560 columns and 4 streams.
++    pub fn hcWritebackNormMoe(g: *const Glue, s: cuda.Stream, h: u64, hout: u64, pss: u64, inj: u64, slot: Slots, scale: u64, norm: u64, eps: f32, rows: usize, dims: usize, streams: usize) !void {
++        if (dims != 2560 or streams != 4) return error.RowShape;
++        var a: cuda.Args = .{};
++        ptrs(&a, &.{ h, hout, pss, inj, slot.y, slot.wts, slot.picks, scale, norm });
++        a.add(eps);
++        ints(&a, &.{ slot.count - 1, slot.count, slot.split });
++        try go(g.f.wbn_moe, s, .{ rows, 1, 1 }, 256, 0, &a);
++    }
++
++    /// Mode 0: the streams' sums; 4: `world` fp32 K slices (hcWritebackMoe writes the MoE slots back).
+     pub fn hcWriteback(g: *const Glue, s: cuda.Stream, h: u64, hout: u64, pss: u64, branch: u64, inj: u64, y: u64, wts: u64, rs: usize, rows: usize, dims: usize, streams: usize, mode: usize, topk: usize, slots: usize, world: usize) !void {
++        _ = .{ y, wts, topk, slots };
+         if (dims % 256 != 0 or streams > 8) return error.RowShape;
+         var a: cuda.Args = .{};
+         const grid: [3]usize = .{ rows, dims / 256, 1 };
+@@ -501,11 +519,6 @@ pub const Glue = struct {
+                 ints(&a, &.{ dims, streams });
+                 try go(g.f.wb0, s, grid, 256, 0, &a);
+             },
+-            2 => {
+-                ptrs(&a, &.{ h, hout, pss, inj, y, wts });
+-                ints(&a, &.{ dims, streams, topk, slots });
+-                try go(g.f.wb_moe, s, grid, 256, 0, &a);
+-            },
+             4 => {
+                 ptrs(&a, &.{ h, hout, pss, branch, inj });
+                 a.add(@as(i64, @intCast(rs)));
+diff --git a/zig/src/families/flashnext/cuda_launch.zig b/zig/src/families/flashnext/cuda_launch.zig
+index d0b66b24f..f17675e95 100644
+--- a/zig/src/families/flashnext/cuda_launch.zig
++++ b/zig/src/families/flashnext/cuda_launch.zig
+@@ -17,6 +17,9 @@ pub const modelopt_experts = @import("cuda_modelopt_experts.zig");
+ pub const moe_native = @import("cuda_moe_native.zig");
+ /// A prompt pass's expert exchange at --tp 2, which the two-rank device test runs against the all-reduce.
+ pub const moe_exchange = @import("cuda_moe_exchange.zig");
++/// --tp 2's hidden-size exchange and the owner-order slot sum, which the two-rank device test checks against --tp 1.
++pub const moe_hidden_sum = @import("cuda_moe_hidden_sum.zig");
++pub const moe_batch = @import("cuda_batch_moe.zig");
+ pub const hc = @import("cuda_hc.zig");
+ pub const draft_affine = @import("cuda_draft_affine.zig");
+ pub const qmm = @import("cuda_qmm.zig");
+@@ -53,6 +56,7 @@ pub const score = @import("cuda_score.zig");
+ pub const native = @import("cuda_lanes.zig").Namespace(Tri);
+ /// Our own glue kernels, which every launch takes when no captured set is loaded
+ pub const Glue = glue_.Glue;
++pub const Slots = glue_.Slots;
+ pub const batch_lanes = @import("cuda_batch_lanes.zig");
+ /// A stream's caches through a page table, as the cache launches take them (TF_FLASHNEXT_KV_PAGES)
+ pub const Pg = glue_.Pg;
+@@ -358,6 +362,7 @@ pub const Tri = struct {
+     /// glue.hc_writeback. Pointer types follow the tensor dtypes Triton specialized (mode 0..4).
+     pub fn hcWriteback(t: Tri, h: u64, hout: u64, pss: u64, branch: u64, branch_ty: []const u8, inj: u64, y: u64, y_ty: []const u8, wts: u64, wts_ty: []const u8, rs: usize, rows: usize, dims: usize, streams: usize, mode: usize, topk: usize, slots: usize, world: usize) !void {
+         if (t.glue("_hc_writeback")) |g| return g.hcWriteback(t.s, h, hout, pss, branch, inj, y, wts, rs, rows, dims, streams, mode, topk, slots, world);
++        if (mode == 2) return error.NativeGlueRequired; // the owner-order slot sum is the native glue's alone
+         try t.run("_hc_writeback", .{ u(rows), u(dims / 256), 1 }, &.{
+             p("H", "*bf16", h),
+             p("HOUT", "*bf16", hout),
+@@ -370,6 +375,18 @@ pub const Tri = struct {
+         }, &.{ ci("D", dims), ci("S", streams), ci("MODE", mode), ci("TOPK", topk), ci("SLOTS", slots), ci("BLOCK", 256), ci("WORLD", world) });
+     }
+ 
++    /// The MoE slots written back on the native glue, summed in owner order.
++    pub fn hcWritebackMoe(t: Tri, h: u64, hout: u64, pss: u64, inj: u64, slot: glue_.Slots, rows: usize, dims: usize, streams: usize) !void {
++        const g = t.glue("_hc_writeback") orelse return error.NativeGlueRequired;
++        return g.hcWritebackMoe(t.s, h, hout, pss, inj, slot, rows, dims, streams);
++    }
++
++    /// hcWritebackMoe and hcNormalize (`scale` into `norm`) in one launch: the same bits as the two.
++    pub fn hcWritebackNormMoe(t: Tri, h: u64, hout: u64, pss: u64, inj: u64, slot: glue_.Slots, scale: u64, norm: u64, eps: f32, rows: usize) !void {
++        const g = t.glue("_hc_writeback") orelse return error.NativeGlueRequired;
++        return g.hcWritebackNormMoe(t.s, h, hout, pss, inj, slot, scale, norm, eps, rows, 2560, 4);
++    }
++
+     /// hcWriteback and hcNormalize (`scale` into `norm`) in one launch on the native glue: the same bits as the two.
+     pub fn hcWritebackNorm(t: Tri, h: u64, hout: u64, pss: u64, branch: u64, inj: u64, y: u64, wts: u64, scale: u64, norm: u64, eps: f32, rs: usize, rows: usize, dims: usize, streams: usize, mode: usize, topk: usize, slots: usize, world: usize) !void {
+         const g = t.glue("_hc_writeback") orelse return error.NativeGlueRequired;
+@@ -487,6 +504,7 @@ test {
+     _ = @import("cuda_rank_memory.zig");
+     _ = @import("cuda_rank_wire.zig");
+     _ = @import("cuda_moe_exchange.zig");
++    _ = @import("cuda_moe_hidden_sum.zig");
+     _ = @import("cuda_modelopt_experts.zig");
+     _ = @import("cuda_modelopt_threads.zig");
+     _ = row_path;
+diff --git a/zig/src/families/flashnext/cuda_moe_exchange_test.zig b/zig/src/families/flashnext/cuda_moe_exchange_test.zig
+index 674455836..953795117 100644
+--- a/zig/src/families/flashnext/cuda_moe_exchange_test.zig
++++ b/zig/src/families/flashnext/cuda_moe_exchange_test.zig
+@@ -18,7 +18,7 @@ const row_y = slots * dims * 4;
+ 
+ // Each NCCL call and launch in order; an asynchronous state the waits read.
+ const Fake = struct {
+-    const Call = struct { kind: enum { scatter, gather, reduce, launch }, send: u64 = 0, recv: u64 = 0, count: usize = 0, f32: bool = true, grid: [6]u32 = @splat(0), args: [5]u64 = @splat(0) };
++    const Call = struct { kind: enum { scatter, gather, reduce, launch }, send: u64 = 0, recv: u64 = 0, count: usize = 0, f32: bool = true, grid: [6]u32 = @splat(0), args: [8]u64 = @splat(0) };
+     var calls: [4]Call = undefined;
+     var len: usize = 0;
+     var state: nccl.Result = 0;
+@@ -50,8 +50,8 @@ const Fake = struct {
+     }
+     fn launch(_: abi.Function, gx: c_uint, gy: c_uint, gz: c_uint, bx: c_uint, by: c_uint, bz: c_uint, _: c_uint, _: abi.Stream, args: ?[*]?*anyopaque, _: ?[*]?*anyopaque) callconv(.c) abi.Result {
+         var c: Call = .{ .kind = .launch, .grid = .{ gx, gy, gz, bx, by, bz } };
+-        for (0..3) |i| c.args[i] = read(u64, args, i);
+-        for (3..5) |i| c.args[i] = @intCast(read(c_int, args, i));
++        for (0..4) |i| c.args[i] = read(u64, args, i);
++        for (4..8) |i| c.args[i] = @bitCast(@as(i64, read(c_int, args, i)));
+         record(c);
+         return 0;
+     }
+@@ -65,7 +65,7 @@ const Fake = struct {
+     }
+ };
+ 
+-const Bufs = struct { y: u64 = 0x1000_0000, wts: u64 = 0x2000_0000, moe_f32: u64 = 0x3000_0000 };
++const Bufs = struct { y: u64 = 0x1000_0000, wts: u64 = 0x2000_0000, picks: u64 = 0x4000_0000, moe_f32: u64 = 0x3000_0000 };
+ 
+ const Pass = struct {
+     s: *const Bufs,
+@@ -156,7 +156,7 @@ test "a split pass reduce-scatters its rank's block in place, sums that block's
+         const k = Fake.calls[1];
+         try expect(k.kind == .launch);
+         try expectEqual([6]u32{ @intCast(rows), dims / 256, 1, 256, 1, 1 }, k.grid);
+-        try expectEqual([5]u64{ bufs.y + lo * row_y, bufs.wts + lo * slots * 4, bufs.moe_f32 + lo * dims * 4, dims, slots }, k.args);
++        try expectEqual([8]u64{ bufs.y + lo * row_y, bufs.wts + lo * slots * 4, bufs.picks + lo * slots * 4, bufs.moe_f32 + lo * dims * 4, dims, slots, wt.experts_n / 2, @bitCast(@as(i64, -1)) }, k.args);
+         const ag = Fake.calls[2];
+         try expect(ag.kind == .gather and ag.f32 and ag.send == bufs.moe_f32 + rank * h * dims * 4 and ag.recv == bufs.moe_f32 and ag.count == h * dims);
+         try expect(pass.pending_f32 and !c.failed and Fake.aborts == 0);
+diff --git a/zig/src/families/flashnext/cuda_moe_hidden_sum.zig b/zig/src/families/flashnext/cuda_moe_hidden_sum.zig
+new file mode 100644
+index 000000000..6a0641c89
+--- /dev/null
++++ b/zig/src/families/flashnext/cuda_moe_hidden_sum.zig
+@@ -0,0 +1,24 @@
++//! --tp 2's MoE exchange: each rank sums its own slots in owner order, then one FP32 all-reduce of the hidden rows.
++const wt = @import("cuda_prompt_wt.zig");
++const moe = @import("cuda_batch_moe.zig");
++
++const dims = wt.dims;
++
++/// Owner 1's first routed expert: rank 1's first at --tp 2, and the owner order's cut at every world.
++pub const split = wt.experts_n / 2;
++
++/// Each rank must hold exactly one owner's slots: its experts, and its half of the shared expert's columns.
++pub fn applies(world: usize, split_shared: bool) bool {
++    return world == 2 and split_shared;
++}
++
++/// moe_f32: this rank's owner chain, then the all-reduce adds the peer's: owner 0's plus owner 1's, as at --tp 1.
++pub fn run(pass: anytype, c: anytype, n: usize, rank: usize) !void {
++    try moe.sumPart(pass, 0, n, @intCast(rank));
++    try c.sum(pass.stream, pass.s.moe_f32, n * dims);
++    pass.pending_f32 = true;
++}
++
++test {
++    if (@import("builtin").os.tag != .windows) _ = @import("cuda_moe_hidden_sum_test.zig"); // over a Unix socket pair
++}
+diff --git a/zig/src/families/flashnext/cuda_moe_hidden_sum_test.zig b/zig/src/families/flashnext/cuda_moe_hidden_sum_test.zig
+new file mode 100644
+index 000000000..cf155b8d6
+--- /dev/null
++++ b/zig/src/families/flashnext/cuda_moe_hidden_sum_test.zig
+@@ -0,0 +1,90 @@
++//! The hidden-size exchange's reach and its calls over a faked NCCL and driver.
++const std = @import("std");
++const cuda = @import("cuda");
++const wt = @import("cuda_prompt_wt.zig");
++const batch = @import("cuda_batch.zig");
++const mtp = @import("cuda_mtp.zig");
++const hidden_sum = @import("cuda_moe_hidden_sum.zig");
++const Collective = @import("cuda_collective.zig").Collective;
++const nccl = cuda.nccl;
++const abi = cuda.abi;
++const expect = std.testing.expect;
++const expectEqual = std.testing.expectEqual;
++
++const dims = wt.dims;
++const slots = wt.slots;
++
++const Fake = struct {
++    const Call = struct { reduce: bool, send: u64 = 0, recv: u64 = 0, count: usize = 0, f32_sum: bool = false, grid: [6]u32 = @splat(0), args: [8]u64 = @splat(0) };
++    var calls: [3]Call = undefined;
++    var len: usize = 0;
++
++    fn reduce(send: abi.DevicePtr, recv: abi.DevicePtr, count: usize, t: nccl.DataType, op: nccl.RedOp, _: nccl.Comm, _: abi.Stream) callconv(.c) nccl.Result {
++        calls[len] = .{ .reduce = true, .send = send, .recv = recv, .count = count, .f32_sum = t == .f32 and op == .sum };
++        len += 1;
++        return 0;
++    }
++    fn read(comptime T: type, args: ?[*]?*anyopaque, i: usize) T {
++        return @as(*const T, @ptrCast(@alignCast(args.?[i].?))).*;
++    }
++    fn launch(_: abi.Function, gx: c_uint, gy: c_uint, gz: c_uint, bx: c_uint, by: c_uint, bz: c_uint, _: c_uint, _: abi.Stream, args: ?[*]?*anyopaque, _: ?[*]?*anyopaque) callconv(.c) abi.Result {
++        var c: Call = .{ .reduce = false, .grid = .{ gx, gy, gz, bx, by, bz } };
++        for (0..4) |i| c.args[i] = read(u64, args, i);
++        for (4..8) |i| c.args[i] = @bitCast(@as(i64, read(c_int, args, i)));
++        calls[len] = c;
++        len += 1;
++        return 0;
++    }
++    fn asyncError(_: nccl.Comm, out: *nccl.Result) callconv(.c) nccl.Result {
++        out.* = 0;
++        return 0;
++    }
++};
++
++const Bufs = struct { y: u64 = 0x1000_0000, wts: u64 = 0x2000_0000, picks: u64 = 0x4000_0000, moe_f32: u64 = 0x3000_0000 };
++
++const Pass = struct {
++    s: *const Bufs,
++    k: struct { moe_sum: cuda.Function },
++    stream: cuda.Stream,
++    pending_f32: bool = false,
++};
++
++test "the hidden-size exchange takes two ranks whose shared expert is split by columns, and the owner cut is rank 1's" {
++    try expect(hidden_sum.applies(2, true));
++    try expect(!hidden_sum.applies(2, false));
++    try expect(!hidden_sum.applies(1, true) and !hidden_sum.applies(1, false));
++    try expectEqual(@as(usize, 256), hidden_sum.split);
++}
++
++test "every pass width sums the rank's owner chain over all its rows, then all-reduces the FP32 hidden rows in place" {
++    var d: cuda.Driver = undefined;
++    d.api.cuLaunchKernel = Fake.launch;
++    const bufs: Bufs = .{};
++    for ([_]usize{ 0, 1 }) |rank| for ([_]usize{ 1, mtp.round_rows, mtp.round_rows + 1, 1537, batch.max_chunk }) |n| {
++        var pair: [2]c_int = .{ -1, -1 };
++        if (std.c.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0, &pair) != 0) return error.SocketPair;
++        defer for (pair) |fd| {
++            _ = std.c.close(fd);
++        };
++        var c: Collective = undefined;
++        c.failed = false;
++        c.comm = @ptrFromInt(0x1000);
++        c.link = .{ .fd = pair[0] };
++        c.timeout_ms = 1000;
++        c.rank = rank;
++        c.lib.api.ncclAllReduce = Fake.reduce;
++        c.api.ncclCommGetAsyncError = Fake.asyncError;
++        var pass: Pass = .{ .s = &bufs, .k = .{ .moe_sum = .{ .d = &d, .handle = @ptrFromInt(1) } }, .stream = .{ .d = &d, .handle = null } };
++        Fake.len = 0;
++        try hidden_sum.run(&pass, &c, n, rank);
++        try expectEqual(@as(usize, 2), Fake.len);
++        const k = Fake.calls[0];
++        try expect(!k.reduce);
++        try expectEqual([6]u32{ @intCast(n), dims / 256, 1, 256, 1, 1 }, k.grid);
++        try expectEqual([8]u64{ bufs.y, bufs.wts, bufs.picks, bufs.moe_f32, dims, slots, hidden_sum.split, rank }, k.args);
++        const ar = Fake.calls[1];
++        try expect(ar.reduce and ar.f32_sum and ar.send == bufs.moe_f32 and ar.recv == bufs.moe_f32 and ar.count == n * dims);
++        try expect(pass.pending_f32 and !c.failed);
++    };
++}
+diff --git a/zig/src/families/flashnext/cuda_moe_native.zig b/zig/src/families/flashnext/cuda_moe_native.zig
+index 9b5dffd67..6e8618409 100644
+--- a/zig/src/families/flashnext/cuda_moe_native.zig
++++ b/zig/src/families/flashnext/cuda_moe_native.zig
+@@ -7,6 +7,7 @@ const zs = @import("cuda_zero_slice.zig");
+ const shared = @import("cuda_batch_side.zig");
+ const exchange = @import("cuda_moe_exchange.zig");
+ const peer = @import("cuda_peer_slots.zig");
++const hidden_sum = @import("cuda_moe_hidden_sum.zig");
+ const Kernels = @import("cuda_batch_kernels.zig").Kernels;
+ 
+ const dims = wt.dims;
+@@ -21,7 +22,9 @@ pub fn run(self: anytype, native: *const mixed.Owned, n: usize, pairs: usize, pl
+     const skip: i32 = @intCast(owned.count);
+     const picks = if (native.world == 1) s.picks else try ownPicks(self, s.picks, s.picks_ep, pairs, owned.first, owned.count);
+     const y_bytes = exchange.clearedRows(native.world, n) * slots * dims * 4;
+-    if (zs.clearsY(native.world, native.rank)) try self.stream.d.check(self.stream.d.api.cuMemsetD8Async(s.y, 0, y_bytes, self.stream.handle), "cuMemsetD8Async");
++    // the hidden-size exchange reads only the slots this rank writes, so it needs no cleared y
++    const hidden = hidden_sum.applies(native.world, native.split_shared);
++    if (zs.clearsY(native.world, native.rank) and !hidden) try self.stream.d.check(self.stream.d.api.cuMemsetD8Async(s.y, 0, y_bytes, self.stream.handle), "cuMemsetD8Async");
+     const side = try shared.fork(self, native, n);
+     switch (owned.format) {
+         .nvfp4 => {
+@@ -44,6 +47,7 @@ pub fn run(self: anytype, native: *const mixed.Owned, n: usize, pairs: usize, pl
+             if (split) try exchange.finish(self, collective, n);
+             return;
+         };
++        if (hidden) return hidden_sum.run(self, collective, n, native.rank);
+         if (exchange.rowSplit(native.world, n)) return exchange.run(self, collective, n);
+         try collective.sum(self.stream, s.y, pairs * dims);
+     }
+diff --git a/zig/src/families/flashnext/cuda_prompt_step.zig b/zig/src/families/flashnext/cuda_prompt_step.zig
+index ddef6e6fd..1a23b31ab 100644
+--- a/zig/src/families/flashnext/cuda_prompt_step.zig
++++ b/zig/src/families/flashnext/cuda_prompt_step.zig
+@@ -133,7 +133,7 @@ pub const Scratch = struct {
+         s.ids = try cuda.DeviceBuffer.alloc(driver, 4);
+         s.logits = try cuda.DeviceBuffer.alloc(driver, vocab * 2);
+         s.router_l = try cuda.DeviceBuffer.alloc(driver, (experts_n + 1) * 4);
+-        s.picks = try cuda.DeviceBuffer.alloc(driver, slots * 4);
++        s.picks = try cuda.DeviceBuffer.alloc(driver, rows * slots * 4);
+         s.moe_members = try cuda.DeviceBuffer.alloc(driver, slots * 4);
+         s.moe_items = try cuda.DeviceBuffer.alloc(driver, slots * 3 * 4);
+         s.moe_counts = try cuda.DeviceBuffer.alloc(driver, 8);
+@@ -190,12 +190,12 @@ pub const Scratch = struct {
+     }
+ };
+ 
+-pub fn writeback(tri: anytype, s: *Scratch, h: u64, mode: usize, inj: u64, y: u64, wts: u64) !void {
++pub fn writeback(tri: anytype, s: *Scratch, h: u64, mode: usize, inj: u64, y: u64, wts: u64, picks: u64) !void {
+     const dummy = s.dummy.ptr;
+     if (mode == 0) {
+         try tri.hcWriteback(h, h, s.pss.ptr, dummy, "*bf16", dummy, dummy, "*bf16", dummy, "*bf16", dims, 1, dims, streams, 0, 1, 1, 1);
+     } else if (mode == 2) {
+-        try tri.hcWriteback(h, h, s.pss.ptr, dummy, "*bf16", inj, y, "*fp32", wts, "*fp32", dims, 1, dims, streams, 2, 10, 11, 1);
++        try tri.hcWritebackMoe(h, h, s.pss.ptr, inj, .{ .y = y, .wts = wts, .picks = picks, .count = slots, .split = experts_n / 2 }, 1, dims, streams);
+     } else if (mode == 4) {
+         try tri.hcWriteback(h, h, s.pss.ptr, s.part.ptr, "*fp32", inj, dummy, "*bf16", dummy, "*bf16", dims, 1, dims, streams, 4, 1, 1, out_sk);
+     } else return error.UnexpectedTensor;
+@@ -266,11 +266,11 @@ fn launchExpert(f: cuda.Function, stream: cuda.Stream, x: u64, x_stride: usize,
+     try cuda.launch.launch(f, .{ .grid = .{ .x = @intCast((units + 3) / 4) }, .block = .{ .x = 128 } }, stream, &a);
+ }
+ 
+-pub fn moeStep(comptime Tri: type, tri: Tri, s: *Scratch, stream: *cuda.Stream, plan_fn: cuda.Function, up_fn: cuda.Function, down_fn: cuda.Function, router_w: u64, up: u64, down: u64, y: u64, wts: u64) !void {
++pub fn moeStep(comptime Tri: type, tri: Tri, s: *Scratch, stream: *cuda.Stream, plan_fn: cuda.Function, up_fn: cuda.Function, down_fn: cuda.Function, router_w: u64, up: u64, down: u64, y: u64, wts: u64, picks: u64) !void {
+     try tri.router(s.mixed.ptr, router_w, s.router_l.ptr, dims);
+-    try tri.topkRows(s.router_l.ptr, s.picks.ptr, wts);
++    try tri.topkRows(s.router_l.ptr, picks, wts);
+     var plan_a: cuda.Args = .{};
+-    plan_a.add(s.picks.ptr);
++    plan_a.add(picks);
+     plan_a.add(cint(slots));
+     plan_a.add(cint(experts_n + 1));
+     plan_a.add(cint(tile));
+diff --git a/zig/src/families/flashnext/cuda_rows.zig b/zig/src/families/flashnext/cuda_rows.zig
+index 99d04e5ab..47e7b478a 100644
+--- a/zig/src/families/flashnext/cuda_rows.zig
++++ b/zig/src/families/flashnext/cuda_rows.zig
+@@ -123,15 +123,16 @@ fn runLayer(comptime Tri: type, p: *Pass, tri: Tri, lw: *Layer, layer: usize, id
+         const inj = p.s.inj.ptr + @as(u64, t) * inj_stride;
+         const y = p.s.y.ptr + @as(u64, t) * slots * dims * 4;
+         const wt = p.s.wts.ptr + @as(u64, t) * wts_stride;
++        const pk = p.s.picks.ptr + @as(u64, t) * slots * 4;
+         if (layer == ple_layer and p.mode[t] == 2) {
+-            try step.writeback(tri, p.s, h, 2, inj, y, wt);
++            try step.writeback(tri, p.s, h, 2, inj, y, wt, pk);
+             p.mode[t] = 0;
+         }
+         if (layer == ple_layer) try step.pleStep(Tri, p.gpa, p.io, p.driver, p.stream, tri, p.s, p.model_dir, p.history, token, h, lw.key, lw.val, lw.nk.ptr, lw.nq.ptr, lw.nc.ptr, lw.ple_cw.ptr, &p.tail);
+         if (p.mode[t] == 2) {
+-            try step.writeback(tri, p.s, h, 2, inj, y, wt);
++            try step.writeback(tri, p.s, h, 2, inj, y, wt, pk);
+             p.mode[t] = 0;
+-        } else try step.writeback(tri, p.s, h, 0, inj, y, wt);
++        } else try step.writeback(tri, p.s, h, 0, inj, y, wt, pk);
+         try step.readout(tri, p.s, lw.attn_hc, h, inj);
+         if (lw.linear) {
+             const li = weights.linearIndex(layer);
+@@ -140,9 +141,9 @@ fn runLayer(comptime Tri: type, p: *Pass, tri: Tri, lw: *Layer, layer: usize, id
+             const ai = weights.attnIndex(layer);
+             try step.attnStep(Tri, p.driver, p.stream, tri, p.s, lw.proj, lw.out, lw.q_scale.ptr, lw.k_scale.ptr, lw.i_scale.ptr, p.kc[ai].ptr, p.vc[ai].ptr, p.ikc[ai].ptr, @intCast(pos0 + t), p.pg);
+         }
+-        try step.writeback(tri, p.s, h, 4, inj, y, wt);
++        try step.writeback(tri, p.s, h, 4, inj, y, wt, pk);
+         try step.readout(tri, p.s, lw.mlp_hc, h, inj);
+-        try step.moeStep(Tri, tri, p.s, p.stream, p.plan_fn, p.up_fn, p.down_fn, lw.router.ptr, lw.experts_up.ptr, lw.experts_down.ptr, y, wt);
++        try step.moeStep(Tri, tri, p.s, p.stream, p.plan_fn, p.up_fn, p.down_fn, lw.router.ptr, lw.experts_up.ptr, lw.experts_down.ptr, y, wt, pk);
+         p.mode[t] = 2;
+     }
+ }
+@@ -153,7 +154,8 @@ fn head(comptime Tri: type, p: *Pass, tri: Tri, row: usize) !void {
+     const inj = p.s.inj.ptr + @as(u64, row) * inj_stride;
+     const y = p.s.y.ptr + @as(u64, row) * slots * dims * 4;
+     const wt = p.s.wts.ptr + @as(u64, row) * wts_stride;
+-    try step.writeback(tri, p.s, h, 2, inj, y, wt);
++    const pk = p.s.picks.ptr + @as(u64, row) * slots * 4;
++    try step.writeback(tri, p.s, h, 2, inj, y, wt, pk);
+     p.mode[row] = 0;
+     try step.readout(tri, p.s, p.mixer, h, inj);
+     try qmm.matmul(p.driver, p.stream.*, p.s.mixed.ptr, p.s.xsm.ptr, p.head_q.w.ptr, p.head_q.s.ptr, p.head_q.b.ptr, p.s.logits.ptr, 1, vocab, dims);
+diff --git a/zig/tests/cuda/contract_flashnext_wbnorm.zig b/zig/tests/cuda/contract_flashnext_wbnorm.zig
+index 2f390f15f..c75cfaa31 100644
+--- a/zig/tests/cuda/contract_flashnext_wbnorm.zig
++++ b/zig/tests/cuda/contract_flashnext_wbnorm.zig
+@@ -43,7 +43,7 @@ pub const WbNorm = struct {
+     mode: Mode,
+     glue: *const flash.Glue,
+     shape: c.Shape = .{ .rows = 0, .n = 0, .k = 0 },
+-    ins: [6]u64 = @splat(0),
++    ins: [7]u64 = @splat(0),
+     lens: [3]usize = @splat(0),
+     outs: [3]u64 = @splat(0),
+     nout: usize = 0,
+@@ -97,6 +97,9 @@ pub const WbNorm = struct {
+         const scale = try a.alloc(f32, wide);
+         defer a.free(scale);
+         for (scale) |*x| x.* = 0.5 + r.float(f32);
++        const picks = try a.alloc(i32, m * slots);
++        defer a.free(picks);
++        for (picks) |*x| x.* = @intCast(r.uintLessThan(u32, 513));
+         if (fill == .nonfinite) for (0..m) |row| {
+             h[row * wide + (row % streams) * dims + 3] = switch (row % 4) {
+                 0 => 0x7fc1,
+@@ -105,7 +108,7 @@ pub const WbNorm = struct {
+                 else => 0x8000,
+             };
+         };
+-        for ([_][]const u8{ std.mem.sliceAsBytes(h), std.mem.sliceAsBytes(inj), std.mem.sliceAsBytes(y), std.mem.sliceAsBytes(wts), std.mem.sliceAsBytes(br), std.mem.sliceAsBytes(scale) }, 0..) |b, i| self.ins[i] = try self.rig.input(b);
++        for ([_][]const u8{ std.mem.sliceAsBytes(h), std.mem.sliceAsBytes(inj), std.mem.sliceAsBytes(y), std.mem.sliceAsBytes(wts), std.mem.sliceAsBytes(br), std.mem.sliceAsBytes(scale), std.mem.sliceAsBytes(picks) }, 0..) |b, i| self.ins[i] = try self.rig.input(b);
+         if (self.mode != .sums) try self.out(m * wide * 2); // the written-back rows
+         try self.out(m * nc * streams * 4); // square sums a 256-column slice and stream
+         try self.out(m * wide * 2); // the normalized rows
+@@ -126,16 +129,21 @@ pub const WbNorm = struct {
+         return if (self.mode == .sums) .{ .hout = 0, .pss = o[0], .norm = o[1] } else .{ .hout = o[0], .pss = o[1], .norm = o[2] };
+     }
+ 
++    fn slot(self: *const WbNorm) flash.Slots {
++        return .{ .y = self.ins[2], .wts = self.ins[3], .picks = self.ins[6], .count = slots, .split = 256 };
++    }
++
+     fn ours(self: *WbNorm, o: []const u64) !void {
+         const p = self.split(o);
+         const m = self.shape.rows;
++        if (self.mode == .moe) return self.glue.hcWritebackNormMoe(self.rig.s, self.ins[0], p.hout, p.pss, self.ins[1], self.slot(), self.ins[5], p.norm, eps, m, dims, streams);
+         try self.glue.hcWritebackNorm(self.rig.s, self.ins[0], p.hout, p.pss, self.ins[4], self.ins[1], self.ins[2], self.ins[3], self.ins[5], p.norm, eps, m * dims, m, dims, streams, self.modeNumber(), slots - 1, slots, self.shape.k);
+     }
+ 
+     fn theirs(self: *WbNorm, o: []const u64) !void {
+         const p = self.split(o);
+         const m = self.shape.rows;
+-        try self.glue.hcWriteback(self.rig.s, self.ins[0], p.hout, p.pss, self.ins[4], self.ins[1], self.ins[2], self.ins[3], m * dims, m, dims, streams, self.modeNumber(), slots - 1, slots, self.shape.k);
++        if (self.mode == .moe) try self.glue.hcWritebackMoe(self.rig.s, self.ins[0], p.hout, p.pss, self.ins[1], self.slot(), m, dims, streams) else try self.glue.hcWriteback(self.rig.s, self.ins[0], p.hout, p.pss, self.ins[4], self.ins[1], self.ins[2], self.ins[3], m * dims, m, dims, streams, self.modeNumber(), slots - 1, slots, self.shape.k);
+         try self.glue.hcNormalize(self.rig.s, if (self.mode == .sums) self.ins[0] else p.hout, p.pss, self.ins[5], p.norm, eps, m, dims, streams);
+     }
+ 
+diff --git a/zig/tests/cuda/contract_flashnext_writeback.zig b/zig/tests/cuda/contract_flashnext_writeback.zig
+index 3700d915d..a009f454a 100644
+--- a/zig/tests/cuda/contract_flashnext_writeback.zig
++++ b/zig/tests/cuda/contract_flashnext_writeback.zig
+@@ -10,6 +10,20 @@ const slots = 11;
+ 
+ pub const Mode = enum { sums, moe, slices };
+ 
++/// The first routed expert owner 1 holds (rank 1's at --tp 2).
++pub const owner_split = 256;
++
++/// The slots' FP32 sum in owner order: owner 0's and owner 1's fma chains in slot order, then their sum.
++pub fn ownerSum(y: []const f32, wts: []const f32, picks: []const i32, row: usize, n: usize, col: usize) f32 {
++    var a: [2]f32 = .{ 0, 0 };
++    for (0..slots) |k| {
++        const at = row * slots + k;
++        const one = if (k == slots - 1) col >= n / 2 else picks[at] >= owner_split;
++        a[@intFromBool(one)] = @mulAdd(f32, y[at * n + col], wts[at], a[@intFromBool(one)]);
++    }
++    return a[0] + a[1];
++}
++
+ fn depth(_: c.Shape) usize {
+     return 13;
+ }
+@@ -41,11 +55,13 @@ pub const Writeback = struct {
+     y: []f32 = &.{},
+     wts: []f32 = &.{},
+     br: []f32 = &.{},
++    picks: []i32 = &.{},
+     dh: u64 = 0,
+     dinj: u64 = 0,
+     dy: u64 = 0,
+     dwts: u64 = 0,
+     dbr: u64 = 0,
++    dpicks: u64 = 0,
+     pss: u64 = 0,
+     hout: u64 = 0,
+     msg: [200]u8 = undefined,
+@@ -74,6 +90,7 @@ pub const Writeback = struct {
+         self.y = try a.alloc(f32, shape.rows * slots * shape.n);
+         self.wts = try a.alloc(f32, shape.rows * slots);
+         self.br = try a.alloc(f32, shape.k * shape.rows * shape.n);
++        self.picks = try a.alloc(i32, shape.rows * slots);
+         var prng = std.Random.DefaultPrng.init(seed);
+         const rng = prng.random();
+         for (self.h) |*b| b.* = c.toBf16(if (fill == .stress) @floatFromInt(1 + rng.uintLessThan(u32, 64)) else rng.float(f32) * 2 - 1);
+@@ -81,6 +98,7 @@ pub const Writeback = struct {
+         for (self.y) |*v| v.* = if (fill == .stress) 0 else rng.float(f32) * 2 - 1;
+         for (self.wts) |*v| v.* = rng.float(f32) * 0.2;
+         for (self.br) |*v| v.* = if (fill == .stress) 0 else rng.float(f32) - 0.5;
++        for (self.picks) |*v| v.* = @intCast(rng.uintLessThan(u32, 513));
+         if (fill != .stress and self.mode != .sums) {
+             self.h[0] = 0x3b34;
+             self.inj[0] = 0x3c9a;
+@@ -104,6 +122,7 @@ pub const Writeback = struct {
+         self.dy = try self.rig.input(std.mem.sliceAsBytes(self.y));
+         self.dwts = try self.rig.input(std.mem.sliceAsBytes(self.wts));
+         self.dbr = try self.rig.input(std.mem.sliceAsBytes(self.br));
++        self.dpicks = try self.rig.input(std.mem.sliceAsBytes(self.picks));
+         self.pss = try self.rig.output(self.count() * 4);
+         self.hout = if (self.mode == .sums) 0 else try self.rig.output(self.h.len * 2);
+         return true;
+@@ -121,6 +140,7 @@ pub const Writeback = struct {
+                 args.add(self.dinj);
+                 args.add(self.dy);
+                 args.add(self.dwts);
++                args.add(self.dpicks);
+             },
+             .slices => {
+                 args.add(self.dbr);
+@@ -133,6 +153,7 @@ pub const Writeback = struct {
+         if (self.mode == .moe) {
+             args.add(@as(c_int, slots - 1));
+             args.add(@as(c_int, slots));
++            args.add(@as(c_int, owner_split));
+         }
+         if (self.mode == .slices) args.add(@as(c_int, @intCast(sh.k)));
+         try cuda.launch.launch(self.f, .{ .grid = .{ .x = @intCast(sh.rows), .y = @intCast(sh.n / 256) }, .block = .{ .x = 256 } }, self.rig.s, &args);
+@@ -149,10 +170,7 @@ pub const Writeback = struct {
+         if (self.mode == .sums) return h;
+         var branch: f32 = 0;
+         switch (self.mode) {
+-            .moe => for (0..slots) |k| {
+-                const at = row * slots + k;
+-                branch = @mulAdd(f32, self.y[at * sh.n + col], self.wts[at], branch);
+-            },
++            .moe => branch = ownerSum(self.y, self.wts, self.picks, row, sh.n, col),
+             .slices => {
+                 branch = self.br[row * sh.n + col];
+                 for (1..sh.k) |k| branch += self.br[(k * sh.rows + row) * sh.n + col];
+@@ -191,7 +209,7 @@ pub const Writeback = struct {
+         if (!try self.rig.intact()) return "a payload guard changed";
+         const inputs = try self.rig.inputBytes();
+         var offset: usize = 0;
+-        for ([_][]const u8{ std.mem.sliceAsBytes(self.h), std.mem.sliceAsBytes(self.inj), std.mem.sliceAsBytes(self.y), std.mem.sliceAsBytes(self.wts), std.mem.sliceAsBytes(self.br) }) |expected| {
++        for ([_][]const u8{ std.mem.sliceAsBytes(self.h), std.mem.sliceAsBytes(self.inj), std.mem.sliceAsBytes(self.y), std.mem.sliceAsBytes(self.wts), std.mem.sliceAsBytes(self.br), std.mem.sliceAsBytes(self.picks) }) |expected| {
+             if (!std.mem.eql(u8, inputs[offset..][0..expected.len], expected)) return "an immutable input changed";
+             offset += expected.len;
+         }
+diff --git a/zig/tests/cuda/flashnext_exchange_tests.zig b/zig/tests/cuda/flashnext_exchange_tests.zig
+index 79a381a90..a0f7fe2ff 100644
+--- a/zig/tests/cuda/flashnext_exchange_tests.zig
++++ b/zig/tests/cuda/flashnext_exchange_tests.zig
+@@ -77,7 +77,7 @@ fn planted(gpu: check.Gpu, c: *Collective, stream: cuda.Stream, rank: usize) !vo
+ }
+ 
+ const Kernels = struct { moe_sum: cuda.Function };
+-const Bufs = struct { y: u64, wts: u64, moe_f32: u64 };
++const Bufs = struct { y: u64, wts: u64, picks: u64, moe_f32: u64 };
+ const Pass = struct { s: *const Bufs, k: Kernels, stream: cuda.Stream, pending_f32: bool = false };
+ 
+ /// A writeback's outputs over the pass's rows and the spare one, poisoned so a row no launch writes shows.
+@@ -177,6 +177,12 @@ fn pass(gpu: check.Gpu, c: *Collective, stream: cuda.Stream, tri: flash.Tri, k:
+     defer y_b.free();
+     var wd = try cuda.DeviceBuffer.fromHost(gpu.d, std.mem.sliceAsBytes(wts));
+     defer wd.free();
++    const picks = try a.alloc(i32, rows * slots);
++    defer a.free(picks);
++    for (picks, 0..) |*v, i| v.* = @intCast(mix(i ^ 0x91) % 513);
++    var pd = try cuda.DeviceBuffer.fromHost(gpu.d, std.mem.sliceAsBytes(picks));
++    defer pd.free();
++    const slot: flash.Slots = .{ .y = y_a.ptr, .wts = wd.ptr, .picks = pd.ptr, .count = slots, .split = 256 };
+     var hd = try cuda.DeviceBuffer.fromHost(gpu.d, std.mem.sliceAsBytes(hs));
+     defer hd.free();
+     var sd = try cuda.DeviceBuffer.fromHost(gpu.d, std.mem.asBytes(&scale));
+@@ -196,10 +202,10 @@ fn pass(gpu: check.Gpu, c: *Collective, stream: cuda.Stream, tri: flash.Tri, k:
+     const rs = n * dims;
+ 
+     try c.sum(stream, y_a.ptr, n * slots * dims);
+-    try tri.hcWriteback(h, outs[0].hout.ptr, outs[0].pss.ptr, dummy.ptr, "*bf16", inj, y_a.ptr, "*fp32", wd.ptr, "*fp32", rs, n, dims, streams, 2, 10, 11, 1);
+-    try tri.hcWritebackNorm(h, outs[1].hout.ptr, outs[1].pss.ptr, dummy.ptr, inj, y_a.ptr, wd.ptr, sc, outs[1].norm.ptr, eps, rs, n, dims, streams, 2, 10, 11, 1);
++    try tri.hcWritebackMoe(h, outs[0].hout.ptr, outs[0].pss.ptr, inj, slot, n, dims, streams);
++    try tri.hcWritebackNormMoe(h, outs[1].hout.ptr, outs[1].pss.ptr, inj, slot, sc, outs[1].norm.ptr, eps, n);
+ 
+-    const bufs: Bufs = .{ .y = y_b.ptr, .wts = wd.ptr, .moe_f32 = moe.ptr };
++    const bufs: Bufs = .{ .y = y_b.ptr, .wts = wd.ptr, .picks = pd.ptr, .moe_f32 = moe.ptr };
+     var p: Pass = .{ .s = &bufs, .k = k, .stream = stream };
+     try flash.moe_exchange.run(&p, c, n);
+     try check.expect(p.pending_f32, "rank {d}: the exchange leaves its sum pending in fp32", .{rank});
+diff --git a/zig/tests/cuda/flashnext_hc_tests.zig b/zig/tests/cuda/flashnext_hc_tests.zig
+index 974ce95d5..a1edf4f26 100644
+--- a/zig/tests/cuda/flashnext_hc_tests.zig
++++ b/zig/tests/cuda/flashnext_hc_tests.zig
+@@ -71,12 +71,15 @@ fn writeback(r: *Rig, g: *const flash.Glue, mode: usize) !void {
+     const dy = try r.dev(std.mem.sliceAsBytes(y));
+     const dwts = try r.dev(std.mem.sliceAsBytes(wts));
+     const dbr = try r.dev(std.mem.sliceAsBytes(br));
++    const picks = try r.a.alloc(i32, most * 11);
++    for (picks, 0..) |*p, i| p.* = @intCast((i * 2654435761) % 513);
++    const slot: flash.Slots = .{ .y = dy, .wts = dwts, .picks = try r.dev(std.mem.sliceAsBytes(picks)), .count = 11, .split = 256 };
+     var outs: [counts.len]u64 = undefined;
+     var psss: [counts.len]u64 = undefined;
+     for (counts, 0..) |m, c| {
+         outs[c] = try r.out(m * wide * 2);
+         psss[c] = try r.out(m * nc * streams * 4);
+-        try g.hcWriteback(r.s, dh, outs[c], psss[c], dbr, dinj, dy, dwts, most * dims, m, dims, streams, mode, 10, 11, 8);
++        if (mode == 2) try g.hcWritebackMoe(r.s, dh, outs[c], psss[c], dinj, slot, m, dims, streams) else try g.hcWriteback(r.s, dh, outs[c], psss[c], dbr, dinj, dy, dwts, most * dims, m, dims, streams, mode, 10, 11, 8);
+     }
+     const name = switch (mode) {
+         0 => "writeback sums",
+diff --git a/zig/tests/cuda/flashnext_hidden_sum_tests.zig b/zig/tests/cuda/flashnext_hidden_sum_tests.zig
+new file mode 100644
+index 000000000..0d07460ca
+--- /dev/null
++++ b/zig/tests/cuda/flashnext_hidden_sum_tests.zig
+@@ -0,0 +1,162 @@
++//! Two ranks' hidden-size exchange against the one-rank owner-order sum's bytes, and both orders against FP64.
++const std = @import("std");
++const cuda = @import("cuda");
++const flash = @import("flashnext");
++const check = @import("check.zig");
++
++const Collective = flash.collective.Collective;
++const dims = 2560;
++const slots = 11;
++const split = 256;
++const u: f64 = std.math.ldexp(@as(f64, 1), -24);
++const steps = slots + 1;
++const gamma: f64 = steps * u / (1 - steps * u);
++
++const Kernels = struct { moe_sum: cuda.Function };
++const Bufs = struct { y: u64, wts: u64, picks: u64, moe_f32: u64 };
++const Pass = struct { s: *const Bufs, k: Kernels, stream: cuda.Stream, pending_f32: bool = false };
++
++pub fn run(gpu: check.Gpu, c: *Collective, stream: cuda.Stream, rank: usize) !void {
++    var mod = try cuda.Module.load(gpu.d, cuda.kernels.flashnext_batch);
++    defer mod.unload();
++    const k: Kernels = .{ .moe_sum = try mod.function("fn_moe_sum") };
++    for ([_]usize{ 1, 4, 16, 64, 65, 3072, 8192 }) |n| try pass(gpu, c, stream, k, rank, n);
++    check.pass("rank {d}: --tp 2's hidden-size exchange equals --tp 1's owner-order bytes, within gamma_{d} of FP64; planted controls fail", .{ rank, steps });
++}
++
++fn mix(x: u64) u64 {
++    var z = x +% 0x9e37_79b9_7f4a_7c15;
++    z = (z ^ (z >> 30)) *% 0xbf58_476d_1ce4_e5b9;
++    z = (z ^ (z >> 27)) *% 0x94d0_49bb_1331_11eb;
++    return z ^ (z >> 31);
++}
++
++/// A value in [-1, 1) times 2^-12 to 2^3: expert rows' range, with the cancellation a real sum meets.
++fn value(h: u64) f32 {
++    const unit = @as(f32, @floatFromInt(h >> 40)) / (1 << 24);
++    return (unit * 2 - 1) * std.math.ldexp(@as(f32, 1), @as(i32, @intCast((h >> 8) % 16)) - 12);
++}
++
++/// Rank `rank`'s y (rank 2: both ranks'), the weights and expert ids: owner 1 from expert 256 or column dims / 2.
++fn fill(y: []f32, wts: []f32, picks: []i32, n: usize, rank: usize) void {
++    @memset(y, 0);
++    for (0..n) |r| for (0..slots) |s| {
++        const pair = r * slots + s;
++        wts[pair] = @as(f32, @floatFromInt((mix(pair ^ 0x77) >> 40) + 1)) / (1 << 24);
++        const owner = mix(pair ^ 0x3a) & 1;
++        picks[pair] = if (s == slots - 1) 512 else @intCast(owner * split + mix(pair ^ 0x5c) % split);
++        for (0..dims) |d| {
++            const of = if (s == slots - 1) @intFromBool(d >= dims / 2) else owner;
++            if (rank == 2 or of == rank) y[pair * dims + d] = value(mix(pair * dims + d));
++        }
++    };
++}
++
++const Stats = struct { worst: f64 = 0, worst_col: usize = 0, max_abs: f64 = 0, sum_abs: f64 = 0, over: usize = 0 };
++
++fn note(st: *Stats, got: f32, ref: f64, scale: f64, col: usize) void {
++    const err = @abs(@as(f64, got) - ref);
++    st.max_abs = @max(st.max_abs, err);
++    st.sum_abs += err;
++    if (err > gamma * scale) st.over += 1;
++    const rel = if (scale == 0) (if (err == 0) 0 else std.math.inf(f64)) else err / (gamma * scale);
++    if (rel > st.worst) {
++        st.worst = rel;
++        st.worst_col = col;
++    }
++}
++
++fn bf16(v: f32) u16 {
++    const bits: u32 = @bitCast(v);
++    return @truncate((bits + 0x7fff + ((bits >> 16) & 1)) >> 16);
++}
++
++fn pass(gpu: check.Gpu, c: *Collective, stream: cuda.Stream, k: Kernels, rank: usize, n: usize) !void {
++    const a = gpu.gpa;
++    const mine = try a.alloc(f32, n * slots * dims);
++    defer a.free(mine);
++    const whole = try a.alloc(f32, n * slots * dims);
++    defer a.free(whole);
++    const wts = try a.alloc(f32, n * slots);
++    defer a.free(wts);
++    const picks = try a.alloc(i32, n * slots);
++    defer a.free(picks);
++    fill(mine, wts, picks, n, rank);
++    fill(whole, wts, picks, n, 2);
++    var wd = try cuda.DeviceBuffer.fromHost(gpu.d, std.mem.sliceAsBytes(wts));
++    defer wd.free();
++    var pd = try cuda.DeviceBuffer.fromHost(gpu.d, std.mem.sliceAsBytes(picks));
++    defer pd.free();
++    var yd = try cuda.DeviceBuffer.fromHost(gpu.d, std.mem.sliceAsBytes(mine));
++    defer yd.free();
++    var yw = try cuda.DeviceBuffer.fromHost(gpu.d, std.mem.sliceAsBytes(whole));
++    defer yw.free();
++    var moe = try cuda.DeviceBuffer.alloc(gpu.d, (n + 1) * dims * 4);
++    defer moe.free();
++    var one = try cuda.DeviceBuffer.alloc(gpu.d, n * dims * 4);
++    defer one.free();
++    try moe.fill8(0x5a, stream.handle);
++    const two_bufs: Bufs = .{ .y = yd.ptr, .wts = wd.ptr, .picks = pd.ptr, .moe_f32 = moe.ptr };
++    var p: Pass = .{ .s = &two_bufs, .k = k, .stream = stream };
++    try flash.moe_hidden_sum.run(&p, c, n, rank);
++    const one_bufs: Bufs = .{ .y = yw.ptr, .wts = wd.ptr, .picks = pd.ptr, .moe_f32 = one.ptr };
++    var q: Pass = .{ .s = &one_bufs, .k = k, .stream = stream };
++    try flash.moe_batch.sumSlots(&q, 0, n);
++    try c.finish(stream);
++    try check.expect(p.pending_f32, "rank {d}: the sum is left pending in fp32", .{rank});
++    const raw = try check.download(gpu, moe);
++    defer a.free(raw);
++    for (raw[n * dims * 4 ..]) |b| try check.expect(b == 0x5a, "rank {d}: {d} rows: nothing written past the pass", .{ rank, n });
++    const solo = try check.download(gpu, one);
++    defer a.free(solo);
++    try check.sameBytes("--tp 2 hidden-size exchange against the --tp 1 owner-order sum", raw[0 .. n * dims * 4], solo);
++    const got: []const f32 = @alignCast(std.mem.bytesAsSlice(f32, raw[0 .. n * dims * 4]));
++
++    var os: Stats = .{};
++    var ms: Stats = .{};
++    var bf_diff: usize = 0;
++    var host_diff: usize = 0;
++    for (0..n) |r| for (0..dims) |d| {
++        var a0: f32 = 0;
++        var a1: f32 = 0;
++        var old: f32 = 0;
++        var x: f64 = 0;
++        var m: f64 = 0;
++        for (0..slots) |s| {
++            const at = r * slots + s;
++            const v = whole[at * dims + d];
++            const of = if (s == slots - 1) d >= dims / 2 else picks[at] >= split;
++            if (of) a1 = @mulAdd(f32, v, wts[at], a1) else a0 = @mulAdd(f32, v, wts[at], a0);
++            old = @mulAdd(f32, v, wts[at], old);
++            const t = @as(f64, v) * wts[at];
++            x += t;
++            m += @abs(t);
++        }
++        const g = got[r * dims + d];
++        if (@as(u32, @bitCast(g)) != @as(u32, @bitCast(a0 + a1))) host_diff += 1;
++        note(&os, g, x, m, d);
++        note(&ms, old, x, m, d);
++        if (bf16(g) != bf16(old)) bf_diff += 1;
++    };
++    const count: f64 = @floatFromInt(n * dims);
++    try check.expect(host_diff == 0, "rank {d}: {d} rows: {d} sums differ from the host owner order", .{ rank, n, host_diff });
++    try check.expect(os.over == 0, "rank {d}: {d} rows: {d} elements past gamma_{d} of FP64", .{ rank, n, os.over, steps });
++    std.debug.print("owner-sum rank={d} rows={d} owner max_abs={e:.3} mean_abs={e:.3} worst_of_bound={d:.4} col={d} | main max_abs={e:.3} mean_abs={e:.3} worst_of_bound={d:.4} col={d} | bf16_differ={d:.5}%\n", .{ rank, n, os.max_abs, os.sum_abs / count, os.worst, os.worst_col, ms.max_abs, ms.sum_abs / count, ms.worst, ms.worst_col, 100 * @as(f64, @floatFromInt(bf_diff)) / count });
++
++    // planted: a flipped high mantissa bit in the largest sum breaks the bytes and the FP64 bound
++    var at: usize = 0;
++    for (got, 0..) |v, i| {
++        if (@abs(v) > @abs(got[at])) at = i;
++    }
++    const planted: f32 = @bitCast(@as(u32, @bitCast(got[at])) ^ (1 << 22));
++    var x: f64 = 0;
++    var m: f64 = 0;
++    for (0..slots) |s| {
++        const i = (at / dims) * slots + s;
++        const t = @as(f64, whole[i * dims + at % dims]) * wts[i];
++        x += t;
++        m += @abs(t);
++    }
++    try check.expect(@abs(@as(f64, planted) - x) > gamma * m, "rank {d}: {d} rows: planted sum at {d} breaks the FP64 bound", .{ rank, n, at });
++    check.pass("rank {d}: {d} rows: --tp 1 bytes, host owner order, gamma_{d} bound, nothing past the pass; planted control fails", .{ rank, n, steps });
++}
+diff --git a/zig/tests/cuda/flashnext_rank_tests.zig b/zig/tests/cuda/flashnext_rank_tests.zig
+index bccd3d59c..2b2474369 100644
+--- a/zig/tests/cuda/flashnext_rank_tests.zig
++++ b/zig/tests/cuda/flashnext_rank_tests.zig
+@@ -7,7 +7,7 @@ const check = @import("check.zig");
+ const wire = flash.rank_wire;
+ 
+ pub fn run(gpu: check.Gpu, rank: usize, port: u16, mode_arg: []const u8, master: []const u8) !void {
+-    const modes = [_][]const u8{ "sum", "eof", "timeout", "missing", "late", "gone", "eof-scatter", "timeout-scatter", "exchange" };
++    const modes = [_][]const u8{ "sum", "eof", "timeout", "missing", "late", "gone", "eof-scatter", "timeout-scatter", "exchange", "hidden-sum" };
+     for (modes) |m| {
+         if (std.mem.eql(u8, m, mode_arg)) break;
+     } else return error.UnknownRankMode;
+@@ -57,6 +57,10 @@ pub fn run(gpu: check.Gpu, rank: usize, port: u16, mode_arg: []const u8, master:
+         try @import("flashnext_exchange_tests.zig").run(gpu, &collective, stream, rank);
+         return meet(link, rank, 99);
+     }
++    if (std.mem.eql(u8, mode, "hidden-sum")) {
++        try @import("flashnext_hidden_sum_tests.zig").run(gpu, &collective, stream, rank);
++        return meet(link, rank, 99);
++    }
+     if (std.mem.eql(u8, mode, "eof") or std.mem.eql(u8, mode, "timeout")) {
+         // both communicators are up before the peer fails, so the failure meets the collective, not the init
+         try meet(link, rank, 98);
+diff --git a/zig/tests/cuda/main_usage.zig b/zig/tests/cuda/main_usage.zig
+index 66c907df7..af773cba3 100644
+--- a/zig/tests/cuda/main_usage.zig
++++ b/zig/tests/cuda/main_usage.zig
+@@ -15,7 +15,7 @@ pub const usage =
+     \\  flashnext-kv-host  a stream's K/V rows on mapped pinned host pages: device writes, memsets and copies reach them
+     \\  flashnext-score MODEL IDS_FILE  decisions' label scores against a plain pass's last row
+     \\  flashnext-model-rank MODEL RANK PORT IDS_FILE [rounds|leave] [MASTER]  full-model rounds == eager rows; leave: the peer is stopped
+-    \\  flashnext-rank RANK PORT [sum|eof|timeout|missing|late|gone|eof-scatter|timeout-scatter|exchange] [MASTER]  two-process collectives, failures, start-up waits, the expert exchange
++    \\  flashnext-rank RANK PORT [sum|eof|timeout|missing|late|gone|eof-scatter|timeout-scatter|exchange|hidden-sum] [MASTER]  two-process collectives, failures, start-up waits, the expert exchanges
+     \\  flashnext-draft-affine    proposal-head affine projection against FP64 and row-count invariance
+     \\  flashnext-shared          separate MXFP8 shared expert and reserved-slot scatter against FP64
+     \\  flashnext-nvfp4-tp        rank-local expert cuts and FP32 partials against FP64 (one GPU)
+-- 
+2.56.0
+

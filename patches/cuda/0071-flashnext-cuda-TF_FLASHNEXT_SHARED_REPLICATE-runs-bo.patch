@@ -1,0 +1,242 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jay Leaton <58495321+jayleaton@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 15:21:22 +0700
+Subject: [PATCH 71/76] flashnext cuda: TF_FLASHNEXT_SHARED_REPLICATE runs both
+ ranks' shared expert halves on each rank, so --tp 2 drops the shared gather
+
+---
+ docs/environment.md                           |  1 +
+ .../families/flashnext/cuda_mixed_experts.zig | 27 ++++++++++++++++-
+ .../families/flashnext/cuda_rank_engine.zig   |  4 +--
+ .../families/flashnext/cuda_shared_split.zig  | 27 ++++++++++++-----
+ .../flashnext/cuda_split_lane_test.zig        | 29 +++++++++++++++++++
+ zig/src/platform/environment.zig              |  1 +
+ .../platform/environment_flashnext_test.zig   |  4 +--
+ zig/tests/fixtures/gradient-serving.tsv       |  2 +-
+ 8 files changed, 82 insertions(+), 13 deletions(-)
+
+diff --git a/docs/environment.md b/docs/environment.md
+index 458130bd7..4a5e50beb 100644
+--- a/docs/environment.md
++++ b/docs/environment.md
+@@ -155,6 +155,7 @@ stops the start with the variable, the supplied text and the accepted forms.
+ | `TF_FLASHNEXT_DECODE_GRAPH` | Exactly `0` or `1`; default off |
+ | `TF_FLASHNEXT_SPLIT_DENSE` | Exactly `0` or `1`; default on: two ranks split the BF16 dense projections |
+ | `TF_FLASHNEXT_SPLIT_SHARED` | Exactly `0` or `1`; default on: under the dense split the shared expert is split too, with one gather a layer. `0` runs it whole on rank 0 instead, as without the split. Give every rank the same value. |
++| `TF_FLASHNEXT_SHARED_REPLICATE` | Exactly `0` or `1`; default off. `1`: under the shared expert's split each rank also loads the peer's gate and up cuts and runs both ranks' halves itself with the peer's launches, instead of the gather; the down projection and its output columns are unchanged, so are the bits. Inert without the split (`--pp 2`, `TF_FLASHNEXT_SPLIT_SHARED=0`). Give every rank the same value (the ranks refuse to pair otherwise). |
+ | `TF_FLASHNEXT_SHARD_HEAD` | Exactly `0` or `1`; default off: at `--tp 2` each rank keeps its half of the output head; a greedy unmasked verify exchanges each half's best value and column a row, other passes gather the scores; one GPU and `--pp 2` keep the whole head |
+ | `TF_FLASHNEXT_ATTN_LANES` | Exactly `0` or `1`; default off |
+ | `TF_FLASHNEXT_WARM_AHEAD` | Exactly `0` or `1`; default off |
+diff --git a/zig/src/families/flashnext/cuda_mixed_experts.zig b/zig/src/families/flashnext/cuda_mixed_experts.zig
+index bf6efb0f1..38b4fef5b 100644
+--- a/zig/src/families/flashnext/cuda_mixed_experts.zig
++++ b/zig/src/families/flashnext/cuda_mixed_experts.zig
+@@ -11,13 +11,26 @@ pub const Owned = struct {
+     rank: usize,
+     world: usize,
+     split_shared: bool = false,
++    /// TF_FLASHNEXT_SHARED_REPLICATE: the peer's gate and up cuts, so this rank makes both halves without a gather.
++    peer: ?[2]wt.Q4 = null,
+ 
+     pub fn free(self: *Owned) void {
+         self.experts.free();
+         for (&self.shared) |*p| p.free();
++        if (self.peer) |*q| for (q) |*p| p.free();
++    }
++
++    /// Rank `owner`'s gate (0) or up (1) cut: this rank's own, or with `peer` the other rank's.
++    pub fn cut(self: *const Owned, i: usize, owner: usize) wt.Q4 {
++        return if (owner == self.rank) self.shared[i] else self.peer.?[i];
+     }
+ };
+ 
++/// TF_FLASHNEXT_SHARED_REPLICATE=1: under the shared split each rank also makes the peer's half (no gather).
++pub fn replicateOn() !bool {
++    return @import("sys").environment.read(bool, "TF_FLASHNEXT_SHARED_REPLICATE", false);
++}
++
+ pub fn load(a: std.mem.Allocator, d: *cuda.Driver, store: *wt.Store, prefix: []const u8, world: usize, rank: usize, split: bool) !Owned {
+     var e = try routed.load(a, d, store, prefix, world, rank);
+     errdefer e.free();
+@@ -34,5 +47,17 @@ pub fn load(a: std.mem.Allocator, d: *cuda.Driver, store: *wt.Store, prefix: []c
+             if (shared[i].native == null) return error.UnsupportedQuantization;
+         }
+     }
+-    return .{ .experts = e, .shared = shared, .rank = rank, .world = world, .split_shared = split };
++    var peer: ?[2]wt.Q4 = null;
++    errdefer if (peer) |*q| for (q) |*p| p.free();
++    if (split and world == 2 and try replicateOn()) {
++        // the same cut the peer loads for itself, so each half's launch matches the peer's
++        var buf: [256]u8 = undefined;
++        peer = @splat(wt.Q4.empty(d));
++        for ([_][]const u8{ "gate_proj", "up_proj" }, 0..) |name, i| {
++            const key = try std.fmt.bufPrint(&buf, "{s}.shared_expert.{s}", .{ prefix, name });
++            peer.?[i] = try projections.loadCut(a, d, store, key, wt.moe_w, wt.dims, try routed.Cut.init(wt.moe_w, world, 1 - rank), .rows);
++            if (peer.?[i].native == null) return error.UnsupportedQuantization;
++        }
++    }
++    return .{ .experts = e, .shared = shared, .rank = rank, .world = world, .split_shared = split, .peer = peer };
+ }
+diff --git a/zig/src/families/flashnext/cuda_rank_engine.zig b/zig/src/families/flashnext/cuda_rank_engine.zig
+index b214ba253..1dd51acce 100644
+--- a/zig/src/families/flashnext/cuda_rank_engine.zig
++++ b/zig/src/families/flashnext/cuda_rank_engine.zig
+@@ -24,7 +24,7 @@ pub const Identity = extern struct {
+     max_images: u64 = 0,
+     dense_split: u64 = 0,
+     split_rows: u64 = 0,
+-    shared_split: u64 = 0,
++    shared_split: u64 = 0, // TF_FLASHNEXT_SPLIT_SHARED in bit 0 and TF_FLASHNEXT_SHARED_REPLICATE in bit 1
+     peer_slots: u64 = 0,
+     exchange: u64 = 0, // TF_FLASHNEXT_HIDDEN_SUM in bit 0 and TF_FLASHNEXT_OWNER_SLOTS in bit 1, as read at load
+     split: u64 = 0, // rank 1's first layer at --pp 2 (0: tensor ranks, every layer on both)
+@@ -53,7 +53,7 @@ pub fn identity(a: std.mem.Allocator, io: std.Io, dir: []const u8, context: usiz
+     defer a.free(index);
+     const program = try std.process.executablePathAlloc(io, a);
+     defer a.free(program);
+-    return .{ .config = try fileHash(a, io, config), .index = try fileHash(a, io, index), .program = try fileHash(a, io, program), .checkpoint = checkpoint, .context = context, .chunk = chunk, .decode_graph = @intFromBool(@import("cuda_round_graph.zig").enabled()), .head_sharded = @intFromBool(try @import("cuda_head.zig").enabled()), .dense_split = @intFromBool(try @import("cuda_dense_split.zig").appliesDir(a, io, dir, 2)), .split_rows = try @import("cuda_moe_exchange.zig").asked(), .shared_split = @intFromBool(try @import("cuda_dense_split.zig").sharedSplit()), .peer_slots = @intFromBool(try @import("cuda_peer_slots.zig").enabled()), .exchange = @as(u64, @intFromBool(try @import("cuda_moe_hidden_sum.zig").enabled())) | @as(u64, @intFromBool(try @import("cuda_owner_slots.zig").enabled())) << 1 };
++    return .{ .config = try fileHash(a, io, config), .index = try fileHash(a, io, index), .program = try fileHash(a, io, program), .checkpoint = checkpoint, .context = context, .chunk = chunk, .decode_graph = @intFromBool(@import("cuda_round_graph.zig").enabled()), .head_sharded = @intFromBool(try @import("cuda_head.zig").enabled()), .dense_split = @intFromBool(try @import("cuda_dense_split.zig").appliesDir(a, io, dir, 2)), .split_rows = try @import("cuda_moe_exchange.zig").asked(), .shared_split = @as(u64, @intFromBool(try @import("cuda_dense_split.zig").sharedSplit())) | @as(u64, @intFromBool(try @import("cuda_mixed_experts.zig").replicateOn())) << 1, .peer_slots = @intFromBool(try @import("cuda_peer_slots.zig").enabled()), .exchange = @as(u64, @intFromBool(try @import("cuda_moe_hidden_sum.zig").enabled())) | @as(u64, @intFromBool(try @import("cuda_owner_slots.zig").enabled())) << 1 };
+ }
+ 
+ /// How long a rank waits for its peer: a minute with a given digest, 30 when the peer may be hashing every byte.
+diff --git a/zig/src/families/flashnext/cuda_shared_split.zig b/zig/src/families/flashnext/cuda_shared_split.zig
+index bf7a5691a..420d28799 100644
+--- a/zig/src/families/flashnext/cuda_shared_split.zig
++++ b/zig/src/families/flashnext/cuda_shared_split.zig
+@@ -14,16 +14,29 @@ pub fn runOn(self: anytype, st: anytype, native: *const mixed.Owned, n: usize) !
+     const dims = wt.dims;
+     const glue = self.tri.own orelse return error.NativeGlueRequired;
+     const width = if (native.split_shared) wt.moe_w / 2 else wt.moe_w;
+-    try self.k.native_lane.matmul(st, s.mixed, dims, n, native.shared[0].native.?, s.shared_gate, s.native_part);
+-    try self.k.native_lane.matmul(st, s.mixed, dims, n, native.shared[1].native.?, s.shared_up, s.native_part);
+-    try glue.sharedSwiGLU(st, s.shared_gate, s.shared_up, s.shared_act, n, width);
+     var input = s.shared_act;
++    if (native.split_shared and native.peer != null) {
++        // each rank's half as that rank launches it, laid out [2, n, width] in rank order as the gather lands them
++        for (0..2) |owner| for (0..2) |i| {
++            const out = (if (i == 0) s.shared_gate else s.shared_up) + owner * n * width * 2;
++            try self.k.native_lane.matmul(st, s.mixed, dims, n, native.cut(i, owner).native.?, out, s.native_part);
++        };
++        try glue.sharedSwiGLU(st, s.shared_gate, s.shared_up, s.shared_act, 2 * n, width);
++    } else {
++        try self.k.native_lane.matmul(st, s.mixed, dims, n, native.shared[0].native.?, s.shared_gate, s.native_part);
++        try self.k.native_lane.matmul(st, s.mixed, dims, n, native.shared[1].native.?, s.shared_up, s.native_part);
++        try glue.sharedSwiGLU(st, s.shared_gate, s.shared_up, s.shared_act, n, width);
++    }
+     if (native.split_shared) {
+-        const c = self.m.collective orelse return error.TensorParallelUnavailable;
+-        try c.gather(st, input, s.rank_gather, n * width);
++        var gathered = s.shared_act;
++        if (native.peer == null) {
++            const c = self.m.collective orelse return error.TensorParallelUnavailable;
++            try c.gather(st, input, s.rank_gather, n * width);
++            gathered = s.rank_gather;
++        }
+         // one row: the ranks' gathered blocks [2, 1, width] are already the row [1, moe_w] the down projection reads
+-        if (n > 1) for (0..2) |rank| try ops.copyCols(self.k, st, s.rank_gather + rank * n * width * 2, width, s.rank_input + rank * width * 2, wt.moe_w, width, n);
+-        input = if (n == 1) s.rank_gather else s.rank_input;
++        if (n > 1) for (0..2) |rank| try ops.copyCols(self.k, st, gathered + rank * n * width * 2, width, s.rank_input + rank * width * 2, wt.moe_w, width, n);
++        input = if (n == 1) gathered else s.rank_input;
+     }
+     // the whole expert's down goes straight into its slot (cuda_batch_side.down), as on the side stream
+     if (!native.split_shared) return @import("cuda_batch_side.zig").down(self, st, input, native, n);
+diff --git a/zig/src/families/flashnext/cuda_split_lane_test.zig b/zig/src/families/flashnext/cuda_split_lane_test.zig
+index 2ffbb3b6c..276220970 100644
+--- a/zig/src/families/flashnext/cuda_split_lane_test.zig
++++ b/zig/src/families/flashnext/cuda_split_lane_test.zig
+@@ -281,6 +281,7 @@ test "shared expert composition keeps whole direct slots and split full-K output
+         var native: @import("cuda_mixed_experts.zig").Owned = undefined;
+         native.rank = rank;
+         native.split_shared = split;
++        native.peer = null;
+         const width: usize = if (split) wt.moe_w / 2 else wt.moe_w;
+         const columns: usize = if (split) dims / 2 else dims;
+         for (0..3) |i| native.shared[i].native = cuda.modelopt.bf16Weight(0x2000, if (i == 2) columns else width, if (i == 2) wt.moe_w else dims);
+@@ -328,11 +329,39 @@ test "shared expert composition keeps whole direct slots and split full-K output
+             } else try std.testing.expectEqual(@as(usize, 0x600), last.f);
+         }
+     };
++    // replicated: both ranks' halves here in rank order where the gather would land them, then the same copies and down
++    for ([_]usize{ 1, 64 }) |n| for (0..2) |rank| {
++        const width = wt.moe_w / 2;
++        var native: @import("cuda_mixed_experts.zig").Owned = undefined;
++        native.rank = rank;
++        native.split_shared = true;
++        for (0..3) |i| native.shared[i].native = cuda.modelopt.bf16Weight(0x2000, if (i == 2) dims / 2 else width, if (i == 2) wt.moe_w else dims);
++        native.peer = .{ native.shared[0], native.shared[1] };
++        var self: Self = .{ .k = &r.k, .s = &r.s, .m = r.pass(n, true).m, .stream = .{ .d = &r.d, .handle = null }, .tri = .{ .own = &glue } };
++        Rec.n = 0;
++        try @import("cuda_shared_split.zig").run(&self, &native, n);
++        var outs: [5]i64 = undefined;
++        var mm: usize = 0;
++        for (recorded()) |call| {
++            try std.testing.expect(call.kind != .gather and call.kind != .sum);
++            if (call.f == qmmf_id) {
++                outs[mm] = call.a[if (mm < 4) 1 else 0];
++                mm += 1;
++            }
++        }
++        try std.testing.expectEqual(@as(usize, 5), mm);
++        const half: i64 = @intCast(n * width * 2);
++        const g: i64 = @intCast(r.s.shared_gate);
++        const u: i64 = @intCast(r.s.shared_up);
++        try std.testing.expectEqualSlices(i64, &.{ g, u, g + half, u + half, @intCast(if (n == 1) r.s.shared_act else r.s.rank_input) }, &outs);
++        if (n > 1) try std.testing.expectEqual(@as(i64, @intCast(r.s.shared_act)) + half, recorded()[Rec.n - 3].a[0]);
++    };
+     // a down weight the strided launch cannot address keeps the contiguous product and the scatter, without an error
+     r.c.rank = 0;
+     var native: @import("cuda_mixed_experts.zig").Owned = undefined;
+     native.rank = 0;
+     native.split_shared = false;
++    native.peer = null;
+     for (0..3) |i| native.shared[i].native = cuda.modelopt.bf16Weight(0x2000, if (i == 2) dims else wt.moe_w, if (i == 2) wt.moe_w else dims);
+     native.shared[2].native.?.npad += 1;
+     var self: Self = .{ .k = &r.k, .s = &r.s, .m = r.pass(64, true).m, .stream = .{ .d = &r.d, .handle = null }, .tri = .{ .own = &glue } };
+diff --git a/zig/src/platform/environment.zig b/zig/src/platform/environment.zig
+index dc5921809..06a356026 100644
+--- a/zig/src/platform/environment.zig
++++ b/zig/src/platform/environment.zig
+@@ -224,6 +224,7 @@ pub const rules = [_]Rule{
+     .{ .name = "TF_FLASHNEXT_DECODE_GRAPH", .scope = .flashnext, .kind = .flag, .forms = "0 or 1 (default 0)" },
+     .{ .name = "TF_FLASHNEXT_SPLIT_DENSE", .scope = .flashnext, .kind = .flag, .forms = "0 or 1 (default 1)" },
+     .{ .name = "TF_FLASHNEXT_SPLIT_SHARED", .scope = .flashnext, .kind = .flag, .forms = "0 or 1 (default 1; 0 runs the shared expert whole on rank 0 under the dense split); give every rank the same" },
++    .{ .name = "TF_FLASHNEXT_SHARED_REPLICATE", .scope = .flashnext, .kind = .flag, .forms = "0 or 1 (default 0; 1: under the shared split each rank also makes the peer's half, no gather); give every rank the same" },
+     .{ .name = "TF_FLASHNEXT_SHARD_HEAD", .scope = .flashnext, .kind = .flag, .forms = "0 or 1 (default 0)" },
+     .{ .name = "TF_FLASHNEXT_ATTN_LANES", .scope = .flashnext, .kind = .flag, .forms = "0 or 1 (default 0)" },
+     .{ .name = "TF_FLASHNEXT_WARM_AHEAD", .scope = .flashnext, .kind = .flag, .forms = "0 or 1 (default 0)" },
+diff --git a/zig/src/platform/environment_flashnext_test.zig b/zig/src/platform/environment_flashnext_test.zig
+index 11a438701..70d01db53 100644
+--- a/zig/src/platform/environment_flashnext_test.zig
++++ b/zig/src/platform/environment_flashnext_test.zig
+@@ -33,13 +33,13 @@ fn check(name: []const u8, raw: []const u8, valid: bool) !void {
+     try t.expect(std.mem.endsWith(u8, why.?, e.rule(name).forms));
+ }
+ 
+-test "Flash Next strict env: the table holds all 52 settings: 35 switches, 12 integers, 2 reals, 3 structured" {
++test "Flash Next strict env: the table holds all 53 settings: 36 switches, 12 integers, 2 reals, 3 structured" {
+     var counts: [4]usize = @splat(0);
+     for (e.rules) |r| if (r.scope == .flashnext) {
+         try t.expect(std.mem.startsWith(u8, r.name, "TF_FLASHNEXT_"));
+         counts[@backingInt(group(r))] += 1;
+     };
+-    try t.expectEqual([4]usize{ 35, 12, 2, 3 }, counts);
++    try t.expectEqual([4]usize{ 36, 12, 2, 3 }, counts);
+ }
+ 
+ test "Flash Next strict env: unset and blank settings both read as the caller's default" {
+diff --git a/zig/tests/fixtures/gradient-serving.tsv b/zig/tests/fixtures/gradient-serving.tsv
+index 6d5fb10f1..d43fc6cb7 100644
+--- a/zig/tests/fixtures/gradient-serving.tsv
++++ b/zig/tests/fixtures/gradient-serving.tsv
+@@ -137,7 +137,7 @@ zig/src/families/flashnext/cuda_launch.zig	12b9ba75f979f431d2e306e9e3cd636893760
+ zig/src/families/flashnext/cuda_media.zig	394601e8a807f5516f501efcaefa6fb3308f392ee322db7296b11c90814f8eea	raw
+ zig/src/families/flashnext/cuda_media_test.zig	4292f8f7c8f8bf4efd0dfaaa5a6c63e11568f85534127a0ce9feb0ab0be05120	raw
+ zig/src/families/flashnext/cuda_mix.zig	248a2a86b3f377531f5b713c408ba99f73604510f4afe34ffae52615d5863c2c	raw
+-zig/src/families/flashnext/cuda_mixed_experts.zig	d0362f591e98c2d13581ae48fb75fb7391e41558e08119c6e21e3b34c004e503	raw
++zig/src/families/flashnext/cuda_mixed_experts.zig	b8e06e99deaafac2d83d19ec777b1cc48f10d5542935523ac8118ad538d51126	raw
+ zig/src/families/flashnext/cuda_mlp.zig	8224a28003487487e69eb669be11eaafafdb1ce0bc4c5e57024cef0a6a29e66f	raw
+ zig/src/families/flashnext/cuda_modelopt_experts.zig	54c3eb705e952a79ac903c55dd4b70370c3e0df1cab63058664bbcbba55a957a	raw	F6: block-FP8 routed experts (Qwen's FP8 release) load a rank's whole experts and are admitted at --tp 2; the NVFP4 and affine paths keep their bytes
+ zig/src/families/flashnext/cuda_moe.zig	87ba75343c1d228800ed9fcc6d933f1175df172c008e14a8c7a64ff7011bed44	raw
+-- 
+2.56.0
+

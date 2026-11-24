@@ -1,0 +1,74 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jay Leaton <58495321+jayleaton@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 15:02:13 +0700
+Subject: [PATCH 54/76] flashnext tests: the two-rank hidden-sum test also sums
+ over the peer's mapped buffer, up to its 128 rows, against --tp 1's bytes
+
+---
+ zig/tests/cuda/flashnext_hidden_sum_tests.zig | 23 +++++++++++++++----
+ 1 file changed, 18 insertions(+), 5 deletions(-)
+
+diff --git a/zig/tests/cuda/flashnext_hidden_sum_tests.zig b/zig/tests/cuda/flashnext_hidden_sum_tests.zig
+index 0d07460ca..31479bb97 100644
+--- a/zig/tests/cuda/flashnext_hidden_sum_tests.zig
++++ b/zig/tests/cuda/flashnext_hidden_sum_tests.zig
+@@ -5,6 +5,7 @@ const flash = @import("flashnext");
+ const check = @import("check.zig");
+ 
+ const Collective = flash.collective.Collective;
++const PeerSlots = @typeInfo(@FieldType(Collective, "peer")).optional.child;
+ const dims = 2560;
+ const slots = 11;
+ const split = 256;
+@@ -12,16 +13,18 @@ const u: f64 = std.math.ldexp(@as(f64, 1), -24);
+ const steps = slots + 1;
+ const gamma: f64 = steps * u / (1 - steps * u);
+ 
+-const Kernels = struct { moe_sum: cuda.Function };
++const Kernels = struct { moe_sum: cuda.Function, peer_rows_send: cuda.Function, peer_rows_add: cuda.Function };
+ const Bufs = struct { y: u64, wts: u64, picks: u64, moe_f32: u64 };
+ const Pass = struct { s: *const Bufs, k: Kernels, stream: cuda.Stream, pending_f32: bool = false };
+ 
+ pub fn run(gpu: check.Gpu, c: *Collective, stream: cuda.Stream, rank: usize) !void {
+     var mod = try cuda.Module.load(gpu.d, cuda.kernels.flashnext_batch);
+     defer mod.unload();
+-    const k: Kernels = .{ .moe_sum = try mod.function("fn_moe_sum") };
+-    for ([_]usize{ 1, 4, 16, 64, 65, 3072, 8192 }) |n| try pass(gpu, c, stream, k, rank, n);
+-    check.pass("rank {d}: --tp 2's hidden-size exchange equals --tp 1's owner-order bytes, within gamma_{d} of FP64; planted controls fail", .{ rank, steps });
++    const k: Kernels = .{ .moe_sum = try mod.function("fn_moe_sum"), .peer_rows_send = try mod.function("fn_peer_rows_send"), .peer_rows_add = try mod.function("fn_peer_rows_add") };
++    var peer = try PeerSlots.init(gpu.d, c.link, rank, 30_000);
++    defer peer.deinit();
++    for ([_]usize{ 1, 4, 16, 64, 65, 128, 3072, 8192 }) |n| try pass(gpu, c, &peer, stream, k, rank, n);
++    check.pass("rank {d}: --tp 2's hidden-size exchange, over NCCL and over the peer's buffer, equals --tp 1's owner-order bytes, within gamma_{d} of FP64; planted controls fail", .{ rank, steps });
+ }
+ 
+ fn mix(x: u64) u64 {
+@@ -71,7 +74,7 @@ fn bf16(v: f32) u16 {
+     return @truncate((bits + 0x7fff + ((bits >> 16) & 1)) >> 16);
+ }
+ 
+-fn pass(gpu: check.Gpu, c: *Collective, stream: cuda.Stream, k: Kernels, rank: usize, n: usize) !void {
++fn pass(gpu: check.Gpu, c: *Collective, peer: *PeerSlots, stream: cuda.Stream, k: Kernels, rank: usize, n: usize) !void {
+     const a = gpu.gpa;
+     const mine = try a.alloc(f32, n * slots * dims);
+     defer a.free(mine);
+@@ -110,6 +113,16 @@ fn pass(gpu: check.Gpu, c: *Collective, stream: cuda.Stream, k: Kernels, rank: u
+     const solo = try check.download(gpu, one);
+     defer a.free(solo);
+     try check.sameBytes("--tp 2 hidden-size exchange against the --tp 1 owner-order sum", raw[0 .. n * dims * 4], solo);
++    if (PeerSlots.fits(n)) {
++        try moe.fill8(0x5a, stream.handle);
++        var v: Pass = .{ .s = &two_bufs, .k = k, .stream = stream };
++        try flash.moe_hidden_sum.runPeer(&v, peer, n, rank);
++        try c.finish(stream);
++        const via = try check.download(gpu, moe);
++        defer a.free(via);
++        for (via[n * dims * 4 ..]) |b| try check.expect(b == 0x5a, "rank {d}: {d} rows: the peer-buffer sum writes nothing past the pass", .{ rank, n });
++        try check.sameBytes("the peer-buffer hidden sum against the --tp 1 owner-order sum", via[0 .. n * dims * 4], solo);
++    }
+     const got: []const f32 = @alignCast(std.mem.bytesAsSlice(f32, raw[0 .. n * dims * 4]));
+ 
+     var os: Stats = .{};
+-- 
+2.56.0
+

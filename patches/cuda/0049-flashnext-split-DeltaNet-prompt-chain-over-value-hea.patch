@@ -1,0 +1,734 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jay Leaton <58495321+jayleaton@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 00:07:41 +0700
+Subject: [PATCH 49/76] flashnext: split DeltaNet prompt chain over (value
+ head, slice) where the SMs allow
+
+fn_gdn_chain_split steps each value head's 128 state rows in two blocks of
+64 (eight threads a row, tree<8> keeps warp_sum's order), with the two cache
+marks' states; fused passes take fn_gdn_front, the split chain and
+fn_gdn_norm when every block has its own SM (96 SMs whole heads, 48 a rank's).
+Registered as a replacement of fn_gdn_chain_tpr with two planted controls.
+---
+ docs/kernel-contract.md                       |   7 +
+ zig/kernels/cuda/flashnext_gdn_tpr.cuh        |  70 ++++-
+ .../core/contract/flashnext_split_records.zig |  32 ++
+ zig/src/core/contract/registry_joins.zig      |   1 +
+ .../core/contract/registry_pending_test.zig   |   1 +
+ zig/src/families/flashnext/cuda_batch.zig     |   4 +-
+ .../families/flashnext/cuda_batch_kernels.zig |  12 +-
+ zig/src/families/flashnext/cuda_gdn_fused.zig |  47 ++-
+ zig/src/families/flashnext/cuda_launch.zig    |   2 +
+ zig/tests/cuda/contract_flashnext_groups.zig  |   5 +
+ zig/tests/cuda/contract_flashnext_split.zig   | 273 ++++++++++++++++++
+ zig/tests/cuda/main.zig                       |   1 +
+ zig/tests/cuda/main_usage.zig                 |   1 +
+ 13 files changed, 437 insertions(+), 19 deletions(-)
+ create mode 100644 zig/src/core/contract/flashnext_split_records.zig
+ create mode 100644 zig/tests/cuda/contract_flashnext_split.zig
+
+diff --git a/docs/kernel-contract.md b/docs/kernel-contract.md
+index 92dee9392..2e6a2e2ab 100644
+--- a/docs/kernel-contract.md
++++ b/docs/kernel-contract.md
+@@ -592,3 +592,10 @@ Only unsplit prompt calls select K32; fused slices retain the parent K64 tile.
+ Each new control launches K32 for its output type at small and production row counts.
+ `qmmf-prompt-bench` times the 64-row lane, prompt16, the parent K64 tile and K32 on each Flash Next BF16 shape.
+ Measured nvcc 13.0 resources cover both K32 entries on sm_120 and sm_121; later compiler receipts remain pending.
++
++Flash Next's split prompt chain `fn_gdn_chain_split` (and `_h8`) steps each value head's 128 state rows in two blocks
++of 64, eight threads a row; the fused block's passes take it with `fn_gdn_front` and `fn_gdn_norm` where every block
++has an SM of its own (96 SMs for the whole layer's heads, 48 for a rank's). Its registration replaces
++`fn_gdn_chain_tpr`: ys, the state and two cache marks' states must equal its bytes. `flashnext-gdn-split-contract`
++runs both forms and two controls, red at gate 3: the launch one slice short, and each slice reading its neighbour's
++state. Its launches are in `flashnext_split_records.zig`, nvcc 13.0's usage; later compiler receipts remain pending.
+diff --git a/zig/kernels/cuda/flashnext_gdn_tpr.cuh b/zig/kernels/cuda/flashnext_gdn_tpr.cuh
+index 777d85678..7533a6906 100644
+--- a/zig/kernels/cuda/flashnext_gdn_tpr.cuh
++++ b/zig/kernels/cuda/flashnext_gdn_tpr.cuh
+@@ -1,4 +1,4 @@
+-// fn_gdn_rows' chain, a block a value head, TPR threads a state row, warp_sum's tree in the thread (same bits).
++// fn_gdn_rows' chain, a block ROWS state rows of a value head, TPR threads a row, warp_sum's tree (same bits).
+ #ifndef KREG
+ #define KREG 0
+ #endif
+@@ -11,8 +11,8 @@ __device__ __forceinline__ void cp16(void* dst, const void* src) {
+ __device__ __forceinline__ void cp8(void* dst, const void* src) {
+     asm volatile("cp.async.ca.shared.global [%0], [%1], 8;\n" ::"r"(static_cast<uint32_t>(__cvta_generic_to_shared(dst))), "l"(src));
+ }
+-template <int STEPS> struct Stage {
+-    static constexpr int ROW = (DK + DK + DV) * 4 + 16;
++template <int STEPS, int ROWS = DV> struct Stage {
++    static constexpr int ROW = (DK + DK + ROWS) * 4 + 16;  // k, q, the block's v rows, g and beta
+     static constexpr int BYTES = STEPS * ROW;
+ };
+ // warp_sum's tree over the 32 lane partials x[l'] (lane l = l' TPR + t): in-thread levels, then the threads' xor levels
+@@ -27,15 +27,18 @@ __device__ __forceinline__ float tree(float (&x)[32 / TPR]) {
+     for (int m = TPR / 2; m >= 1; m >>= 1) r = r + __shfl_xor_sync(0xffffffffu, r, m);
+     return r;
+ }
+-// NK key and NV value heads (a layer's 16 and 48, or one rank's 8 and 24), TPR threads a state row, STEPS rows a stage
+-template <int NK, int NV, int TPR, int STEPS>
++// NK, NV key and value heads (16, 48 or a rank's 8, 24); block (hv, y): state rows y ROWS on; CUTS: marks' states
++template <int NK, int NV, int TPR, int STEPS, int ROWS = DV, bool CUTS = false>
+ __device__ __forceinline__ void chain(const float* __restrict__ qn, const float* __restrict__ kn, const float* __restrict__ v,
+                                       const float* __restrict__ gb, const float* state_in, float* state_out, int rows,
+-                                      float* __restrict__ ys_out) {
+-    using S = Stage<STEPS>;
++                                      float* __restrict__ ys_out, int cut0 = 0, float* cut0_state = nullptr, int cut1 = 0,
++                                      float* cut1_state = nullptr) {
++    using S = Stage<STEPS, ROWS>;
+     constexpr int L = 32 / TPR;                           // the lanes a thread holds
++    constexpr int UNITS = 32 + 32 + ROWS / 4 + 1;         // a step's 16-byte copies: k, q, v rows, then g and beta
+     extern __shared__ __align__(16) unsigned char smem[];
+-    const int hv = blockIdx.x, hk = hv / (NV / NK), row = threadIdx.x / TPR, t = threadIdx.x % TPR;
++    const int hv = blockIdx.x, hk = hv / (NV / NK), lr = threadIdx.x / TPR, t = threadIdx.x % TPR;
++    const int y0 = ROWS == DV ? 0 : blockIdx.y * ROWS, row = y0 + lr;
+     const size_t sbase = (size_t)hv * DV * DK + (size_t)row * DK;
+     float s[L][4];
+ #pragma unroll
+@@ -45,13 +48,13 @@ __device__ __forceinline__ void chain(const float* __restrict__ qn, const float*
+     auto load = [&](int buf, int r0) {
+         unsigned char* base = smem + buf * S::BYTES;
+         const int n = min(STEPS, rows - r0);
+-        for (int c = threadIdx.x; c < n * 97; c += blockDim.x) {
+-            const int r = c / 97, u = c % 97, rr = r0 + r;
++        for (int c = threadIdx.x; c < n * UNITS; c += blockDim.x) {
++            const int r = c / UNITS, u = c % UNITS, rr = r0 + r;
+             unsigned char* d = base + r * S::ROW;
+             if (u < 32) cp16(d + u * 16, kn + ((size_t)rr * NK + hk) * DK + u * 4);
+             else if (u < 64) cp16(d + DK * 4 + (u - 32) * 16, qn + ((size_t)rr * NK + hk) * DK + (u - 32) * 4);
+-            else if (u < 96) cp16(d + 2 * DK * 4 + (u - 64) * 16, v + (size_t)rr * NV * DV + hv * DV + (u - 64) * 4);
+-            else cp8(d + (2 * DK + DV) * 4, gb + ((size_t)rr * NV + hv) * 2);
++            else if (u < UNITS - 1) cp16(d + 2 * DK * 4 + (u - 64) * 16, v + (size_t)rr * NV * DV + hv * DV + y0 + (u - 64) * 4);
++            else cp8(d + (2 * DK + ROWS) * 4, gb + ((size_t)rr * NV + hv) * 2);
+         }
+         asm volatile("cp.async.commit_group;\n" ::);
+     };
+@@ -69,8 +72,8 @@ __device__ __forceinline__ void chain(const float* __restrict__ qn, const float*
+         const int r0 = bi * STEPS, n = min(STEPS, rows - r0);
+         for (int rr = 0; rr < n; ++rr) {
+             const unsigned char* d = base + rr * S::ROW;
+-            const float vv = reinterpret_cast<const float*>(d + 2 * DK * 4)[row];
+-            const float2 gbv = *reinterpret_cast<const float2*>(d + (2 * DK + DV) * 4);
++            const float vv = reinterpret_cast<const float*>(d + 2 * DK * 4)[lr];
++            const float2 gbv = *reinterpret_cast<const float2*>(d + (2 * DK + ROWS) * 4);
+             const float g = gbv.x, beta = gbv.y;
+             float x[L];
+             float4 kr[KREG ? L : 1];
+@@ -103,6 +106,16 @@ __device__ __forceinline__ void chain(const float* __restrict__ qn, const float*
+                 x[l] = o;
+             }
+             const float o = bf(tree<TPR>(x));
++            if constexpr (CUTS) {  // a prompt cache mark inside the pass: the state after row cut - 1
++                const int done = r0 + rr + 1;
++                if (done == cut0 || done == cut1) {
++                    float* cs_out = done == cut0 ? cut0_state : cut1_state;
++#pragma unroll
++                    for (int l = 0; l < L; ++l)
++#pragma unroll
++                        for (int i = 0; i < 4; ++i) cs_out[sbase + (l * TPR + t) * 4 + i] = s[l][i];
++                }
++            }
+             if (t == 0) ys_out[((size_t)(r0 + rr) * NV + hv) * DV + row] = o;
+         }
+         __syncthreads();
+@@ -127,3 +140,32 @@ extern "C" __global__ void __launch_bounds__(256) fn_gdn_chain_tpr_h8(const floa
+                                                                     float* state_out, int rows, float* ys_out) {
+     gdn_tpr::chain<8, 24, 2, 16>(qn, kn, v, gb, state_in, state_out, rows, ys_out);
+ }
++
++// fn_gdn_chain_tpr's rows over a grid (value head, slice): ROWS state rows a block, TPR threads a row (the same bits)
++namespace gdn_split {
++constexpr int TPR = 8, ROWS = 64, STEPS = 16, THREADS = ROWS * TPR;
++template <int NK, int NV>
++__device__ __forceinline__ void run(const float* qn, const float* kn, const float* v, const float* gb, const float* state_in,
++                                    float* state_out, int rows, float* ys_out, int cut0, float* cut0_state, int cut1,
++                                    float* cut1_state) {
++    if (cut0 == 0 && cut1 == 0)
++        gdn_tpr::chain<NK, NV, TPR, STEPS, ROWS, false>(qn, kn, v, gb, state_in, state_out, rows, ys_out);
++    else
++        gdn_tpr::chain<NK, NV, TPR, STEPS, ROWS, true>(qn, kn, v, gb, state_in, state_out, rows, ys_out, cut0, cut0_state,
++                                                       cut1, cut1_state);
++}
++}  // namespace gdn_split
++
++// The prompt chain on grid (48, 128 / ROWS): fn_gdn_chain_tpr's bytes, and the state after two cache marks (0: none).
++extern "C" __global__ void __launch_bounds__(gdn_split::THREADS) fn_gdn_chain_split(
++        const float* qn, const float* kn, const float* v, const float* gb, const float* state_in, float* state_out, int rows,
++        float* ys_out, int cut0, float* cut0_state, int cut1, float* cut1_state) {
++    gdn_split::run<16, 48>(qn, kn, v, gb, state_in, state_out, rows, ys_out, cut0, cut0_state, cut1, cut1_state);
++}
++
++// fn_gdn_chain_split on one rank's 8 key and 24 value heads (a rank's half set never cuts).
++extern "C" __global__ void __launch_bounds__(gdn_split::THREADS) fn_gdn_chain_split_h8(
++        const float* qn, const float* kn, const float* v, const float* gb, const float* state_in, float* state_out, int rows,
++        float* ys_out) {
++    gdn_split::run<8, 24>(qn, kn, v, gb, state_in, state_out, rows, ys_out, 0, nullptr, 0, nullptr);
++}
+diff --git a/zig/src/core/contract/flashnext_split_records.zig b/zig/src/core/contract/flashnext_split_records.zig
+new file mode 100644
+index 000000000..69d458559
+--- /dev/null
++++ b/zig/src/core/contract/flashnext_split_records.zig
+@@ -0,0 +1,32 @@
++//! Flash Next's split prompt chain (each value head's state rows over two blocks), nvcc 13.0's usage on every SM.
++const registry = @import("registry.zig");
++
++/// nvcc 13.0's usage (kernel-contract-limits on a GB10); later compilers' sets are pending.
++pub const records = [_]registry.CudaRecord{
++    .{ .launch = .{ .name = "flashnext_batch fn_gdn_chain_split", .symbol = "fn_gdn_chain_split", .image = "flashnext_batch", .threads = 512, .dynamic = 41472 }, .usage = .{
++        .{ .regs = 60, .static = 0, .bound = 512 },
++        .{ .regs = 64, .static = 0, .bound = 512 },
++        .{ .regs = 64, .static = 0, .bound = 512 },
++        .{ .regs = 64, .static = 0, .bound = 512 },
++        .{ .regs = 64, .static = 0, .bound = 512 },
++    }, .later_pending = true },
++    .{ .launch = .{ .name = "flashnext_batch fn_gdn_chain_split_h8", .symbol = "fn_gdn_chain_split_h8", .image = "flashnext_batch", .threads = 512, .dynamic = 41472 }, .usage = .{
++        .{ .regs = 60, .static = 0, .bound = 512 },
++        .{ .regs = 59, .static = 0, .bound = 512 },
++        .{ .regs = 59, .static = 0, .bound = 512 },
++        .{ .regs = 64, .static = 0, .bound = 512 },
++        .{ .regs = 64, .static = 0, .bound = 512 },
++    }, .later_pending = true },
++};
++
++test "Flash Next split chain: measured on every SM, within its limits, launched as the pass launches it" {
++    const std = @import("std");
++    const t = std.testing;
++    const split = 64 * 8; // gdn_split::ROWS x TPR, cuda_gdn_fused.zig's split_threads
++    try t.expectEqual(@as(usize, 0), try registry.checkCuda(t.allocator, &records, false));
++    for (records) |r| {
++        try t.expect(r.usage[0].regs != 0 and r.later_pending);
++        try t.expectEqual(@as(u32, split), r.launch.threads);
++        try t.expectEqual(@as(u32, 2 * 16 * ((2 * 128 + 64) * 4 + 16)), r.launch.dynamic);
++    }
++}
+diff --git a/zig/src/core/contract/registry_joins.zig b/zig/src/core/contract/registry_joins.zig
+index d3e87f5b2..433c7f6aa 100644
+--- a/zig/src/core/contract/registry_joins.zig
++++ b/zig/src/core/contract/registry_joins.zig
+@@ -106,6 +106,7 @@ pub const landed_cuda = registry.cuda ++ @import("muse_cuda_records.zig").cuda +
+     @import("proposal_sampling_records.zig").records ++
+     @import("flashnext_pages_pending.zig").records ++
+     @import("flashnext_heads_records.zig").records ++
++    @import("flashnext_split_records.zig").records ++
+     @import("glm_f32w_pending.zig").records ++
+     @import("penalty_sampling_records.zig").records ++
+     @import("flashnext_attn_lanes_pending.zig").records ++
+diff --git a/zig/src/core/contract/registry_pending_test.zig b/zig/src/core/contract/registry_pending_test.zig
+index 26d0a9a4c..7087d9b46 100644
+--- a/zig/src/core/contract/registry_pending_test.zig
++++ b/zig/src/core/contract/registry_pending_test.zig
+@@ -75,6 +75,7 @@ test "targeted CUDA launches still refuse every missing applicable receipt" {
+ 
+ test {
+     _ = @import("flashnext_heads_records.zig"); // its own test: the TP=2 DeltaNet twins' records
++    _ = @import("flashnext_split_records.zig"); // its own test: the split prompt chain's records
+     _ = @import("moetile_records.zig"); // its own test: the shared down's slot-output entries
+     _ = @import("qmmf_prompt_records.zig"); // its own test: the 128-row BF16 prompt entries
+ }
+diff --git a/zig/src/families/flashnext/cuda_batch.zig b/zig/src/families/flashnext/cuda_batch.zig
+index bbdcb150f..914ad8820 100644
+--- a/zig/src/families/flashnext/cuda_batch.zig
++++ b/zig/src/families/flashnext/cuda_batch.zig
+@@ -264,7 +264,9 @@ pub fn Pass(comptime Tri: type) type {
+                 // the three in one kernel a value head: the same per-row op sequences, no fp32 rows through memory
+                 const st = self.seq.state[li].ptr;
+                 const in: gdn_fused.In = .{ .proj = s.proj, .conv = self.seq.conv[li].ptr, .cw = lw.cw.ptr, .a_log = lw.a_log.ptr, .dt = lw.dt.ptr, .state = st, .state_out = if (keep.state_out != 0) keep.state_out else st, .norm = lw.norm.ptr, .heads = h, .cuts = cuts };
+-                try gdn_fused.launch(g.fused, self.stream, in, n, s.gout, s.gxs);
++                if (gdn_fused.splitOn(self.k.forms.sms, h)) {
++                    try gdn_fused.split(g, self.stream, in, n, .{ .q = s.gq, .k = s.gk, .v = s.gv, .gb = s.ggb, .ys = s.ys }, s.gout, s.gxs);
++                } else try gdn_fused.launch(g.fused, self.stream, in, n, s.gout, s.gxs);
+             } else if (self.lanes.len == 0 and keep.log != 0) {
+                 // pending rows (one GPU, whole heads: --tp refuses them): the window goes into the log after them
+                 try late.front(self.k, self.stream, lw, s.proj, self.seq.conv[li].ptr, n, s.gq, keep);
+diff --git a/zig/src/families/flashnext/cuda_batch_kernels.zig b/zig/src/families/flashnext/cuda_batch_kernels.zig
+index 186504e1d..e71b1b3b3 100644
+--- a/zig/src/families/flashnext/cuda_batch_kernels.zig
++++ b/zig/src/families/flashnext/cuda_batch_kernels.zig
+@@ -8,6 +8,7 @@ const qmm_smem = state.qmm_smem;
+ const chain_tpr_smem = state.chain_tpr_smem;
+ const gdn_fused_smem = state.gdn_fused_smem;
+ const Heads = @import("cuda_heads.zig").Heads;
++const gdn_fused = @import("cuda_gdn_fused.zig");
+ 
+ /// The DeltaNet kernels of one head geometry: the full heads', or their `_h8` twins' (8 key and 24 value heads).
+ pub const Gdn = struct {
+@@ -18,10 +19,12 @@ pub const Gdn = struct {
+     /// front + chain + gated norm in one kernel a value head (prompt passes of 64 rows or more).
+     fused: cuda.Function,
+     norm: cuda.Function,
++    /// fused's chain with each value head's state rows over several blocks (fn_gdn_front and fn_gdn_norm around it).
++    split: cuda.Function,
+ 
+     /// The entry point of `field` for the full heads (suffix "") or a twin set (suffix "_h8").
+     pub fn symbol(comptime field: []const u8, comptime suffix: [:0]const u8) [:0]const u8 {
+-        const names = .{ .front = "fn_gdn_front", .chain = "fn_gdn_rows", .chain_to = "fn_gdn_rows_to", .chain_tpr = "fn_gdn_chain_tpr", .fused = "fn_gdn_fused", .norm = "fn_gdn_norm" };
++        const names = .{ .front = "fn_gdn_front", .chain = "fn_gdn_rows", .chain_to = "fn_gdn_rows_to", .chain_tpr = "fn_gdn_chain_tpr", .fused = "fn_gdn_fused", .norm = "fn_gdn_norm", .split = "fn_gdn_chain_split" };
+         return @field(names, field) ++ suffix;
+     }
+ 
+@@ -30,6 +33,7 @@ pub const Gdn = struct {
+         inline for (@typeInfo(Gdn).@"struct".field_names) |name| @field(g, name) = try m.function(symbol(name, suffix));
+         try g.chain_tpr.allowDynamicShared(chain_tpr_smem);
+         try g.fused.allowDynamicShared(gdn_fused_smem);
++        try g.split.allowDynamicShared(gdn_fused.split_smem);
+         return g;
+     }
+ };
+@@ -37,6 +41,7 @@ pub const Gdn = struct {
+ /// The prompt pass's kernel forms, each switch read once at load: the pass and the disk key read these.
+ pub const Forms = struct {
+     gdn_fused: bool = true, // TF_FLASHNEXT_GDN_FUSED
++    sms: u32 = 0, // the device's multiprocessors: the fused block's passes split their chains on enough (splitOn)
+     hc_fuse: bool = true, // TF_FLASHNEXT_HC_FUSE
+     in_pass: bool = true, // TF_FLASHNEXT_KEEP_INPASS
+     readout_rows: usize = 64, // TF_FLASHNEXT_READOUT_ROWS (maxInt: never)
+@@ -45,7 +50,7 @@ pub const Forms = struct {
+ 
+     pub fn resolve() Forms {
+         return .{
+-            .gdn_fused = @import("cuda_gdn_fused.zig").on(),
++            .gdn_fused = gdn_fused.on(),
+             .hc_fuse = @import("cuda_batch_hc.zig").on(),
+             .in_pass = @import("cuda_lanes_snap.zig").keepInPass(),
+             .readout_rows = @import("cuda_chunk.zig").readoutTileRows(),
+@@ -125,6 +130,7 @@ pub const Kernels = struct {
+         var sms: c_int = 0;
+         try d.check(d.api.cuDeviceGet(&device, 0), "cuDeviceGet");
+         try d.check(d.api.cuDeviceGetAttribute(&sms, .multiprocessor_count, device), "cuDeviceGetAttribute");
++        k.forms.sms = @intCast(sms);
+         k.nvfp4 = try cuda.experts.Nvfp4Experts.load(d, @intCast(sms));
+         errdefer k.nvfp4.unload();
+         k.fp8 = try cuda.experts.Fp8Experts.load(d, @intCast(sms));
+@@ -184,7 +190,7 @@ pub const Kernels = struct {
+ };
+ 
+ test "a split layer's DeltaNet launches, the rollback replay's front and chain too, take the _h8 twins; a whole one today's" {
+-    const want = [_][:0]const u8{ "fn_gdn_front_h8", "fn_gdn_rows_h8", "fn_gdn_rows_to_h8", "fn_gdn_chain_tpr_h8", "fn_gdn_fused_h8", "fn_gdn_norm_h8" };
++    const want = [_][:0]const u8{ "fn_gdn_front_h8", "fn_gdn_rows_h8", "fn_gdn_rows_to_h8", "fn_gdn_chain_tpr_h8", "fn_gdn_fused_h8", "fn_gdn_norm_h8", "fn_gdn_chain_split_h8" };
+     const names = @typeInfo(Gdn).@"struct".field_names;
+     inline for (names, want) |field, name| {
+         try std.testing.expectEqualStrings(name, Gdn.symbol(field, "_h8"));
+diff --git a/zig/src/families/flashnext/cuda_gdn_fused.zig b/zig/src/families/flashnext/cuda_gdn_fused.zig
+index 5ca64e382..c46d4fc7d 100644
+--- a/zig/src/families/flashnext/cuda_gdn_fused.zig
++++ b/zig/src/families/flashnext/cuda_gdn_fused.zig
+@@ -1,10 +1,11 @@
+-//! The prompt GDN block's launches: fn_gdn_fused (front, chain, gated norm in one kernel a value head), the gated norm.
++//! The prompt GDN block's launches: fn_gdn_fused (front, chain, gated norm in one kernel a value head), its split form.
+ const std = @import("std");
+ const cuda = @import("cuda");
+ const gdn = @import("cuda_gdn.zig");
+ const Heads = @import("cuda_heads.zig").Heads;
+ const parts = @import("cuda_batch_state.zig");
+ const eps = @import("cuda_prompt_wt.zig").eps;
++const Gdn = @import("cuda_batch_kernels.zig").Gdn;
+ 
+ /// One kernel a value head for a lone stream's pass, unless TF_FLASHNEXT_GDN_FUSED=0 (three launches, the same bits).
+ pub fn on() bool {
+@@ -43,3 +44,47 @@ pub fn norm(f: cuda.Function, stream: cuda.Stream, ys: u64, proj: u64, norm_w: u
+     for ([_]u64{ out, xs }) |v| b.add(v);
+     try cuda.launch.launch(f, .{ .grid = .{ .x = @intCast(rows), .y = heads.nv }, .block = .{ .x = gdn.dv } }, stream, &b);
+ }
++
++/// fn_gdn_chain_split's state rows a block (gdn_split::ROWS) and threads a row (gdn_split::TPR).
++pub const split_rows: u32 = 64;
++pub const split_tpr: u32 = 8;
++pub const split_threads: u32 = split_rows * split_tpr;
++/// fn_gdn_chain_split's staged rows: 2 x 16 steps of q, k (128 fp32 each), its v rows, g and beta.
++pub const split_smem: u32 = 2 * 16 * ((2 * 128 + split_rows) * 4 + 16);
++
++/// Whether a pass on heads h splits each head's state rows over blocks: when every block has an SM of its own.
++pub fn splitOn(sms: u32, h: Heads) bool {
++    return sms >= h.nv * (gdn.dv / split_rows);
++}
++
++/// The unfused rows the split form passes through memory: fn_gdn_front's outputs and the chain's readouts.
++pub const Rows = struct { q: u64, k: u64, v: u64, gb: u64, ys: u64 };
++
++/// The split form of `launch`: fn_gdn_front, fn_gdn_chain_split (marks included) and fn_gdn_norm, launch's bits.
++pub fn split(g: *const Gdn, stream: cuda.Stream, in: In, rows: usize, r: Rows, out: u64, xs: u64) !void {
++    const h = in.heads;
++    var f: cuda.Args = .{};
++    for ([_]u64{ in.proj, in.conv, in.cw, in.a_log, in.dt, r.q, r.k, r.v, r.gb }) |v| f.add(v);
++    try cuda.launch.launch(g.front, .{ .grid = .{ .x = @intCast(rows), .y = h.nk + h.nv }, .block = .{ .x = 256 } }, stream, &f);
++    var a: cuda.Args = .{};
++    for ([_]u64{ r.q, r.k, r.v, r.gb, in.state, in.state_out }) |v| a.add(v);
++    a.add(@as(c_int, @intCast(rows)));
++    a.add(r.ys);
++    // the marks run with whole heads only: a rank's half set (fn_gdn_chain_split_h8) takes none
++    std.debug.assert(h.nv == gdn.nv or (in.cuts[0].row == 0 and in.cuts[1].row == 0));
++    if (h.nv == gdn.nv) for (in.cuts) |c| {
++        a.add(@as(c_int, @intCast(c.row)));
++        a.add(c.state);
++    };
++    const grid: cuda.launch.Dim3 = .{ .x = h.nv, .y = @as(u32, @intCast(gdn.dv)) / split_rows };
++    try cuda.launch.launch(g.split, .{ .grid = grid, .block = .{ .x = split_threads }, .shared = split_smem }, stream, &a);
++    try norm(g.norm, stream, r.ys, in.proj, in.norm, out, xs, rows, h);
++}
++
++test "the split chain runs where each of its blocks has an SM: a GB10's rank halves, every head set on 188 SMs" {
++    try std.testing.expect(!splitOn(48, .full));
++    try std.testing.expect(splitOn(48, .half));
++    try std.testing.expect(splitOn(96, .full));
++    try std.testing.expect(splitOn(188, .full) and splitOn(188, .half));
++    try std.testing.expect(!splitOn(40, .half));
++}
+diff --git a/zig/src/families/flashnext/cuda_launch.zig b/zig/src/families/flashnext/cuda_launch.zig
+index f17675e95..de97f5f9e 100644
+--- a/zig/src/families/flashnext/cuda_launch.zig
++++ b/zig/src/families/flashnext/cuda_launch.zig
+@@ -31,6 +31,8 @@ pub const tile_kernels = @import("cuda_tile_kernels.zig");
+ pub const tiles = @import("cuda_tiles.zig");
+ pub const readout_fused = @import("readout_fused.zig");
+ pub const gdn = @import("cuda_gdn.zig");
++/// The prompt GDN block's launches and its split chain's sizes, which flashnext-gdn-split-contract launches.
++pub const gdn_fused = @import("cuda_gdn_fused.zig");
+ pub const mlp = @import("cuda_mlp.zig");
+ pub const moe = @import("cuda_moe.zig");
+ pub const attn = @import("cuda_attn.zig");
+diff --git a/zig/tests/cuda/contract_flashnext_groups.zig b/zig/tests/cuda/contract_flashnext_groups.zig
+index 8b8dbe34d..690991fdf 100644
+--- a/zig/tests/cuda/contract_flashnext_groups.zig
++++ b/zig/tests/cuda/contract_flashnext_groups.zig
+@@ -6,6 +6,7 @@ const flash = @import("flashnext");
+ const check = @import("check.zig");
+ const glue_k = @import("contract_flashnext_glue.zig");
+ const heads_k = @import("contract_flashnext_heads.zig");
++const split_k = @import("contract_flashnext_split.zig");
+ const Columns = @import("contract_flashnext_columns.zig").Columns;
+ const lay = @import("flashnext_gdn_heads.zig");
+ 
+@@ -22,6 +23,7 @@ pub const Set = struct {
+     ranks: [std.enums.values(heads_k.Kind).len * 2]heads_k.Rank = undefined,
+     n_ranks: usize = 0,
+     columns: [4]Columns = undefined,
++    split: ?split_k.Set = null,
+     n_columns: usize = 0,
+ 
+     /// Every registration onto `kernels`, from the flashnext_batch, flashnext_attn and flashnext_hcf images.
+@@ -54,6 +56,8 @@ pub const Set = struct {
+             self.n_ranks += 1;
+         };
+         for (&self.ranks) |*m| try kernels.append(a, m.kernel());
++        self.split = .{};
++        try self.split.?.add(gpu, s, batch, kernels);
+         for (&self.columns, 0..) |*m, i| {
+             m.* = .{ .rig = .{ .gpu = gpu, .s = s }, .f = try batch.function("fn_copy_cols"), .slot = i % 2 == 1, .control = i >= 2 };
+             self.n_columns += 1;
+@@ -62,6 +66,7 @@ pub const Set = struct {
+     }
+ 
+     pub fn deinit(self: *Set) void {
++        if (self.split) |*x| x.deinit();
+         for (self.columns[0..self.n_columns]) |*m| m.deinit();
+         for (self.ranks[0..self.n_ranks]) |*m| m.deinit();
+         for (self.glues[0..self.n_glues]) |*m| m.deinit();
+diff --git a/zig/tests/cuda/contract_flashnext_split.zig b/zig/tests/cuda/contract_flashnext_split.zig
+new file mode 100644
+index 000000000..57098a591
+--- /dev/null
++++ b/zig/tests/cuda/contract_flashnext_split.zig
+@@ -0,0 +1,273 @@
++//! Flash Next's split prompt chain: fn_gdn_chain_split's readouts, state and marks' states equal fn_gdn_chain_tpr's.
++const std = @import("std");
++const cuda = @import("cuda");
++const core = @import("core");
++const flash = @import("flashnext");
++const check = @import("check.zig");
++const rig_ = @import("contract_rig.zig");
++
++const c = core.contract.spec;
++const g = core.contract.gates;
++const parts = flash.batch_state;
++const split = flash.gdn_fused;
++const Heads = flash.Heads;
++const dk = 128;
++const dv = 128;
++const slice = split.split_rows * dk; // the state floats one block holds
++
++/// The whole layer's split chain, a rank's twin, and two planted controls on the whole layer's kernel.
++pub const Kind = enum {
++    full,
++    half,
++    /// The split launched one slice short: each head's last state rows are never stepped.
++    short,
++    /// The split reading its neighbour slice's state: state_in moved one slice on.
++    neighbour,
++
++    fn heads(k: Kind) Heads {
++        return if (k == .half) .half else .full;
++    }
++};
++
++fn noSums(_: c.Shape) usize {
++    return 0;
++}
++
++/// The fused dispatch seam, the default chunk and the most a chunk may ask for, on the heads `h`.
++fn served(comptime h: Heads) [3]c.Shape {
++    return .{
++        .{ .rows = 64, .n = h.nv * dv, .k = dk },
++        .{ .rows = parts.default_chunk, .n = h.nv * dv, .k = dk },
++        .{ .rows = parts.max_chunk, .n = h.nv * dv, .k = dk },
++    };
++}
++const full_served = served(.full);
++const half_served = served(.half);
++
++pub fn spec(kind: Kind) c.Spec {
++    const name = switch (kind) {
++        .full => "cuda flashnext DeltaNet prompt chain fn_gdn_chain_split (each value head over 2 blocks)",
++        .half => "cuda flashnext DeltaNet prompt chain fn_gdn_chain_split_h8 on a rank's 24 value heads",
++        .short => "control: fn_gdn_chain_split launched one slice short",
++        .neighbour => "control: fn_gdn_chain_split reading the neighbour slice's state",
++    };
++    const stated = "ys, the state and on even row counts two cache marks' states bit-equal to fn_gdn_chain_tpr's, non-finite inputs included";
++    return .{ .name = name, .accum = .none, .depth = noSums, .out = .raw, .nan = .{ .stated = stated }, .replaces = if (kind == .half) "fn_gdn_chain_tpr_h8" else "fn_gdn_chain_tpr", .tiles = .{ .{ .size = 16 }, .{}, .{} }, .served = if (kind == .half) &half_served else &full_served };
++}
++
++/// Two cache marks on an even row count (after its middle and last rows); an odd count runs without marks (0: none).
++fn cutRows(rows: usize) [2]usize {
++    return if (rows % 2 == 0) .{ rows / 2, rows } else .{ 0, 0 };
++}
++
++pub const Fns = struct { split: cuda.Function, split_h8: cuda.Function, tpr: cuda.Function, tpr_h8: cuda.Function };
++
++pub fn load(batch: cuda.Module) !Fns {
++    const f: Fns = .{
++        .split = try batch.function("fn_gdn_chain_split"),
++        .split_h8 = try batch.function("fn_gdn_chain_split_h8"),
++        .tpr = try batch.function("fn_gdn_chain_tpr"),
++        .tpr_h8 = try batch.function("fn_gdn_chain_tpr_h8"),
++    };
++    try f.split.allowDynamicShared(split.split_smem);
++    try f.split_h8.allowDynamicShared(split.split_smem);
++    try f.tpr.allowDynamicShared(parts.chain_tpr_smem);
++    try f.tpr_h8.allowDynamicShared(parts.chain_tpr_smem);
++    return f;
++}
++
++pub const Split = struct {
++    rig: rig_.Rig,
++    kind: Kind,
++    f: *const Fns,
++    rows: usize = 0,
++    /// qn, kn, v, gb and the state; the neighbour control's state holds one more slice past the last head.
++    ins: [5]u64 = @splat(0),
++    outs: [4]u64 = @splat(0),
++    lens: [4]usize = @splat(0),
++    nout: usize = 0,
++    base: u64 = 0,
++    ys: u64 = 0,
++    seen: std.ArrayList(u8) = .empty,
++    msg: [160]u8 = undefined,
++
++    pub fn deinit(self: *Split) void {
++        self.seen.deinit(self.rig.gpu.gpa);
++        self.rig.deinit();
++    }
++
++    pub fn kernel(self: *Split) g.Kernel {
++        const control: ?g.Gate = switch (self.kind) {
++            .short, .neighbour => .shapes,
++            else => null,
++        };
++        return .{ .spec = spec(self.kind), .ctx = self, .vt = &vt, .control = control };
++    }
++
++    const vt = g.hooks(Split);
++
++    fn f32s(self: *Split, n: usize, r: std.Random, lo: f32, hi: f32) ![]f32 {
++        const v = try self.rig.gpu.gpa.alloc(f32, n);
++        for (v) |*x| x.* = lo + r.float(f32) * (hi - lo);
++        return v;
++    }
++
++    pub fn prepare(self: *Split, shape: c.Shape, fill: g.Fill, seed: u64) !bool {
++        self.rig.reset();
++        self.nout = 0;
++        self.rows = shape.rows;
++        const h = self.kind.heads();
++        if (shape.rows == 0 or shape.n != h.nv * dv or shape.k != dk) return false;
++        var prng = std.Random.DefaultPrng.init(seed ^ 0x73706c6974);
++        const r = prng.random();
++        const a = self.rig.gpu.gpa;
++        const m = shape.rows;
++        const qn = try self.f32s(m * h.nk * dk, r, -0.1, 0.1);
++        defer a.free(qn);
++        const kn = try self.f32s(m * h.nk * dk, r, -0.1, 0.1);
++        defer a.free(kn);
++        const v = try self.f32s(m * h.nv * dv, r, -1, 1);
++        defer a.free(v);
++        const gb = try self.f32s(m * h.nv * 2, r, 0, 1);
++        defer a.free(gb);
++        for (0..m * h.nv) |i| gb[2 * i] = -gb[2 * i]; // a log decay, then beta in (0, 1)
++        const st = try self.f32s(h.nv * dv * dk + slice, r, -0.5, 0.5);
++        defer a.free(st);
++        if (fill == .nonfinite) {
++            qn[3] = std.math.nan(f32);
++            v[(m / 2) * h.nv * dv + 5] = std.math.inf(f32);
++            v[(m - 1) * h.nv * dv + dv - 1] = -std.math.inf(f32); // a head's last state row: its last slice
++            st[dv * dk + 7] = -std.math.inf(f32);
++        }
++        for ([_][]const f32{ qn, kn, v, gb }, 0..) |x, i| self.ins[i] = try self.rig.input(std.mem.sliceAsBytes(x));
++        self.ins[4] = try self.rig.input(std.mem.sliceAsBytes(st[0 .. h.nv * dv * dk + if (self.kind == .neighbour) slice else 0]));
++        for ([_]usize{ m * h.nv * dv * 4, h.nv * dv * dk * 4 }) |len| try self.out(len);
++        if (cutRows(m)[0] != 0 and h.nv == Heads.full.nv) for (0..2) |_| try self.out(h.nv * dv * dk * 4);
++        var total: usize = 0;
++        for (self.lens[0..self.nout]) |l| total += l;
++        self.base = try self.rig.scratch(total);
++        self.ys = try self.rig.scratch(m * h.nv * dv * 4);
++        return true;
++    }
++
++    fn out(self: *Split, len: usize) !void {
++        self.outs[self.nout] = try self.rig.output(len);
++        self.lens[self.nout] = len;
++        self.nout += 1;
++    }
++
++    /// The split as the pass launches it (each control with its planted fault), into `o`.
++    fn ours(self: *Split, o: []const u64) !void {
++        const h = self.kind.heads();
++        var a: cuda.Args = .{};
++        const moved: u64 = if (self.kind == .neighbour) slice * 4 else 0;
++        for ([_]u64{ self.ins[0], self.ins[1], self.ins[2], self.ins[3], self.ins[4] + moved, o[1] }) |x| a.add(x);
++        a.add(@as(c_int, @intCast(self.rows)));
++        a.add(o[0]);
++        if (self.kind != .half) for (cutRows(self.rows), 0..) |at, i| {
++            a.add(@as(c_int, @intCast(at)));
++            a.add(if (at == 0) 0 else o[2 + i]);
++        };
++        const slices: u32 = dv / split.split_rows - @intFromBool(self.kind == .short);
++        const f = if (self.kind == .half) self.f.split_h8 else self.f.split;
++        try cuda.launch.launch(f, .{ .grid = .{ .x = h.nv, .y = slices }, .block = .{ .x = split.split_threads }, .shared = split.split_smem }, self.rig.s, &a);
++    }
++
++    /// fn_gdn_chain_tpr over `rows` rows from the state in: the state into `st`, the readouts into `ys`.
++    fn tpr(self: *Split, rows: usize, st: u64, ys: u64) !void {
++        const h = self.kind.heads();
++        var a: cuda.Args = .{};
++        for ([_]u64{ self.ins[0], self.ins[1], self.ins[2], self.ins[3], self.ins[4], st }) |x| a.add(x);
++        a.add(@as(c_int, @intCast(rows)));
++        a.add(ys);
++        const f = if (self.kind == .half) self.f.tpr_h8 else self.f.tpr;
++        try cuda.launch.launch(f, .{ .grid = .{ .x = h.nv }, .block = .{ .x = 256 }, .shared = parts.chain_tpr_smem }, self.rig.s, &a);
++    }
++
++    /// The replaced chain over the rows into `o`, and over each mark's rows into its state.
++    fn theirs(self: *Split, o: []const u64) !void {
++        try self.tpr(self.rows, o[1], o[0]);
++        if (o.len == 4) for (cutRows(self.rows), 0..) |at, i| try self.tpr(at, o[2 + i], self.ys);
++    }
++
++    pub fn run(self: *Split) !void {
++        try self.ours(self.outs[0..self.nout]);
++        try self.rig.s.synchronize();
++    }
++
++    /// The replaced chain's bytes in the outputs' layout, back to back, its scratch poisoned (0xff) first.
++    fn baseline(self: *Split) ![]const u8 {
++        var at = self.base;
++        var o: [4]u64 = undefined;
++        for (self.lens[0..self.nout], 0..) |l, i| {
++            o[i] = at;
++            at += l;
++        }
++        const total = at - self.base;
++        const ff = try self.rig.gpu.gpa.alloc(u8, total);
++        defer self.rig.gpu.gpa.free(ff);
++        @memset(ff, 0xff);
++        const b: cuda.DeviceBuffer = .{ .d = self.rig.gpu.d, .ptr = self.base, .len = total };
++        try b.upload(0, ff);
++        try self.theirs(o[0..self.nout]);
++        try self.rig.s.synchronize();
++        return self.rig.bytes(self.base, total);
++    }
++
++    pub fn replaced(self: *Split) ![]const u8 {
++        return self.baseline();
++    }
++
++    /// Gate 1's stated rule: the outputs on the planted inputs equal fn_gdn_chain_tpr's bytes.
++    pub fn check(self: *Split, gate: g.Gate) !?[]const u8 {
++        _ = gate;
++        self.seen.clearRetainingCapacity();
++        try self.seen.appendSlice(self.rig.gpu.gpa, try self.rig.outputBytes());
++        const want = try self.baseline();
++        if (std.mem.eql(u8, self.seen.items, want)) return null;
++        return try std.fmt.bufPrint(&self.msg, "bytes differ from fn_gdn_chain_tpr's from byte {d}", .{std.mem.indexOfDiff(u8, self.seen.items, want).?});
++    }
++
++    pub fn count(self: *Split) usize {
++        var total: usize = 0;
++        for (self.lens[0..self.nout]) |l| total += l;
++        return total;
++    }
++
++    pub fn reference(_: *Split, _: []f64, _: []f64) !void {
++        return error.NoFloat64Reference;
++    }
++};
++
++/// The four registrations, owned so their contexts outlive the run.
++pub const Set = struct {
++    fns: Fns = undefined,
++    splits: [std.enums.values(Kind).len]Split = undefined,
++
++    pub fn add(self: *Set, gpu: check.Gpu, s: cuda.Stream, batch: cuda.Module, kernels: *std.ArrayList(g.Kernel)) !void {
++        self.fns = try load(batch);
++        for (std.enums.values(Kind), &self.splits) |kind, *m| m.* = .{ .rig = .{ .gpu = gpu, .s = s }, .kind = kind, .f = &self.fns };
++        for (&self.splits) |*m| try kernels.append(gpu.gpa, m.kernel());
++    }
++
++    pub fn deinit(self: *Set) void {
++        for (&self.splits) |*m| m.deinit();
++    }
++};
++
++/// Gates 1-4 on both split chains and both planted controls (flashnext-gdn-split-contract).
++pub fn run(gpu: check.Gpu) !void {
++    var stream = try cuda.Stream.init(gpu.d, false);
++    defer stream.deinit();
++    var batch = try cuda.Module.load(gpu.d, cuda.kernels.flashnext_batch);
++    defer batch.unload();
++    var kernels: std.ArrayList(g.Kernel) = .empty;
++    defer kernels.deinit(gpu.gpa);
++    var set: Set = .{};
++    try set.add(gpu, stream, batch, &kernels);
++    defer set.deinit();
++    var tally: g.Tally = .{};
++    try g.runAll(gpu.gpa, kernels.items, 0x73706c, &tally);
++    std.debug.print("SUMMARY flashnext gdn split gates 1-4: {d} pass, {d} fail; {d} controls red, {d} missed\n", .{ tally.passed, tally.failed, tally.caught, tally.missed });
++    try check.expect(tally.problems() == 0, "flashnext gdn split contract failed", .{});
++}
+diff --git a/zig/tests/cuda/main.zig b/zig/tests/cuda/main.zig
+index 4d7287c3e..a12b0d0eb 100644
+--- a/zig/tests/cuda/main.zig
++++ b/zig/tests/cuda/main.zig
+@@ -206,6 +206,7 @@ fn run(gpu: check.Gpu, cmd: []const u8, rest: []const [:0]const u8) !void {
+         const heads = @import("flashnext_gdn_heads_tests.zig");
+         return if (rest.len == 1) heads.runBaseline(gpu, rest[0]) else heads.run(gpu);
+     }
++    if (std.mem.eql(u8, cmd, "flashnext-gdn-split-contract")) return @import("contract_flashnext_split.zig").run(gpu);
+     if (std.mem.eql(u8, cmd, "flashnext-tp-heads")) return @import("flashnext_tp_heads_tests.zig").run(gpu, try arg(rest, 0));
+     if (std.mem.eql(u8, cmd, "flashnext-pages")) return @import("contract_fn_pages.zig").run(gpu);
+     if (std.mem.eql(u8, cmd, "flashnext-attn-lanes")) return @import("contract_fn_attn_lanes.zig").run(gpu);
+diff --git a/zig/tests/cuda/main_usage.zig b/zig/tests/cuda/main_usage.zig
+index af773cba3..6c4c3e173 100644
+--- a/zig/tests/cuda/main_usage.zig
++++ b/zig/tests/cuda/main_usage.zig
+@@ -31,6 +31,7 @@ pub const usage =
+     \\  flashnext-hc              Flash Next's own hyper-connection and n-gram glue against float64 (synthetic rows)
+     \\  flashnext-attn            Flash Next's own attention glue, pooling and block scores against float64 (synthetic)
+     \\  flashnext-gdn-heads [BASELINE]  DeltaNet full/half bytes, optionally against a frozen flashnext_batch.fatbin
++    \\  flashnext-gdn-split-contract  the split prompt chain bit-equal to fn_gdn_chain_tpr (gates 1-4), both controls red
+     \\  flashnext-tp-heads MODEL  each rank's cut in-projections and attention heads equal the whole layer's bytes
+     \\  flashnext-pages           the attention glue's caches through a page table: paged == contiguous, float64, controls
+     \\  info                      driver, device and library versions
+-- 
+2.56.0
+

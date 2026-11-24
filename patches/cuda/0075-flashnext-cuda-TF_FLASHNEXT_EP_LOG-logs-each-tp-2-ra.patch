@@ -1,0 +1,251 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jay Leaton <58495321+jayleaton@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 16:23:33 +0700
+Subject: [PATCH 75/76] flashnext cuda: TF_FLASHNEXT_EP_LOG logs each --tp 2
+ rank's distinct experts and pairs a layer every 64 windows
+
+---
+ docs/environment.md                           |   1 +
+ zig/src/families/flashnext/cuda_batch.zig     |   4 +
+ zig/src/families/flashnext/cuda_ep_log.zig    | 123 ++++++++++++++++++
+ .../families/flashnext/cuda_lanes_load.zig    |   1 +
+ zig/src/platform/environment.zig              |   1 +
+ .../platform/environment_flashnext_test.zig   |   4 +-
+ zig/tests/fixtures/gradient-serving.tsv       |   2 +-
+ 7 files changed, 133 insertions(+), 3 deletions(-)
+ create mode 100644 zig/src/families/flashnext/cuda_ep_log.zig
+
+diff --git a/docs/environment.md b/docs/environment.md
+index 2ce82a437..f661618d7 100644
+--- a/docs/environment.md
++++ b/docs/environment.md
+@@ -178,6 +178,7 @@ stops the start with the variable, the supplied text and the accepted forms.
+ | `TF_FLASHNEXT_TP_WINDOW_GRAPH` | Exactly `0` or `1`; default off. `1`: at `--tp 2` the drafted verify windows run as CUDA graphs on both ranks with their collectives captured, whatever `TF_FLASHNEXT_WINDOW_GRAPH` says; `TF_FLASHNEXT_PEER_SLOTS`' epoch moves to the device so a replay advances it. Same kernels and bits as the eager pass. Give every rank the same value. |
+ | `TF_FLASHNEXT_PEER_SLOTS` | Exactly `0` or `1`; default off. At `--tp 2` on one host, a pass of up to 128 rows exchanges its MoE slots by writing each rank's own experts' rows (and its half of the shared expert's) into the peer's mapped buffer, about half the bytes of the all-reduce or reduce-scatter, with the same sums. Refused across hosts and with `TF_FLASHNEXT_DECODE_GRAPH`. Give every rank the same value. |
+ | `TF_FLASHNEXT_GATHER_SLOTS` | Exactly `0` or `1`; default off. With `TF_FLASHNEXT_PEER_SLOTS=1` at `--tp 2`, a pass of up to 128 rows moves the out projection's two gathers (each rank's heads before it, each rank's output columns after it) by writing into the peer's mapped buffer and waiting on its flag instead of NCCL: the same bytes in the same places, so the same bits. Inert without `TF_FLASHNEXT_PEER_SLOTS` and outside `--tp 2`. Give every rank the same value. |
++| `TF_FLASHNEXT_EP_LOG` | Exactly `0` or `1`; default off. `1`: at `--tp 2` each eager decode or verify window of up to 64 rows copies its layers' expert picks aside and reads them back once at its end (a sync a window); every 64 windows each rank logs the mean and p90 of the distinct routed experts it computed a layer, its pairs a layer, and the mean gap between the ranks in distinct experts and in pairs. Captured windows and prompt fills are not counted. Replies are unchanged. |
+ | `TF_FLASHNEXT_READOUT_ROWS` | Whole row count; default 64; `0` never takes the tiles |
+ | `TF_FLASHNEXT_CHUNK` | Whole prompt rows a pass, 1 through 16384; default 3072 |
+ | `TF_FLASHNEXT_PP_SPLIT` | At `--pp 2`, rank 1's first layer, 2 through 47; default 24. Rank 0 holds the layers before it, the embedding and the head. Give both ranks the same value. |
+diff --git a/zig/src/families/flashnext/cuda_batch.zig b/zig/src/families/flashnext/cuda_batch.zig
+index fc070a69f..8fde1ab71 100644
+--- a/zig/src/families/flashnext/cuda_batch.zig
++++ b/zig/src/families/flashnext/cuda_batch.zig
+@@ -18,6 +18,7 @@ const tiles = @import("cuda_tiles.zig");
+ const tk = @import("cuda_tile_kernels.zig");
+ const moe_native = @import("cuda_moe_native.zig");
+ const route_fused = @import("cuda_route_fused.zig");
++const ep_log = @import("cuda_ep_log.zig");
+ const zs = @import("cuda_zero_slice.zig");
+ const ops = @import("cuda_batch_ops.zig");
+ const split_lane = @import("cuda_split_lane.zig");
+@@ -560,10 +561,12 @@ pub fn Pass(comptime Tri: type) type {
+                     try self.readoutKeep(lw.mlp_hc, 0, n, keep.mlp_hc);
+                 }
+                 try self.moeBlockKeep(lw, keep);
++                if (ep_log.on) try ep_log.layer(self, layer);
+                 try self.moeAdds(layer, keep);
+                 self.pending = layer;
+             }
+             try stage_hop.leave(self, logits_host);
++            if (ep_log.on) try ep_log.window(self);
+         }
+ 
+         pub fn complete(self: *Self) !void {
+@@ -590,6 +593,7 @@ pub fn Pass(comptime Tri: type) type {
+ 
+ test "a pass's scratch at the default chunk stays under three gigabytes" {
+     _ = @import("cuda_paging_batch_test.zig");
++    _ = ep_log;
+     try std.testing.expect(Scratch.bytes(default_chunk, .{ .head_rows = default_chunk }) < 3 << 30);
+     try std.testing.expect(Scratch.bytes(1, .{}) < Scratch.bytes(2, .{}));
+     try std.testing.expect(Scratch.bytes(4096, .{ .lane_reduce = false }) < Scratch.bytes(4096, .{}));
+diff --git a/zig/src/families/flashnext/cuda_ep_log.zig b/zig/src/families/flashnext/cuda_ep_log.zig
+new file mode 100644
+index 000000000..24a9b8acb
+--- /dev/null
++++ b/zig/src/families/flashnext/cuda_ep_log.zig
+@@ -0,0 +1,123 @@
++//! TF_FLASHNEXT_EP_LOG: at --tp 2, the distinct routed experts and pairs each rank's experts take, a layer a window.
++const std = @import("std");
++const cuda = @import("cuda");
++const wt = @import("cuda_prompt_wt.zig");
++
++/// TF_FLASHNEXT_EP_LOG as read at load; off, no pass copies or reads anything.
++pub var on = false;
++
++pub fn enabled() !bool {
++    return @import("sys").environment.read(bool, "TF_FLASHNEXT_EP_LOG", false);
++}
++
++/// Rows a logged window holds at most (wider passes and prompt fills are left out), and windows a line sums.
++pub const max_rows: usize = 64;
++pub const every: usize = 64;
++/// Rank 1's first routed expert: each rank of --tp 2 owns half the experts in id order.
++const half = wt.experts_n / 2;
++const cells = wt.layers_n * max_rows * wt.slots;
++const top = max_rows * (wt.slots - 1);
++
++/// One layer's counts: the distinct experts and the pairs each rank's experts take.
++pub const Layer = struct { distinct: [2]u32 = .{ 0, 0 }, pairs: [2]u32 = .{ 0, 0 } };
++
++/// A row's picks (the last slot the shared expert's id) over both ranks' halves of the routed experts.
++pub fn count(picks: []const i32) Layer {
++    var seen: std.StaticBitSet(wt.experts_n) = .empty;
++    var out: Layer = .{};
++    for (picks) |p| {
++        if (p < 0 or p >= wt.experts_n) continue;
++        const e: usize = @intCast(p);
++        out.pairs[e / half] += 1;
++        if (!seen.isSet(e)) out.distinct[e / half] += 1;
++        seen.set(e);
++    }
++    return out;
++}
++
++/// Sums over `every` windows: window layers, each rank's distinct experts (and their histogram), pairs, gaps.
++pub const Stats = struct {
++    windows: usize = 0,
++    layers: u64 = 0,
++    distinct: [2]u64 = .{ 0, 0 },
++    pairs: [2]u64 = .{ 0, 0 },
++    gap_distinct: u64 = 0,
++    gap_pairs: u64 = 0,
++    hist: [2][top + 1]u32 = @splat(@splat(0)),
++
++    pub fn add(s: *Stats, l: Layer) void {
++        s.layers += 1;
++        for (0..2) |r| {
++            s.distinct[r] += l.distinct[r];
++            s.pairs[r] += l.pairs[r];
++            s.hist[r][@min(l.distinct[r], top)] += 1;
++        }
++        s.gap_distinct += @abs(@as(i64, l.distinct[0]) - l.distinct[1]);
++        s.gap_pairs += @abs(@as(i64, l.pairs[0]) - l.pairs[1]);
++    }
++
++    /// The least distinct count at or above 90% of rank `r`'s window layers.
++    pub fn p90(s: *const Stats, r: usize) usize {
++        const want = (s.layers * 9 + 9) / 10;
++        var seen: u64 = 0;
++        for (s.hist[r], 0..) |h, v| {
++            seen += h;
++            if (seen >= want) return v;
++        }
++        return top;
++    }
++
++    fn mean(s: *const Stats, v: u64) f64 {
++        return @as(f64, @floatFromInt(v)) / @as(f64, @floatFromInt(@max(s.layers, 1)));
++    }
++
++    pub fn report(s: *const Stats, rank: usize) void {
++        std.log.info("flash next: TF_FLASHNEXT_EP_LOG rank {d}: {d} windows, {d} layers: distinct experts a layer mean {d:.2} p90 {d}, pairs mean {d:.2}; |rank 0 - rank 1| distinct {d:.2}, pairs {d:.2}", .{ rank, s.windows, s.layers, s.mean(s.distinct[rank]), s.p90(rank), s.mean(s.pairs[rank]), s.mean(s.gap_distinct), s.mean(s.gap_pairs) });
++    }
++};
++
++var dev: ?cuda.DeviceBuffer = null;
++var host: [cells]i32 = undefined;
++var layers_now: usize = 0;
++var stats: Stats = .{};
++
++/// A --tp 2 decode or verify window of up to max_rows rows launched eagerly (a captured graph cannot read back).
++fn logs(pass: anytype) bool {
++    return pass.m.collective != null and !pass.hooks.prompt and !pass.staged and pass.rows <= max_rows and pass.m.layers.len <= wt.layers_n;
++}
++
++/// After layer `index`'s experts: its picks copied aside on the pass's stream, before the next layer routes.
++pub fn layer(pass: anytype, index: usize) !void {
++    if (!logs(pass) or index >= wt.layers_n) return;
++    if (dev == null) dev = try cuda.DeviceBuffer.alloc(pass.stream.d, cells * 4);
++    try pass.copy(dev.?.ptr + index * max_rows * wt.slots * 4, pass.s.picks, pass.rows * wt.slots * 4);
++    layers_now = @max(layers_now, index + 1);
++}
++
++/// After the window: its layers' picks read back once, counted, and every `every` windows one line logged.
++pub fn window(pass: anytype) !void {
++    if (!logs(pass) or layers_now == 0) return;
++    defer layers_now = 0;
++    try pass.complete();
++    const row = max_rows * wt.slots;
++    try dev.?.download(0, std.mem.sliceAsBytes(host[0 .. layers_now * row]));
++    for (0..layers_now) |l| stats.add(count(host[l * row ..][0 .. pass.rows * wt.slots]));
++    stats.windows += 1;
++    if (stats.windows < every) return;
++    stats.report(pass.m.collective.?.rank);
++    stats = .{};
++}
++
++test "each rank's distinct experts and pairs, the shared slot left out, and the p90 over window layers" {
++    const t = std.testing;
++    const shared: i32 = @intCast(wt.experts_n);
++    const l = count(&.{ 3, 3, 300, 255, 256, shared, 511, 3, 1, 2, 4, shared });
++    try t.expectEqual([2]u32{ 5, 3 }, l.distinct);
++    try t.expectEqual([2]u32{ 7, 3 }, l.pairs);
++    var s: Stats = .{};
++    for (0..10) |i| s.add(.{ .distinct = .{ @intCast(i), 4 }, .pairs = .{ 10, 6 } });
++    try t.expectEqual(@as(usize, 8), s.p90(0));
++    try t.expectEqual(@as(usize, 4), s.p90(1));
++    try t.expectEqual(@as(u64, 40), s.gap_pairs);
++    try t.expectEqual(@as(u64, 4 + 3 + 2 + 1 + 0 + 1 + 2 + 3 + 4 + 5), s.gap_distinct);
++}
+diff --git a/zig/src/families/flashnext/cuda_lanes_load.zig b/zig/src/families/flashnext/cuda_lanes_load.zig
+index 046229d1a..f63b1586c 100644
+--- a/zig/src/families/flashnext/cuda_lanes_load.zig
++++ b/zig/src/families/flashnext/cuda_lanes_load.zig
+@@ -45,6 +45,7 @@ pub fn open(comptime F: type, gpa: std.mem.Allocator, io: std.Io, ctx: *const cu
+     Draft.late_on = (Draft.lateWanted() orelse true) and late_fits;
+     // the fused router keeps every bit, so the ranks need not agree on it
+     @import("cuda_route_fused.zig").on = try @import("cuda_route_fused.zig").enabled();
++    @import("cuda_ep_log.zig").on = try @import("cuda_ep_log.zig").enabled();
+     // both ranks of --tp 2 must agree on these: the rank identity carries them
+     @import("cuda_moe_hidden_sum.zig").on = try @import("cuda_moe_hidden_sum.zig").enabled();
+     @import("cuda_owner_slots.zig").on = try @import("cuda_owner_slots.zig").enabled();
+diff --git a/zig/src/platform/environment.zig b/zig/src/platform/environment.zig
+index d8f4c7e8a..3109cc8b1 100644
+--- a/zig/src/platform/environment.zig
++++ b/zig/src/platform/environment.zig
+@@ -246,6 +246,7 @@ pub const rules = [_]Rule{
+     .{ .name = "TF_FLASHNEXT_TP_WINDOW_GRAPH", .scope = .flashnext, .kind = .flag, .forms = "0 or 1 (default 0; 1: at --tp 2 the verify windows run as graphs on both ranks); give every rank the same" },
+     .{ .name = "TF_FLASHNEXT_PEER_SLOTS", .scope = .flashnext, .kind = .flag, .forms = "0 or 1 (default 0; 1: at --tp 2 on one host the MoE exchange writes each rank's slots into the peer's mapped buffer); give every rank the same" },
+     .{ .name = "TF_FLASHNEXT_GATHER_SLOTS", .scope = .flashnext, .kind = .flag, .forms = "0 or 1 (default 0; 1: at --tp 2 with TF_FLASHNEXT_PEER_SLOTS the out projection's two gathers write into the peer's mapped buffer); give every rank the same" },
++    .{ .name = "TF_FLASHNEXT_EP_LOG", .scope = .flashnext, .kind = .flag, .forms = "0 or 1 (default 0; 1: at --tp 2 each rank logs its experts' distinct count and pairs a layer every 64 windows)" },
+     .{ .name = "TF_FLASHNEXT_SPLIT_ROWS", .scope = .flashnext, .kind = .size, .forms = "a whole row count from 0 to the native size maximum (0 or unset: one host's default; more rows a pass than this split the --tp 2 expert exchange by rows); give every rank the same" },
+     .{ .name = "TF_FLASHNEXT_READOUT_ROWS", .scope = .flashnext, .kind = .size, .forms = "a whole row count from 0 to the native size maximum (default 64; 0 never takes the tiles)" },
+     .{ .name = "TF_FLASHNEXT_CHUNK", .scope = .flashnext, .kind = .size, .min = 1, .max = 16384, .forms = "whole prompt rows a pass, 1 to 16384 (default 3072)" },
+diff --git a/zig/src/platform/environment_flashnext_test.zig b/zig/src/platform/environment_flashnext_test.zig
+index a4b6ab01a..facf94f02 100644
+--- a/zig/src/platform/environment_flashnext_test.zig
++++ b/zig/src/platform/environment_flashnext_test.zig
+@@ -33,13 +33,13 @@ fn check(name: []const u8, raw: []const u8, valid: bool) !void {
+     try t.expect(std.mem.endsWith(u8, why.?, e.rule(name).forms));
+ }
+ 
+-test "Flash Next strict env: the table holds all 56 settings: 39 switches, 12 integers, 2 reals, 3 structured" {
++test "Flash Next strict env: the table holds all 57 settings: 40 switches, 12 integers, 2 reals, 3 structured" {
+     var counts: [4]usize = @splat(0);
+     for (e.rules) |r| if (r.scope == .flashnext) {
+         try t.expect(std.mem.startsWith(u8, r.name, "TF_FLASHNEXT_"));
+         counts[@backingInt(group(r))] += 1;
+     };
+-    try t.expectEqual([4]usize{ 39, 12, 2, 3 }, counts);
++    try t.expectEqual([4]usize{ 40, 12, 2, 3 }, counts);
+ }
+ 
+ test "Flash Next strict env: unset and blank settings both read as the caller's default" {
+diff --git a/zig/tests/fixtures/gradient-serving.tsv b/zig/tests/fixtures/gradient-serving.tsv
+index abb6b55a9..d881fe06e 100644
+--- a/zig/tests/fixtures/gradient-serving.tsv
++++ b/zig/tests/fixtures/gradient-serving.tsv
+@@ -131,7 +131,7 @@ zig/src/families/flashnext/cuda_images.zig	5bd8a6c06cb69440522f4392794d9ef52b376
+ zig/src/families/flashnext/cuda_images_test.zig	49d5d97e26b5214ffe3edb12a381c84118a8bf3da255c64be8f711c7da546cc4	raw
+ zig/src/families/flashnext/cuda_lanes.zig	fa002a6c1a43e07bf96d26fd230f4dd2763999e4942402778d00e75d00a1200a	raw	main 4f6017ced (marks inside the pass), fbca90714 (shared solo-chunk rule, #2391), 80e0fd72c (#2753: non-finite draft rows refused by name; finite rows unchanged), dfd9ac5ef4 (#2585: TF_FLASHNEXT_* read through platform/environment.zig, malformed text refused at startup; valid values keep their meaning), #1953: the ladder's values through snap_intermediate, #3308 (loader host test updates the named startup-refusal expectations; no runtime edit to this pinned file); #3135 (kept_disk renamed kept_view for the shared kept image; no served change), this change (the page pool opens with the load's device and io, for its arena mapped as pages are used; a new paged stream's first prompt step waits while the arena's thread maps its pieces; paging off: unchanged); F6: block-FP8 routed experts (Qwen's FP8 release) load a rank's whole experts and are admitted at --tp 2; the NVFP4 and affine paths keep their bytes; opt-in TF_FLASHNEXT_WINDOW_PAD pads a rank-link window; the first copy window keeps 16 rows
+ zig/src/families/flashnext/cuda_lanes_admission_test.zig	0c04ca112ad39d045b320d4c190c4589523fad255ecc2bd0d0cde141ff6dc23f	raw
+-zig/src/families/flashnext/cuda_lanes_load.zig	23fe06051cf81d61d6265d895ce4d162405a8e5407375c1f43d7a498230c621e	raw	main dfd9ac5ef4 (#2585: TF_FLASHNEXT_* read through platform/environment.zig, malformed text refused at startup; valid values keep their meaning), #3467: after load a shard drops its page cache except the n-gram ranges, and the sweep reaches nested shards; tensors and replies are unchanged, this change (the load's device and io handed to the page pool's arena; paging off: unchanged); opt-in TF_FLASHNEXT_DECODE_GRAPH no longer refused with the dense split; default serving unchanged; #2972: the first collective waits up to 10 minutes for the peer's load, and a peer that leaves ends the wait within seconds; F6: block-FP8 routed experts (Qwen's FP8 release) load a rank's whole experts and are admitted at --tp 2; the NVFP4 and affine paths keep their bytes; opt-in TF_FLASHNEXT_TP_WINDOW_GRAPH: --tp 2 verify windows as graphs, the peer epoch on the device; default serving unchanged
++zig/src/families/flashnext/cuda_lanes_load.zig	65c1c9c583fbecf3ddaa1eb593d3fbea494f10c903aca9a41452fbdfd939a2bb	raw	main dfd9ac5ef4 (#2585: TF_FLASHNEXT_* read through platform/environment.zig, malformed text refused at startup; valid values keep their meaning), #3467: after load a shard drops its page cache except the n-gram ranges, and the sweep reaches nested shards; tensors and replies are unchanged, this change (the load's device and io handed to the page pool's arena; paging off: unchanged); opt-in TF_FLASHNEXT_DECODE_GRAPH no longer refused with the dense split; default serving unchanged; #2972: the first collective waits up to 10 minutes for the peer's load, and a peer that leaves ends the wait within seconds; F6: block-FP8 routed experts (Qwen's FP8 release) load a rank's whole experts and are admitted at --tp 2; the NVFP4 and affine paths keep their bytes; opt-in TF_FLASHNEXT_TP_WINDOW_GRAPH: --tp 2 verify windows as graphs, the peer epoch on the device; default serving unchanged
+ zig/src/families/flashnext/cuda_lanes_restore_test.zig	5d0ef1cac8d8704676505e50a7e46cc82a71803aadf7018d3da2136fdc71759c	raw	its rig names the collective's parent communicator; test only
+ zig/src/families/flashnext/cuda_launch.zig	12b9ba75f979f431d2e306e9e3cd636893760a6b69da7f6e379c4764cf681ce9	raw	exports cuda_moe_exchange.zig for its device test; no served change; #2837 (Flash Next TP=2 graph replay); its test block reaches cuda_collective.zig's host tests, no served change; #3413 exports cuda_tiles.zig and readout_fused.zig for their tests
+ zig/src/families/flashnext/cuda_media.zig	394601e8a807f5516f501efcaefa6fb3308f392ee322db7296b11c90814f8eea	raw
+-- 
+2.56.0
+

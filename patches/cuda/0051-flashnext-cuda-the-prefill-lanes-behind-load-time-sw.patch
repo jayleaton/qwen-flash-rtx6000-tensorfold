@@ -1,0 +1,402 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jay Leaton <58495321+jayleaton@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 14:47:19 +0700
+Subject: [PATCH 51/76] flashnext cuda: the prefill lanes behind load-time
+ switches, all off by default
+
+TF_FLASHNEXT_HIDDEN_SUM (owner-order slot sum, --tp 2 hidden-size exchange), TF_FLASHNEXT_OWNER_SLOTS (owner-slot
+prompt exchange) and TF_FLASHNEXT_GDN_SPLIT (split DeltaNet prompt chain), each read once at load; unset keeps the
+recipe's sums, exchanges and kernels. The two exchange switches join the rank identity, and HIDDEN_SUM is bit 2 of the
+kept-prompt-state policy key.
+---
+ docs/environment.md                                |  3 +++
+ zig/kernels/cuda/flashnext_owner_sum.cuh           |  5 +++++
+ zig/src/core/contract/flashnext_cuda_records.zig   |  2 +-
+ zig/src/core/contract/gradient_pending.zig         |  2 +-
+ zig/src/core/contract/measurements/main_130.zig    |  2 +-
+ zig/src/families/flashnext/cuda_batch.zig          |  2 +-
+ zig/src/families/flashnext/cuda_batch_kernels.zig  |  2 ++
+ zig/src/families/flashnext/cuda_batch_moe.zig      |  5 +++--
+ zig/src/families/flashnext/cuda_collective.zig     | 10 +++++-----
+ zig/src/families/flashnext/cuda_disk.zig           |  4 ++--
+ zig/src/families/flashnext/cuda_gdn_fused.zig      |  5 +++++
+ zig/src/families/flashnext/cuda_lanes_load.zig     |  3 +++
+ .../families/flashnext/cuda_moe_exchange_test.zig  |  2 +-
+ zig/src/families/flashnext/cuda_moe_hidden_sum.zig | 14 +++++++++++++-
+ .../flashnext/cuda_moe_hidden_sum_test.zig         |  5 +++++
+ zig/src/families/flashnext/cuda_moe_native.zig     |  2 +-
+ zig/src/families/flashnext/cuda_owner_slots.zig    |  7 +++++++
+ zig/src/families/flashnext/cuda_prompt.zig         |  2 +-
+ zig/src/families/flashnext/cuda_prompt_step.zig    |  2 +-
+ zig/src/families/flashnext/cuda_rank_engine.zig    |  4 +++-
+ zig/src/platform/environment.zig                   |  3 +++
+ zig/src/platform/environment_flashnext_test.zig    |  4 ++--
+ 22 files changed, 69 insertions(+), 21 deletions(-)
+
+diff --git a/docs/environment.md b/docs/environment.md
+index 3fb33dc54..82cad92f6 100644
+--- a/docs/environment.md
++++ b/docs/environment.md
+@@ -141,6 +141,9 @@ stops the start with the variable, the supplied text and the accepted forms.
+ | `TF_FLASHNEXT_FIRST_EARLY` | Exactly `0` or `1`; default on |
+ | `TF_FLASHNEXT_GPU_TOPK` | Exactly `0` or `1`; default on |
+ | `TF_FLASHNEXT_GDN_FUSED` | Exactly `0` or `1`; default on |
++| `TF_FLASHNEXT_GDN_SPLIT` | Exactly `0` or `1`; default off. `1` runs a fused prompt pass's DeltaNet chain over two blocks a value head when the device has an SM for each block, with the same bits |
++| `TF_FLASHNEXT_OWNER_SLOTS` | Exactly `0` or `1`; default off. `1`: a `--tp 2` prompt pass over 64 rows outside a capture sends each rank only the half rows of the slots it owns, with the same bits; both ranks must agree |
++| `TF_FLASHNEXT_HIDDEN_SUM` | Exactly `0` or `1`; default off. `1` sums the MoE slots in owner order on every CUDA path, which changes tokens once against `0`, and at `--tp 2` with the shared expert split exchanges one hidden-size row a layer (TP2 keeps TP1's bits); read at load, both ranks must agree, and it keys the kept prompt states |
+ | `TF_FLASHNEXT_GDN_LANES` | Exactly `0` or `1`; default on |
+ | `TF_FLASHNEXT_BATCH_HEADS` | Exactly `0` or `1`; default on |
+ | `TF_FLASHNEXT_SAMPLED_HEADS` | Exactly `0` or `1`; default on |
+diff --git a/zig/kernels/cuda/flashnext_owner_sum.cuh b/zig/kernels/cuda/flashnext_owner_sum.cuh
+index 12a71e7a7..92c51a8ec 100644
+--- a/zig/kernels/cuda/flashnext_owner_sum.cuh
++++ b/zig/kernels/cuda/flashnext_owner_sum.cuh
+@@ -5,6 +5,11 @@
+ __device__ __forceinline__ float fn_owner_sum(const float* __restrict__ y, const float* __restrict__ wts,
+                                               const int* __restrict__ picks, long long first, int n, int d, int col,
+                                               int split, int part) {
++    if (split == 0) { // no owners (TF_FLASHNEXT_HIDDEN_SUM=0): one chain in slot order
++        float acc = 0.0f;
++        for (int k = 0; k < n; ++k) acc = __fmaf_rn(y[(first + k) * d + col], wts[first + k], acc);
++        return acc;
++    }
+     float a0 = 0.0f, a1 = 0.0f;
+     for (int k = 0; k < n; ++k) {
+         const long long at = first + k;
+diff --git a/zig/src/core/contract/flashnext_cuda_records.zig b/zig/src/core/contract/flashnext_cuda_records.zig
+index 3e4c97c95..03ad4a381 100644
+--- a/zig/src/core/contract/flashnext_cuda_records.zig
++++ b/zig/src/core/contract/flashnext_cuda_records.zig
+@@ -22,7 +22,7 @@ pub const cuda = [_]CudaRecord{
+     .{ .launch = .{ .name = "flashnext_hc fn_hc_reduce_act", .symbol = "fn_hc_reduce_act", .image = "flashnext_hc", .threads = 352 }, .usage = .{ .{ .regs = 32, .static = 4096, .bound = 1024 }, .{ .regs = 63, .static = 4096, .bound = 1024 }, .{ .regs = 63, .static = 4096, .bound = 1024 }, .{ .regs = 58, .static = 4096, .bound = 1024 }, .{ .regs = 58, .static = 4096, .bound = 1024 } } },
+     .{ .launch = .{ .name = "flashnext_hc fn_hc_upmix", .symbol = "fn_hc_upmix", .image = "flashnext_hc", .threads = 256, .dynamic = 18688 }, .usage = .{ .{ .regs = 69, .static = 2048, .bound = 256 }, .{ .regs = 64, .static = 2048, .bound = 256 }, .{ .regs = 64, .static = 2048, .bound = 256 }, .{ .regs = 78, .static = 2048, .bound = 256 }, .{ .regs = 78, .static = 2048, .bound = 256 } } },
+     .{ .launch = .{ .name = "flashnext_hc fn_hc_writeback0", .symbol = "fn_hc_writeback0", .image = "flashnext_hc", .threads = 256 }, .usage = .{ .{ .regs = 30, .static = 256, .bound = 256 }, .{ .regs = 30, .static = 256, .bound = 256 }, .{ .regs = 30, .static = 256, .bound = 256 }, .{ .regs = 33, .static = 256, .bound = 256 }, .{ .regs = 37, .static = 256, .bound = 256 } } },
+-    .{ .launch = .{ .name = "flashnext_hc fn_hc_writeback_moe", .symbol = "fn_hc_writeback_moe", .image = "flashnext_hc", .threads = 256 }, .usage = .{ .{ .regs = 32, .static = 256, .bound = 256 }, .{ .regs = 33, .static = 256, .bound = 256 }, .{ .regs = 33, .static = 256, .bound = 256 }, .{ .regs = 40, .static = 256, .bound = 256 }, .{ .regs = 40, .static = 256, .bound = 256 } } },
++    .{ .launch = .{ .name = "flashnext_hc fn_hc_writeback_moe", .symbol = "fn_hc_writeback_moe", .image = "flashnext_hc", .threads = 256 }, .usage = .{ .{ .regs = 32, .static = 256, .bound = 256 }, .{ .regs = 40, .static = 256, .bound = 256 }, .{ .regs = 40, .static = 256, .bound = 256 }, .{ .regs = 47, .static = 256, .bound = 256 }, .{ .regs = 47, .static = 256, .bound = 256 } } },
+     .{ .launch = .{ .name = "flashnext_hc fn_hc_writeback_slices", .symbol = "fn_hc_writeback_slices", .image = "flashnext_hc", .threads = 256 }, .usage = .{ .{ .regs = 32, .static = 256, .bound = 256 }, .{ .regs = 38, .static = 256, .bound = 256 }, .{ .regs = 38, .static = 256, .bound = 256 }, .{ .regs = 40, .static = 256, .bound = 256 }, .{ .regs = 40, .static = 256, .bound = 256 } } },
+     .{ .launch = .{ .name = "flashnext_hc fn_ple_conv", .symbol = "fn_ple_conv", .image = "flashnext_hc", .threads = 512 }, .usage = .{ .{ .regs = 23, .static = 0, .bound = 512 }, .{ .regs = 35, .static = 0, .bound = 512 }, .{ .regs = 35, .static = 0, .bound = 512 }, .{ .regs = 35, .static = 0, .bound = 512 }, .{ .regs = 35, .static = 0, .bound = 512 } } },
+     .{ .launch = .{ .name = "flashnext_hc fn_ple_gate", .symbol = "fn_ple_gate", .image = "flashnext_hc", .threads = 512 }, .usage = .{ .{ .regs = 32, .static = 128, .bound = 512 }, .{ .regs = 34, .static = 128, .bound = 512 }, .{ .regs = 34, .static = 128, .bound = 512 }, .{ .regs = 35, .static = 128, .bound = 512 }, .{ .regs = 35, .static = 128, .bound = 512 } } },
+diff --git a/zig/src/core/contract/gradient_pending.zig b/zig/src/core/contract/gradient_pending.zig
+index 93d1683a1..5d3d310a3 100644
+--- a/zig/src/core/contract/gradient_pending.zig
++++ b/zig/src/core/contract/gradient_pending.zig
+@@ -94,6 +94,6 @@ pub const records = [_]registry.CudaRecord{
+     .{ .launch = .{ .name = "flashnext_train tf_fn_pocket_out_rows threads 128", .image = "flashnext_train", .symbol = "tf_fn_pocket_out_rows", .threads = 128 }, .usage = .{ .{ .regs = 72, .static = 2048, .bound = 128 }, .{ .regs = 72, .static = 2048, .bound = 128 }, .{ .regs = 72, .static = 2048, .bound = 128 }, .{ .regs = 64, .static = 2048, .bound = 128 }, .{ .regs = 64, .static = 2048, .bound = 128 } } },
+     .{ .launch = .{ .name = "flashnext_train tf_fn_pocket_back threads 256", .image = "flashnext_train", .symbol = "tf_fn_pocket_back", .threads = 256 }, .usage = .{ .{ .regs = 42, .static = 1536, .bound = 256 }, .{ .regs = 40, .static = 1536, .bound = 256 }, .{ .regs = 40, .static = 1536, .bound = 256 }, .{ .regs = 40, .static = 1536, .bound = 256 }, .{ .regs = 40, .static = 1536, .bound = 256 } } },
+     .{ .launch = .{ .name = "flashnext_train tf_fn_pocket_grad threads 256", .image = "flashnext_train", .symbol = "tf_fn_pocket_grad", .threads = 256 }, .usage = .{ .{ .regs = 32, .static = 128, .bound = 256 }, .{ .regs = 40, .static = 128, .bound = 256 }, .{ .regs = 40, .static = 128, .bound = 256 }, .{ .regs = 39, .static = 128, .bound = 256 }, .{ .regs = 39, .static = 128, .bound = 256 } } },
+-    .{ .launch = .{ .name = "flashnext_batch fn_moe_sum threads 256", .image = "flashnext_batch", .symbol = "fn_moe_sum", .threads = 256 }, .usage = .{ .{ .regs = 32, .static = 0, .bound = 0 }, .{ .regs = 39, .static = 0, .bound = 0 }, .{ .regs = 39, .static = 0, .bound = 0 }, .{ .regs = 40, .static = 0, .bound = 0 }, .{ .regs = 40, .static = 0, .bound = 0 } } },
++    .{ .launch = .{ .name = "flashnext_batch fn_moe_sum threads 256", .image = "flashnext_batch", .symbol = "fn_moe_sum", .threads = 256 }, .usage = .{ .{ .regs = 32, .static = 0, .bound = 0 }, .{ .regs = 40, .static = 0, .bound = 0 }, .{ .regs = 40, .static = 0, .bound = 0 }, .{ .regs = 40, .static = 0, .bound = 0 }, .{ .regs = 39, .static = 0, .bound = 0 } } },
+     .{ .launch = .{ .name = "flashnext_hc fn_hc_upmix_up threads 256", .image = "flashnext_hc", .symbol = "fn_hc_upmix_up", .threads = 256 }, .usage = .{ .{ .regs = 69, .static = 2048, .bound = 256 }, .{ .regs = 64, .static = 2048, .bound = 256 }, .{ .regs = 64, .static = 2048, .bound = 256 }, .{ .regs = 78, .static = 2048, .bound = 256 }, .{ .regs = 78, .static = 2048, .bound = 256 } } },
+ };
+diff --git a/zig/src/core/contract/measurements/main_130.zig b/zig/src/core/contract/measurements/main_130.zig
+index da3483c04..6dd1715c5 100644
+--- a/zig/src/core/contract/measurements/main_130.zig
++++ b/zig/src/core/contract/measurements/main_130.zig
+@@ -12,7 +12,7 @@ pub const records = [_]r.Override{
+     .{ .name = "flashnext_batch fn_gdn_fused", .usage = .{ .{ .regs = 168, .static = 0, .bound = 384 }, .{ .regs = 168, .static = 0, .bound = 384 }, .{ .regs = 168, .static = 0, .bound = 384 }, .{ .regs = 168, .static = 0, .bound = 384 }, .{ .regs = 168, .static = 0, .bound = 384 } } },
+     .{ .name = "flashnext_batch fn_qsa_select", .usage = .{ .{ .regs = 32, .static = 1168, .bound = 1024 }, .{ .regs = 52, .static = 1168, .bound = 1024 }, .{ .regs = 52, .static = 1168, .bound = 1024 }, .{ .regs = 55, .static = 1168, .bound = 1024 }, .{ .regs = 64, .static = 1168, .bound = 1024 } } },
+     .{ .name = "flashnext_batch fn_qsa_select_lanes", .usage = .{ .{ .regs = 48, .static = 1168, .bound = 1024 }, .{ .regs = 52, .static = 1168, .bound = 1024 }, .{ .regs = 52, .static = 1168, .bound = 1024 }, .{ .regs = 55, .static = 1168, .bound = 1024 }, .{ .regs = 64, .static = 1168, .bound = 1024 } } },
+-    .{ .name = "flashnext_hc fn_hc_writeback_norm_moe", .usage = .{ .{ .regs = 64, .static = 1296, .bound = 256 }, .{ .regs = 64, .static = 1296, .bound = 256 }, .{ .regs = 64, .static = 1296, .bound = 256 }, .{ .regs = 64, .static = 1296, .bound = 256 }, .{ .regs = 64, .static = 1296, .bound = 256 } } },
++    .{ .name = "flashnext_hc fn_hc_writeback_norm_moe", .usage = .{ .{ .regs = 64, .static = 1296, .bound = 256 }, .{ .regs = 64, .static = 1296, .bound = 256 }, .{ .regs = 64, .static = 1296, .bound = 256 }, .{ .regs = 71, .static = 1296, .bound = 256 }, .{ .regs = 71, .static = 1296, .bound = 256 } } },
+     .{ .name = "nvfp4_experts_tile tf_nvfp4_tile_down_f32", .usage = .{ .{ .regs = 123, .static = 0, .bound = 128 }, .{ .regs = 123, .static = 0, .bound = 128 }, .{ .regs = 128, .static = 0, .bound = 128 }, .{ .regs = 128, .static = 0, .bound = 128 }, .{ .regs = 128, .static = 0, .bound = 128 } } },
+     .{ .name = "nvfp4_experts_tile tf_nvfp4_tile_swiglu", .usage = .{ .{ .regs = 255, .static = 0, .bound = 128 }, .{ .regs = 255, .static = 0, .bound = 128 }, .{ .regs = 255, .static = 0, .bound = 128 }, .{ .regs = 255, .static = 0, .bound = 128 }, .{ .regs = 255, .static = 0, .bound = 128 } } },
+     .{ .name = "qwen35 tf_q35_attn_partial", .usage = .{ .{ .regs = 203, .static = 11648, .bound = 128 }, .{ .regs = 203, .static = 11648, .bound = 128 }, .{ .regs = 203, .static = 11648, .bound = 128 }, .{ .regs = 168, .static = 11648, .bound = 128 }, .{ .regs = 168, .static = 11648, .bound = 128 } } },
+diff --git a/zig/src/families/flashnext/cuda_batch.zig b/zig/src/families/flashnext/cuda_batch.zig
+index 914ad8820..08a13bbf3 100644
+--- a/zig/src/families/flashnext/cuda_batch.zig
++++ b/zig/src/families/flashnext/cuda_batch.zig
+@@ -264,7 +264,7 @@ pub fn Pass(comptime Tri: type) type {
+                 // the three in one kernel a value head: the same per-row op sequences, no fp32 rows through memory
+                 const st = self.seq.state[li].ptr;
+                 const in: gdn_fused.In = .{ .proj = s.proj, .conv = self.seq.conv[li].ptr, .cw = lw.cw.ptr, .a_log = lw.a_log.ptr, .dt = lw.dt.ptr, .state = st, .state_out = if (keep.state_out != 0) keep.state_out else st, .norm = lw.norm.ptr, .heads = h, .cuts = cuts };
+-                if (gdn_fused.splitOn(self.k.forms.sms, h)) {
++                if (self.k.forms.gdn_split and gdn_fused.splitOn(self.k.forms.sms, h)) {
+                     try gdn_fused.split(g, self.stream, in, n, .{ .q = s.gq, .k = s.gk, .v = s.gv, .gb = s.ggb, .ys = s.ys }, s.gout, s.gxs);
+                 } else try gdn_fused.launch(g.fused, self.stream, in, n, s.gout, s.gxs);
+             } else if (self.lanes.len == 0 and keep.log != 0) {
+diff --git a/zig/src/families/flashnext/cuda_batch_kernels.zig b/zig/src/families/flashnext/cuda_batch_kernels.zig
+index fe3e7d70c..72e05e04d 100644
+--- a/zig/src/families/flashnext/cuda_batch_kernels.zig
++++ b/zig/src/families/flashnext/cuda_batch_kernels.zig
+@@ -42,6 +42,7 @@ pub const Gdn = struct {
+ pub const Forms = struct {
+     gdn_fused: bool = true, // TF_FLASHNEXT_GDN_FUSED
+     sms: u32 = 0, // the device's multiprocessors: the fused block's passes split their chains on enough (splitOn)
++    gdn_split: bool = false, // TF_FLASHNEXT_GDN_SPLIT
+     hc_fuse: bool = true, // TF_FLASHNEXT_HC_FUSE
+     in_pass: bool = true, // TF_FLASHNEXT_KEEP_INPASS
+     readout_rows: usize = 64, // TF_FLASHNEXT_READOUT_ROWS (maxInt: never)
+@@ -51,6 +52,7 @@ pub const Forms = struct {
+     pub fn resolve() Forms {
+         return .{
+             .gdn_fused = gdn_fused.on(),
++            .gdn_split = gdn_fused.splitWanted(),
+             .hc_fuse = @import("cuda_batch_hc.zig").on(),
+             .in_pass = @import("cuda_lanes_snap.zig").keepInPass(),
+             .readout_rows = @import("cuda_chunk.zig").readoutTileRows(),
+diff --git a/zig/src/families/flashnext/cuda_batch_moe.zig b/zig/src/families/flashnext/cuda_batch_moe.zig
+index 7aac5b2e5..11f7ac4ee 100644
+--- a/zig/src/families/flashnext/cuda_batch_moe.zig
++++ b/zig/src/families/flashnext/cuda_batch_moe.zig
+@@ -34,12 +34,13 @@ pub fn sumPart(self: anytype, r0: usize, rows: usize, part: i32) !void {
+     a.add(s.moe_f32 + r0 * dims * 4);
+     a.add(batch.cint(dims));
+     a.add(batch.cint(slots));
+-    a.add(batch.cint(@import("cuda_moe_hidden_sum.zig").split));
++    const hidden_sum = @import("cuda_moe_hidden_sum.zig");
++    a.add(batch.cint(if (part < 0) hidden_sum.order() else hidden_sum.split));
+     a.add(part);
+     try cuda.launch.launch(self.k.moe_sum, .{ .grid = .{ .x = @intCast(rows), .y = dims / 256 }, .block = .{ .x = 256 } }, self.stream, &a);
+ }
+ 
+ /// The scratch's MoE slots from row r0, as the owner-order writeback reads them.
+ pub fn slotsAt(s: anytype, r0: usize) @import("cuda_glue.zig").Slots {
+-    return .{ .y = s.y + r0 * slots * dims * 4, .wts = s.wts + r0 * slots * 4, .picks = s.picks + r0 * slots * 4, .count = slots, .split = @import("cuda_moe_hidden_sum.zig").split };
++    return .{ .y = s.y + r0 * slots * dims * 4, .wts = s.wts + r0 * slots * 4, .picks = s.picks + r0 * slots * 4, .count = slots, .split = @import("cuda_moe_hidden_sum.zig").order() };
+ }
+diff --git a/zig/src/families/flashnext/cuda_collective.zig b/zig/src/families/flashnext/cuda_collective.zig
+index 812e2243a..3c86ffeeb 100644
+--- a/zig/src/families/flashnext/cuda_collective.zig
++++ b/zig/src/families/flashnext/cuda_collective.zig
+@@ -197,19 +197,19 @@ pub const Collective = struct {
+         try c.wait(null, wire.deadline(c.timeout_ms));
+     }
+ 
+-    /// `sent` FP32 values to the peer from `send` and `got` from it into `recv`, in one group; zero posts nothing.
+-    pub fn swap(c: *Collective, stream: cuda.Stream, send: u64, sent: usize, recv: u64, got: usize) !void {
++    /// `sent` FP32 values to the peer from `out` and `got` from it into `in`, in one group; zero posts nothing.
++    pub fn swap(c: *Collective, stream: cuda.Stream, out: u64, sent: usize, in: u64, got: usize) !void {
+         if (c.failed or c.comm == null) return error.RankDisconnected;
+         if (sent == 0 and got == 0) return;
+         errdefer c.abort();
+         try c.link.checkPeer();
+-        const peer: c_int = @intCast(1 - c.rank);
++        const other: c_int = @intCast(1 - c.rank);
+         try c.lib.check(c.lib.api.ncclGroupStart(), "ncclGroupStart");
+-        if (sent != 0) c.submitted(c.lib.api.ncclSend(send, sent, .f32, peer, c.comm, stream.handle)) catch |e| {
++        if (sent != 0) c.submitted(c.lib.api.ncclSend(out, sent, .f32, other, c.comm, stream.handle)) catch |e| {
+             _ = c.lib.api.ncclGroupEnd();
+             return e;
+         };
+-        if (got != 0) c.submitted(c.lib.api.ncclRecv(recv, got, .f32, peer, c.comm, stream.handle)) catch |e| {
++        if (got != 0) c.submitted(c.lib.api.ncclRecv(in, got, .f32, other, c.comm, stream.handle)) catch |e| {
+             _ = c.lib.api.ncclGroupEnd();
+             return e;
+         };
+diff --git a/zig/src/families/flashnext/cuda_disk.zig b/zig/src/families/flashnext/cuda_disk.zig
+index 9439ef81b..c19bbc6cf 100644
+--- a/zig/src/families/flashnext/cuda_disk.zig
++++ b/zig/src/families/flashnext/cuda_disk.zig
+@@ -117,8 +117,8 @@ pub fn policyOf(c: anytype) [13]u64 {
+         e.chunk,
+         e.busy_chunk,
+         @intFromBool(f.gdn_fused),
+-        // TF_FLASHNEXT_HC_FUSE, and TF_FLASHNEXT_READOUT_FUSED in bit 1 (unset leaves the key as it was)
+-        @intFromBool(f.hc_fuse) | @as(u64, @intFromBool(f.readout_fused)) << 1,
++        // TF_FLASHNEXT_HC_FUSE, _READOUT_FUSED in bit 1 and _HIDDEN_SUM in bit 2 (unset leaves the key as it was)
++        @intFromBool(f.hc_fuse) | @as(u64, @intFromBool(f.readout_fused)) << 1 | @as(u64, @intFromBool(@import("cuda_moe_hidden_sum.zig").on)) << 2,
+         @intFromBool(f.in_pass),
+         f.readout_rows,
+         f.fact_rows,
+diff --git a/zig/src/families/flashnext/cuda_gdn_fused.zig b/zig/src/families/flashnext/cuda_gdn_fused.zig
+index c46d4fc7d..6f20cc5f5 100644
+--- a/zig/src/families/flashnext/cuda_gdn_fused.zig
++++ b/zig/src/families/flashnext/cuda_gdn_fused.zig
+@@ -52,6 +52,11 @@ pub const split_threads: u32 = split_rows * split_tpr;
+ /// fn_gdn_chain_split's staged rows: 2 x 16 steps of q, k (128 fp32 each), its v rows, g and beta.
+ pub const split_smem: u32 = 2 * 16 * ((2 * 128 + split_rows) * 4 + 16);
+ 
++/// TF_FLASHNEXT_GDN_SPLIT: fused passes may split their chains (splitOn); default off.
++pub fn splitWanted() bool {
++    return @import("sys").environment.read(bool, "TF_FLASHNEXT_GDN_SPLIT", false) catch false;
++}
++
+ /// Whether a pass on heads h splits each head's state rows over blocks: when every block has an SM of its own.
+ pub fn splitOn(sms: u32, h: Heads) bool {
+     return sms >= h.nv * (gdn.dv / split_rows);
+diff --git a/zig/src/families/flashnext/cuda_lanes_load.zig b/zig/src/families/flashnext/cuda_lanes_load.zig
+index b8c532ed8..41659c020 100644
+--- a/zig/src/families/flashnext/cuda_lanes_load.zig
++++ b/zig/src/families/flashnext/cuda_lanes_load.zig
+@@ -38,6 +38,9 @@ pub fn open(comptime F: type, gpa: std.mem.Allocator, io: std.Io, ctx: *const cu
+     const late_fits = o.tp == 1;
+     if (Draft.lateWanted() == true and !late_fits) return error.FlashNextKeepLateUnsupported;
+     Draft.late_on = (Draft.lateWanted() orelse true) and late_fits;
++    // both ranks of --tp 2 must agree on these: the rank identity carries them
++    @import("cuda_moe_hidden_sum.zig").on = try @import("cuda_moe_hidden_sum.zig").enabled();
++    @import("cuda_owner_slots.zig").on = try @import("cuda_owner_slots.zig").enabled();
+     const driver: *cuda.Driver = @constCast(ctx.d);
+     const own = try gpa.create(Cuda);
+     errdefer gpa.destroy(own);
+diff --git a/zig/src/families/flashnext/cuda_moe_exchange_test.zig b/zig/src/families/flashnext/cuda_moe_exchange_test.zig
+index 2140556a5..c2358ab6e 100644
+--- a/zig/src/families/flashnext/cuda_moe_exchange_test.zig
++++ b/zig/src/families/flashnext/cuda_moe_exchange_test.zig
+@@ -156,7 +156,7 @@ test "a split pass under capture reduce-scatters its rank's block in place, sums
+         const k = Fake.calls[1];
+         try expect(k.kind == .launch);
+         try expectEqual([6]u32{ @intCast(rows), dims / 256, 1, 256, 1, 1 }, k.grid);
+-        try expectEqual([8]u64{ bufs.y + lo * row_y, bufs.wts + lo * slots * 4, bufs.picks + lo * slots * 4, bufs.moe_f32 + lo * dims * 4, dims, slots, wt.experts_n / 2, @bitCast(@as(i64, -1)) }, k.args);
++        try expectEqual([8]u64{ bufs.y + lo * row_y, bufs.wts + lo * slots * 4, bufs.picks + lo * slots * 4, bufs.moe_f32 + lo * dims * 4, dims, slots, 0, @bitCast(@as(i64, -1)) }, k.args);
+         const ag = Fake.calls[2];
+         try expect(ag.kind == .gather and ag.f32 and ag.send == bufs.moe_f32 + rank * h * dims * 4 and ag.recv == bufs.moe_f32 and ag.count == h * dims);
+         try expect(pass.pending_f32 and !c.failed and Fake.aborts == 0);
+diff --git a/zig/src/families/flashnext/cuda_moe_hidden_sum.zig b/zig/src/families/flashnext/cuda_moe_hidden_sum.zig
+index 6a0641c89..6d783fb21 100644
+--- a/zig/src/families/flashnext/cuda_moe_hidden_sum.zig
++++ b/zig/src/families/flashnext/cuda_moe_hidden_sum.zig
+@@ -7,9 +7,21 @@ const dims = wt.dims;
+ /// Owner 1's first routed expert: rank 1's first at --tp 2, and the owner order's cut at every world.
+ pub const split = wt.experts_n / 2;
+ 
++/// TF_FLASHNEXT_HIDDEN_SUM as read at load: the owner-order slot sum and --tp 2's hidden-size exchange.
++pub var on = false;
++
++pub fn enabled() !bool {
++    return @import("sys").environment.read(bool, "TF_FLASHNEXT_HIDDEN_SUM", false);
++}
++
++/// The slot sum's owner cut for fn_moe_sum and the MoE writebacks: 0 keeps one chain in slot order.
++pub fn order() usize {
++    return if (on) split else 0;
++}
++
+ /// Each rank must hold exactly one owner's slots: its experts, and its half of the shared expert's columns.
+ pub fn applies(world: usize, split_shared: bool) bool {
+-    return world == 2 and split_shared;
++    return on and world == 2 and split_shared;
+ }
+ 
+ /// moe_f32: this rank's owner chain, then the all-reduce adds the peer's: owner 0's plus owner 1's, as at --tp 1.
+diff --git a/zig/src/families/flashnext/cuda_moe_hidden_sum_test.zig b/zig/src/families/flashnext/cuda_moe_hidden_sum_test.zig
+index cf155b8d6..c6e080125 100644
+--- a/zig/src/families/flashnext/cuda_moe_hidden_sum_test.zig
++++ b/zig/src/families/flashnext/cuda_moe_hidden_sum_test.zig
+@@ -51,6 +51,11 @@ const Pass = struct {
+ };
+ 
+ test "the hidden-size exchange takes two ranks whose shared expert is split by columns, and the owner cut is rank 1's" {
++    defer hidden_sum.on = false;
++    try expect(!hidden_sum.applies(2, true));
++    try expectEqual(@as(usize, 0), hidden_sum.order());
++    hidden_sum.on = true;
++    try expectEqual(hidden_sum.split, hidden_sum.order());
+     try expect(hidden_sum.applies(2, true));
+     try expect(!hidden_sum.applies(2, false));
+     try expect(!hidden_sum.applies(1, true) and !hidden_sum.applies(1, false));
+diff --git a/zig/src/families/flashnext/cuda_moe_native.zig b/zig/src/families/flashnext/cuda_moe_native.zig
+index 802db666f..3831bef82 100644
+--- a/zig/src/families/flashnext/cuda_moe_native.zig
++++ b/zig/src/families/flashnext/cuda_moe_native.zig
+@@ -26,7 +26,7 @@ pub fn run(self: anytype, native: *const mixed.Owned, n: usize, pairs: usize, pl
+     const hidden = hidden_sum.applies(native.world, native.split_shared);
+     if (zs.clearsY(native.world, native.rank) and !hidden) try self.stream.d.check(self.stream.d.api.cuMemsetD8Async(s.y, 0, y_bytes, self.stream.handle), "cuMemsetD8Async");
+     const split = !hidden and native.world != 1 and exchange.rowSplit(native.world, n);
+-    const planned = if (split) try exchange.plan(self, .{ .first = owned.first, .count = owned.count, .split = native.split_shared, .rank = native.rank }, n) else null;
++    const planned = if (split and @import("cuda_owner_slots.zig").on and !hidden_sum.on) try exchange.plan(self, .{ .first = owned.first, .count = owned.count, .split = native.split_shared, .rank = native.rank }, n) else null;
+     const side = try shared.fork(self, native, n);
+     switch (owned.format) {
+         .nvfp4 => {
+diff --git a/zig/src/families/flashnext/cuda_owner_slots.zig b/zig/src/families/flashnext/cuda_owner_slots.zig
+index 33b1d03e0..233c996da 100644
+--- a/zig/src/families/flashnext/cuda_owner_slots.zig
++++ b/zig/src/families/flashnext/cuda_owner_slots.zig
+@@ -9,6 +9,13 @@ const share = cuda.rank_scatter.share;
+ /// Floats a half row of y: the unit a rank owns, two a routed pair's owner, one each of the split shared slot.
+ pub const unit = dims / 2;
+ 
++/// TF_FLASHNEXT_OWNER_SLOTS as read at load; off keeps the reduce-scatter of every slot.
++pub var on = false;
++
++pub fn enabled() !bool {
++    return @import("sys").environment.read(bool, "TF_FLASHNEXT_OWNER_SLOTS", false);
++}
++
+ /// The rank's experts and shared split: what decides which half rows of each pair it owns.
+ pub const Owner = struct { first: usize, count: usize, split: bool, rank: usize };
+ 
+diff --git a/zig/src/families/flashnext/cuda_prompt.zig b/zig/src/families/flashnext/cuda_prompt.zig
+index 147976750..13cecfac0 100644
+--- a/zig/src/families/flashnext/cuda_prompt.zig
++++ b/zig/src/families/flashnext/cuda_prompt.zig
+@@ -386,7 +386,7 @@ pub const Engine = struct {
+         }
+         // head_local: the draft head's lanes on one GPU, a pass's rows split; native_part only where the lane reduces
+         const parts = @import("cuda_batch_state.zig");
+-        const z: parts.Sizes = .{ .head_rows = if (e.collective != null) @max(rows, parts.head_rows_one) else parts.head_rows_one, .lane_reduce = !e.batch_k.native_lane.clusters, .owner = e.collective != null };
++        const z: parts.Sizes = .{ .head_rows = if (e.collective != null) @max(rows, parts.head_rows_one) else parts.head_rows_one, .lane_reduce = !e.batch_k.native_lane.clusters, .owner = e.collective != null and @import("cuda_owner_slots.zig").on };
+         e.batch_s = try batch.Scratch.alloc(e.gpa, e.driver, e.stream.*, rows, z);
+         return &e.batch_s.?;
+     }
+diff --git a/zig/src/families/flashnext/cuda_prompt_step.zig b/zig/src/families/flashnext/cuda_prompt_step.zig
+index 1a23b31ab..a836b56e2 100644
+--- a/zig/src/families/flashnext/cuda_prompt_step.zig
++++ b/zig/src/families/flashnext/cuda_prompt_step.zig
+@@ -195,7 +195,7 @@ pub fn writeback(tri: anytype, s: *Scratch, h: u64, mode: usize, inj: u64, y: u6
+     if (mode == 0) {
+         try tri.hcWriteback(h, h, s.pss.ptr, dummy, "*bf16", dummy, dummy, "*bf16", dummy, "*bf16", dims, 1, dims, streams, 0, 1, 1, 1);
+     } else if (mode == 2) {
+-        try tri.hcWritebackMoe(h, h, s.pss.ptr, inj, .{ .y = y, .wts = wts, .picks = picks, .count = slots, .split = experts_n / 2 }, 1, dims, streams);
++        try tri.hcWritebackMoe(h, h, s.pss.ptr, inj, .{ .y = y, .wts = wts, .picks = picks, .count = slots, .split = @import("cuda_moe_hidden_sum.zig").order() }, 1, dims, streams);
+     } else if (mode == 4) {
+         try tri.hcWriteback(h, h, s.pss.ptr, s.part.ptr, "*fp32", inj, dummy, "*bf16", dummy, "*bf16", dims, 1, dims, streams, 4, 1, 1, out_sk);
+     } else return error.UnexpectedTensor;
+diff --git a/zig/src/families/flashnext/cuda_rank_engine.zig b/zig/src/families/flashnext/cuda_rank_engine.zig
+index aa7efc9b4..0ce94009c 100644
+--- a/zig/src/families/flashnext/cuda_rank_engine.zig
++++ b/zig/src/families/flashnext/cuda_rank_engine.zig
+@@ -26,6 +26,8 @@ pub const Identity = extern struct {
+     split_rows: u64 = 0,
+     shared_split: u64 = 0,
+     peer_slots: u64 = 0,
++    /// TF_FLASHNEXT_HIDDEN_SUM in bit 0 and TF_FLASHNEXT_OWNER_SLOTS in bit 1, as read at load.
++    exchange: u64 = 0,
+ };
+ 
+ fn fileHash(a: std.mem.Allocator, io: std.Io, path: []const u8) ![32]u8 {
+@@ -50,7 +52,7 @@ pub fn identity(a: std.mem.Allocator, io: std.Io, dir: []const u8, context: usiz
+     defer a.free(index);
+     const program = try std.process.executablePathAlloc(io, a);
+     defer a.free(program);
+-    return .{ .config = try fileHash(a, io, config), .index = try fileHash(a, io, index), .program = try fileHash(a, io, program), .checkpoint = checkpoint, .context = context, .chunk = chunk, .decode_graph = @intFromBool(@import("cuda_round_graph.zig").enabled()), .head_sharded = @intFromBool(try @import("cuda_head.zig").enabled()), .dense_split = @intFromBool(try @import("cuda_dense_split.zig").appliesDir(a, io, dir, 2)), .split_rows = try @import("cuda_moe_exchange.zig").asked(), .shared_split = @intFromBool(try @import("cuda_dense_split.zig").sharedSplit()), .peer_slots = @intFromBool(try @import("cuda_peer_slots.zig").enabled()) };
++    return .{ .config = try fileHash(a, io, config), .index = try fileHash(a, io, index), .program = try fileHash(a, io, program), .checkpoint = checkpoint, .context = context, .chunk = chunk, .decode_graph = @intFromBool(@import("cuda_round_graph.zig").enabled()), .head_sharded = @intFromBool(try @import("cuda_head.zig").enabled()), .dense_split = @intFromBool(try @import("cuda_dense_split.zig").appliesDir(a, io, dir, 2)), .split_rows = try @import("cuda_moe_exchange.zig").asked(), .shared_split = @intFromBool(try @import("cuda_dense_split.zig").sharedSplit()), .peer_slots = @intFromBool(try @import("cuda_peer_slots.zig").enabled()), .exchange = @as(u64, @intFromBool(try @import("cuda_moe_hidden_sum.zig").enabled())) | @as(u64, @intFromBool(try @import("cuda_owner_slots.zig").enabled())) << 1 };
+ }
+ 
+ /// How long a rank waits for its peer: a minute with a given digest, 30 when the peer may be hashing every byte.
+diff --git a/zig/src/platform/environment.zig b/zig/src/platform/environment.zig
+index 3798bc847..b801f81e8 100644
+--- a/zig/src/platform/environment.zig
++++ b/zig/src/platform/environment.zig
+@@ -209,6 +209,9 @@ pub const rules = [_]Rule{
+     .{ .name = "TF_FLASHNEXT_FIRST_EARLY", .scope = .flashnext, .kind = .flag, .forms = "0 or 1 (default 1)" },
+     .{ .name = "TF_FLASHNEXT_GPU_TOPK", .scope = .flashnext, .kind = .flag, .forms = "0 or 1 (default 1)" },
+     .{ .name = "TF_FLASHNEXT_GDN_FUSED", .scope = .flashnext, .kind = .flag, .forms = "0 or 1 (default 1)" },
++    .{ .name = "TF_FLASHNEXT_GDN_SPLIT", .scope = .flashnext, .kind = .flag, .forms = "0 or 1 (default 0)" },
++    .{ .name = "TF_FLASHNEXT_OWNER_SLOTS", .scope = .flashnext, .kind = .flag, .forms = "0 or 1 (default 0)" },
++    .{ .name = "TF_FLASHNEXT_HIDDEN_SUM", .scope = .flashnext, .kind = .flag, .forms = "0 or 1 (default 0)" },
+     .{ .name = "TF_FLASHNEXT_GDN_LANES", .scope = .flashnext, .kind = .flag, .forms = "0 or 1 (default 1)" },
+     .{ .name = "TF_FLASHNEXT_BATCH_HEADS", .scope = .flashnext, .kind = .flag, .forms = "0 or 1 (default 1)" },
+     .{ .name = "TF_FLASHNEXT_SAMPLED_HEADS", .scope = .flashnext, .kind = .flag, .forms = "0 or 1 (default 1)" },
+diff --git a/zig/src/platform/environment_flashnext_test.zig b/zig/src/platform/environment_flashnext_test.zig
+index 62bc6015f..e380db2b6 100644
+--- a/zig/src/platform/environment_flashnext_test.zig
++++ b/zig/src/platform/environment_flashnext_test.zig
+@@ -33,13 +33,13 @@ fn check(name: []const u8, raw: []const u8, valid: bool) !void {
+     try t.expect(std.mem.endsWith(u8, why.?, e.rule(name).forms));
+ }
+ 
+-test "Flash Next strict env: the table holds all 40 settings: 26 switches, 10 integers, 1 real, 3 structured" {
++test "Flash Next strict env: the table holds all 43 settings: 29 switches, 10 integers, 1 real, 3 structured" {
+     var counts: [4]usize = @splat(0);
+     for (e.rules) |r| if (r.scope == .flashnext) {
+         try t.expect(std.mem.startsWith(u8, r.name, "TF_FLASHNEXT_"));
+         counts[@backingInt(group(r))] += 1;
+     };
+-    try t.expectEqual([4]usize{ 26, 10, 1, 3 }, counts);
++    try t.expectEqual([4]usize{ 29, 10, 1, 3 }, counts);
+ }
+ 
+ test "Flash Next strict env: unset and blank settings both read as the caller's default" {
+-- 
+2.56.0
+

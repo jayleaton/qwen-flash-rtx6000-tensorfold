@@ -1,0 +1,192 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jay Leaton <58495321+jayleaton@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 10:18:23 +0700
+Subject: [PATCH 61/76] flashnext cuda: --pp 2 decode passes leave the host
+ waits to the head's stage
+
+Rank 0 read rank 1's ack after every decode pass, and rank 1 waited on
+the host for each pass before acking and reading the next frame. Rank
+0 now reads a pass's ack once it has posted the next command, as a late
+prompt chunk's already was (any error on rank 1 ends the session either
+way), and the stage without the head no longer waits for its verify
+windows or decode rounds: nothing on its host reads them, and the next
+frame can only come once rank 0 has the rows back. Only the head's
+stage waits, for the scores it samples from.
+---
+ zig/src/families/flashnext/cuda_batch_hop.zig |  5 +++
+ zig/src/families/flashnext/cuda_prompt.zig    |  5 ++-
+ .../flashnext/cuda_prompt_windows.zig         |  4 ++
+ .../families/flashnext/cuda_rank_engine.zig   | 40 ++++++++++---------
+ .../families/flashnext/cuda_rank_verify.zig   |  4 +-
+ 5 files changed, 35 insertions(+), 23 deletions(-)
+
+diff --git a/zig/src/families/flashnext/cuda_batch_hop.zig b/zig/src/families/flashnext/cuda_batch_hop.zig
+index f0ede71d2..a6d76f958 100644
+--- a/zig/src/families/flashnext/cuda_batch_hop.zig
++++ b/zig/src/families/flashnext/cuda_batch_hop.zig
+@@ -46,6 +46,11 @@ pub fn graphs(hop: ?Hop) bool {
+     return h.late.rows == 0;
+ }
+ 
++/// A stage without the head: the host reads none of its passes, so it leaves the wait to the stage that does.
++pub fn headless(e: anytype) bool {
++    return e.hop != null and !e.span.ends();
++}
++
+ /// The late rows' receive and their absorb (rank 0), before anything else crosses the hop.
+ pub fn settle(hop: Hop) !void {
+     const l = hop.late.*;
+diff --git a/zig/src/families/flashnext/cuda_prompt.zig b/zig/src/families/flashnext/cuda_prompt.zig
+index 157d67339..2ddcb0149 100644
+--- a/zig/src/families/flashnext/cuda_prompt.zig
++++ b/zig/src/families/flashnext/cuda_prompt.zig
+@@ -490,10 +490,11 @@ pub const Engine = struct {
+             const key = try round_graph.Key.init(seqs, s.ids, scores, out);
+             try e.round_graph.run(key, &p, ids);
+         } else try p.chunk(ids, 0, null);
+-        try e.complete();
++        const host = !@import("cuda_batch_hop.zig").headless(e);
++        if (host) try e.complete();
+         const d = e.stream.d;
+         for (seqs, 0..) |q, r| {
+-            try cuda.memory.download(d, out + r * vocab * 2, std.mem.sliceAsBytes(q.logits)[0 .. vocab * 2]);
++            if (host) try cuda.memory.download(d, out + r * vocab * 2, std.mem.sliceAsBytes(q.logits)[0 .. vocab * 2]);
+             q.fed += 1;
+         }
+     }
+diff --git a/zig/src/families/flashnext/cuda_prompt_windows.zig b/zig/src/families/flashnext/cuda_prompt_windows.zig
+index 692a3194b..b25482224 100644
+--- a/zig/src/families/flashnext/cuda_prompt_windows.zig
++++ b/zig/src/families/flashnext/cuda_prompt_windows.zig
+@@ -78,6 +78,10 @@ pub fn windows(e: *Engine, comptime Tri: type, tri: Tri, wins: []const Window, o
+         try window_graph.stageWindow(&p, ids, 0);
+         try e.graphs.shared.run(e.gpa, e.stream.*, key, window_graph.Chunk(batch.Pass(Tri)){ .p = &p, .ids = ids, .pos0 = 0 });
+     } else try p.chunk(ids, 0, null);
++    if (hops.headless(e)) {
++        for (wins) |w| w.seq.fed += w.ids.len;
++        return;
++    }
+     try e.complete();
+     // each stream's last row in its host scores only when asked: the drafted windows' draws read `out`
+     const d = e.stream.d;
+diff --git a/zig/src/families/flashnext/cuda_rank_engine.zig b/zig/src/families/flashnext/cuda_rank_engine.zig
+index 5122393a4..08b03ed54 100644
+--- a/zig/src/families/flashnext/cuda_rank_engine.zig
++++ b/zig/src/families/flashnext/cuda_rank_engine.zig
+@@ -79,7 +79,7 @@ pub const Session = struct {
+     available: std.atomic.Value(bool) = .init(true),
+     /// A pipeline rank's boundary rows over `collective` (--pp 2).
+     rows: ?@import("cuda_rank_hop.zig").Rows = null,
+-    /// A late prompt chunk's ack, read once the next chunk is issued (rank 0 at --pp 2).
++    /// The last command's ack, read once the next is posted (rank 0 at --pp 2: a prompt chunk's or a decode pass's).
+     late: ?wire.Header = null,
+ 
+     /// `wait_ms` bounds the link and the hello: the peer may still be reading every byte for its digest (`linkWait`).
+@@ -173,20 +173,26 @@ pub const Session = struct {
+         s.benchmark_group = try @import("core").benchmark_group.cuda(s.gpa, io, ctx, &s.collective, stream);
+     }
+ 
++    /// The late chunk's rows settle before any other command (rank 0 at --pp 2); the last command's ack after it.
+     pub fn command(s: *Session, input: wire.Header, payload: []const u8) !wire.Header {
++        if (s.rows) |*r| if (s.rank == 0) @import("cuda_batch_hop.zig").settle(r.hop()) catch |err| {
++            s.poison();
++            return err;
++        };
++        const h = try s.post(input, payload);
+         try s.drain();
+-        return s.post(input, payload);
++        return h;
+     }
+ 
+-    /// The late chunk's rows and ack before any other command (rank 0 at --pp 2).
++    /// The last command's ack, once the next is posted: rank 1 starts it without waiting for rank 0 to read.
+     fn drain(s: *Session) !void {
+-        if (s.rank != 0) return;
+-        errdefer s.poison();
+-        if (s.rows) |*r| try @import("cuda_batch_hop.zig").settle(r.hop());
+-        if (s.late) |h| {
+-            s.late = null;
+-            try s.ack(h);
+-        }
++        if (s.late) |h| try s.ack(h);
++        s.late = null;
++    }
++
++    /// A pipeline's ack waits for the next command (its errors end the session either way); one rank reads it now.
++    pub fn later(s: *Session, h: wire.Header) !void {
++        if (s.rows != null) s.late = h else try s.ack(h);
+     }
+ 
+     fn post(s: *Session, input: wire.Header, payload: []const u8) !wire.Header {
+@@ -239,17 +245,13 @@ pub const Session = struct {
+     pub fn forward(s: *Session, comptime Tri: type, tri: Tri, q: *prompt.Seq, ids: []const u32, hooks: prompt.batch.Hooks) !void {
+         if (ids.len == 0 or ids.len > wire.max_payload / 4 or q.fed + ids.len > q.cap or hooks.keep != null or hooks.logits == .all) return error.UnsupportedRankOperation;
+         try tokenIds(ids);
+-        // a pipeline's rows return on every chunk when rank 0 reads them; a late chunk's ack waits
+         const always = s.rows != null and @import("cuda_batch_hop.zig").always(hooks);
+         const flags = @backingInt(hooks.logits) | @as(u32, @intFromBool(always)) << 8;
+         const h = try s.post(.{ .kind = .forward, .object = q.rank_id, .bytes = @intCast(ids.len * 4), .flags = flags }, std.mem.sliceAsBytes(ids));
+         errdefer s.poison();
+         try s.engine.forward(Tri, tri, q, ids, hooks);
+-        if (s.late) |prior| {
+-            s.late = null;
+-            try s.ack(prior);
+-        }
+-        if (hooks.stage.late != null) s.late = h else try s.ack(h);
++        try s.drain();
++        try s.later(h);
+     }
+ 
+     pub fn round(s: *Session, comptime Tri: type, tri: Tri, seqs: []const *prompt.Seq, ids: []const u32, out: u64) !void {
+@@ -266,7 +268,7 @@ pub const Session = struct {
+         const h = try s.command(.{ .kind = .round, .bytes = @intCast(bytes.len) }, bytes);
+         errdefer s.poison();
+         try s.engine.round(Tri, tri, seqs, ids, out);
+-        try s.ack(h);
++        try s.later(h);
+     }
+ 
+     /// Both ranks keep their own recurrent window; only the leader consumes draft scores and hidden rows.
+@@ -277,7 +279,7 @@ pub const Session = struct {
+         errdefer s.poison();
+         const ops: mtp.Ops(Tri) = .{ .e = s.engine, .tri = tri, .h = undefined };
+         try ops.verify(q, d, ids);
+-        try s.ack(h);
++        try s.later(h);
+     }
+ 
+     pub const verifyMany = verify_rows.send;
+@@ -290,7 +292,7 @@ pub const Session = struct {
+         errdefer s.poison();
+         try ops.rollback(q, d, count);
+         try s.collective.finish(s.engine.stream.*);
+-        try s.ack(h);
++        try s.later(h);
+     }
+ 
+     fn window(s: *Session, q: *prompt.Seq) !*mtp.Draft {
+diff --git a/zig/src/families/flashnext/cuda_rank_verify.zig b/zig/src/families/flashnext/cuda_rank_verify.zig
+index a9621e1f6..362239dbe 100644
+--- a/zig/src/families/flashnext/cuda_rank_verify.zig
++++ b/zig/src/families/flashnext/cuda_rank_verify.zig
+@@ -83,7 +83,7 @@ fn limitOf(s: *const Session) usize {
+     return @min(mtp.round_rows, s.engine.chunk);
+ }
+ 
+-/// Rank 0: the frame to rank 1, the same pass here, then rank 1's ack; a failure after the send poisons the session.
++/// Rank 0: the frame to rank 1, the same pass here, then rank 1's ack (at --pp 2 once the next frame is posted).
+ pub fn send(s: *Session, comptime Tri: type, tri: Tri, seqs: []const *prompt.Seq, ds: []const *mtp.Draft, idss: []const []const u32, out: u64) !void {
+     if (!s.drafting or seqs.len == 0 or seqs.len > max_windows or seqs.len != ds.len or seqs.len != idss.len) return error.UnsupportedRankOperation;
+     var ids: [max_windows]u64 = undefined;
+@@ -97,7 +97,7 @@ pub fn send(s: *Session, comptime Tri: type, tri: Tri, seqs: []const *prompt.Seq
+     errdefer s.poison();
+     const ops: mtp.Ops(Tri) = .{ .e = s.engine, .tri = tri, .h = undefined };
+     try ops.verifyMany(seqs, ds, idss, out);
+-    try s.ack(h);
++    try s.later(h);
+ }
+ 
+ /// Rank 1: every check before any state moves, every window draft made before any is borrowed, then the pass.
+-- 
+2.56.0
+

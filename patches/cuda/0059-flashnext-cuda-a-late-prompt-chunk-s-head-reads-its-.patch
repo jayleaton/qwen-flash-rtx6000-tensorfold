@@ -1,0 +1,33 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jay Leaton <58495321+jayleaton@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 03:33:11 +0700
+Subject: [PATCH 59/76] flashnext cuda: a late prompt chunk's head reads its
+ own tokens
+
+A pipeline pass absorbs the chunk before it into the MTP head; the next
+tokens of the chunk being passed were recorded before that, so the earlier
+rows were absorbed with the later chunk's tokens and every prompt of more
+than one chunk failed its next chunk's position check. They are recorded
+after the pass.
+---
+ zig/src/families/flashnext/cuda_mtp_ops.zig | 3 +--
+ 1 file changed, 1 insertion(+), 2 deletions(-)
+
+diff --git a/zig/src/families/flashnext/cuda_mtp_ops.zig b/zig/src/families/flashnext/cuda_mtp_ops.zig
+index f1750adb4..76785e889 100644
+--- a/zig/src/families/flashnext/cuda_mtp_ops.zig
++++ b/zig/src/families/flashnext/cuda_mtp_ops.zig
+@@ -108,9 +108,8 @@ pub fn Ops(comptime Tri: type) type {
+             const last = stop == ids.len;
+             const head_to = @min(stop, ids.len - 1);
+             const deferred = late != null and !last;
+-            if (deferred) d.late_ids = ids[at + 1 .. head_to + 1];
+             try o.forwardMain(seq, ids[at..stop], .{ .logits = if (last) .last else .none, .streams = d.streams.ptr, .prompt = true, .marks = marks, .stage = .{ .late = if (deferred) late else null } });
+-            if (!deferred and head_to > at) try o.forwardHead(d, ids[at + 1 .. head_to + 1], d.streams.ptr, false);
++            if (deferred) d.late_ids = ids[at + 1 .. head_to + 1] else if (head_to > at) try o.forwardHead(d, ids[at + 1 .. head_to + 1], d.streams.ptr, false);
+             if (last) d.prompt_last = d.streams.ptr + (stop - 1 - at) * wide * 2;
+         }
+ 
+-- 
+2.56.0
+

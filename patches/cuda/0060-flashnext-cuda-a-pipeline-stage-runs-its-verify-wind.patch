@@ -1,0 +1,488 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jay Leaton <58495321+jayleaton@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 09:54:56 +0700
+Subject: [PATCH 60/76] flashnext cuda: a pipeline stage runs its verify
+ windows as graphs
+
+A stage's drafted windows ran eagerly: the window graph was off whenever
+the engine had a hop. Each stage now captures its own layers with its
+boundary rows' send and receive, as --tp 2 captures its collectives:
+the nonblocking communicator waits on the host only, outside the graph.
+A pass that must settle a late prompt chunk's rows stays eager, and only
+the embedding stage gathers n-gram rows before a window.
+
+flashnext-span checks it on one GPU: after the two stages' prompt, each
+runs its windows on its own thread and stream, the rows crossing device
+flags a graph captures, and every window row's scores must equal the
+eager engine's; a planted control spoils rank 1's first rows.
+---
+ zig/src/families/flashnext/cuda_batch_hop.zig |   6 +
+ .../flashnext/cuda_prompt_windows.zig         |   7 +-
+ zig/src/families/flashnext/cuda_span_main.zig |  88 ++++++--
+ .../families/flashnext/cuda_span_threads.zig  | 201 ++++++++++++++++++
+ .../families/flashnext/cuda_window_graph.zig  |   8 +-
+ 5 files changed, 292 insertions(+), 18 deletions(-)
+ create mode 100644 zig/src/families/flashnext/cuda_span_threads.zig
+
+diff --git a/zig/src/families/flashnext/cuda_batch_hop.zig b/zig/src/families/flashnext/cuda_batch_hop.zig
+index 06daf05d8..f0ede71d2 100644
+--- a/zig/src/families/flashnext/cuda_batch_hop.zig
++++ b/zig/src/families/flashnext/cuda_batch_hop.zig
+@@ -40,6 +40,12 @@ pub fn back(h: anytype) bool {
+     return h.logits != .none or always(h) or h.stage.back;
+ }
+ 
++/// Whether a pass may run as a captured graph: no stage, or no late rows to settle (their absorb runs its own passes).
++pub fn graphs(hop: ?Hop) bool {
++    const h = hop orelse return true;
++    return h.late.rows == 0;
++}
++
+ /// The late rows' receive and their absorb (rank 0), before anything else crosses the hop.
+ pub fn settle(hop: Hop) !void {
+     const l = hop.late.*;
+diff --git a/zig/src/families/flashnext/cuda_prompt_windows.zig b/zig/src/families/flashnext/cuda_prompt_windows.zig
+index 8a719f075..692a3194b 100644
+--- a/zig/src/families/flashnext/cuda_prompt_windows.zig
++++ b/zig/src/families/flashnext/cuda_prompt_windows.zig
+@@ -6,13 +6,14 @@ const batch = prompt.batch;
+ const pocket = @import("cuda_pocket.zig");
+ const vocab = @import("cuda_prompt_wt.zig").vocab;
+ const window_graph = @import("cuda_window_graph.zig");
++const hops = @import("cuda_batch_hop.zig");
+ const Engine = prompt.Engine;
+ const Seq = prompt.Seq;
+ 
+-/// A drafted window on one GPU as a graph (one chunk, scores left on the device, no media or adds); true once run.
++/// A drafted window as a graph, a stage's with its hop (scores on the device, no media or adds); true once run.
+ pub fn forwardGraph(e: *Engine, comptime Tri: type, p: *batch.Pass(Tri), seq: *Seq, ids: []const u32, hooks: batch.Hooks) !bool {
+     if (!window_graph.enabled() or hooks.logits != .all or hooks.host_logits or hooks.moe_add != null) return false;
+-    if (ids.len > @import("cuda_mtp.zig").max_rows or ids.len > p.s.cap or e.collective != null or e.hop != null or seq.media != null or p.m.pocket != null) return false;
++    if (ids.len > @import("cuda_mtp.zig").max_rows or ids.len > p.s.cap or e.collective != null or !hops.graphs(e.hop) or seq.media != null or p.m.pocket != null) return false;
+     const key = window_graph.Key.init(seq, seq.fed, ids.len, p.s, p.seq.scores, @intFromPtr(p.m.layers.ptr), hooks);
+     try window_graph.stageWindow(p, ids, seq.fed);
+     try e.graphs.window.run(e.gpa, e.stream.*, key, window_graph.Chunk(batch.Pass(Tri)){ .p = p, .ids = ids, .pos0 = seq.fed });
+@@ -70,7 +71,7 @@ pub fn windows(e: *Engine, comptime Tri: type, tri: Tri, wins: []const Window, o
+     const media = for (wins) |w| {
+         if (w.seq.media != null) break true;
+     } else false;
+-    if (window_graph.enabled() and reads == .none and p.m.pocket == null and e.collective == null and e.hop == null and !media) {
++    if (window_graph.enabled() and reads == .none and p.m.pocket == null and e.collective == null and hops.graphs(e.hop) and !media) {
+         // on one GPU: staged, then the pass as a graph keyed by every lane's buffers
+         const attn = @import("cuda_batch_lanes.zig").useAttn(&p, ids.len);
+         const key = window_graph.SharedKey.init(lanes, s, scores, @intFromPtr(p.m.layers.ptr), out, attn);
+diff --git a/zig/src/families/flashnext/cuda_span_main.zig b/zig/src/families/flashnext/cuda_span_main.zig
+index feacd7781..c540edbaf 100644
+--- a/zig/src/families/flashnext/cuda_span_main.zig
++++ b/zig/src/families/flashnext/cuda_span_main.zig
+@@ -1,10 +1,11 @@
+-//! Two pipeline stages on one GPU against one engine: greedy tokens and every step's scores, byte for byte.
++//! Two pipeline stages on one GPU against one engine, byte for byte: greedy steps, then graph windows on two threads.
+ const std = @import("std");
+ const cuda = @import("cuda");
+ const flash = @import("flashnext");
+ 
+ const prompt = flash.prompt;
+ const Span = flash.span.Span;
++const threads = @import("cuda_span_threads.zig");
+ const wide = 4 * 2560;
+ const vocab = prompt.vocabulary;
+ 
+@@ -14,11 +15,12 @@ pub fn main(init: std.process.Init) !u8 {
+     const io = init.io;
+     const args = try init.minimal.args.toSlice(init.arena.allocator());
+     if (args.len < 5) {
+-        std.debug.print("usage: flashnext-span <model-dir> <ids-file> <count> <split>\n", .{});
++        std.debug.print("usage: flashnext-span <model-dir> <ids-file> <count> <split> [plant]\n", .{});
+         return 2;
+     }
+     const count = try std.fmt.parseInt(usize, args[3], 10);
+     const split = try std.fmt.parseInt(usize, args[4], 10);
++    const plant = args.len > 5 and std.mem.eql(u8, args[5], "plant");
+     const text = try std.Io.Dir.cwd().readFileAlloc(io, args[2], gpa, .limited(1 << 24));
+     defer gpa.free(text);
+     var ids: std.ArrayList(u32) = .empty;
+@@ -36,7 +38,9 @@ pub fn main(init: std.process.Init) !u8 {
+     var stream = try cuda.Stream.init(&driver, true);
+     defer stream.deinit();
+     const tri: flash.Tri = .{ .own = &glue, .s = stream };
+-    var run: Run = .{ .gpa = gpa, .io = io, .driver = &driver, .stream = &stream, .tri = tri, .dir = args[1], .ids = ids.items, .count = count };
++    const ref = try gpa.alloc(u8, count * vocab * 2);
++    defer gpa.free(ref);
++    var run: Run = .{ .gpa = gpa, .io = io, .driver = &driver, .stream = &stream, .tri = tri, .dir = args[1], .ids = ids.items, .count = count, .ref = ref };
+ 
+     const tokens = try gpa.alloc(u32, 2 * count);
+     defer gpa.free(tokens);
+@@ -55,6 +59,20 @@ pub fn main(init: std.process.Init) !u8 {
+         }
+     }
+     std.debug.print("split {d}: {d} prompt rows and {d} greedy steps, tokens and scores equal to one engine\n", .{ split, ids.items.len, count });
++    const got = try gpa.alloc(u8, count * vocab * 2);
++    defer gpa.free(got);
++    const g = try run.windows(&ctx, &glue, split, whole.tokens, got, plant);
++    for (0..count) |i| {
++        if (!std.mem.eql(u8, ref[i * vocab * 2 ..][0 .. vocab * 2], got[i * vocab * 2 ..][0 .. vocab * 2])) {
++            std.debug.print("split {d}: window row {d} differs from the eager engine{s}\n", .{ split, i, if (plant) " (planted)" else "" });
++            return 1;
++        }
++    }
++    if (g.captures == 0 or g.replays + g.updates == 0) {
++        std.debug.print("split {d}: the stages' windows ran no graph ({d} captured, {d} updated, {d} replayed)\n", .{ split, g.captures, g.updates, g.replays });
++        return 1;
++    }
++    std.debug.print("split {d}: {d} window rows on two threads equal to the eager engine; rank 0 graphs {d} captured, {d} updated, {d} replayed\n", .{ split, count, g.captures, g.updates, g.replays });
+     return 0;
+ }
+ 
+@@ -70,6 +88,8 @@ const Run = struct {
+     dir: []const u8,
+     ids: []const u32,
+     count: usize,
++    /// Every window row's scores on the whole engine, eagerly.
++    ref: []u8,
+ 
+     fn cap(r: *const Run) usize {
+         return r.ids.len + r.count;
+@@ -81,6 +101,46 @@ const Run = struct {
+         var seq = try e.newSeq(r.cap());
+         defer seq.deinit(r.gpa);
+         try greedy(r, out, &seq, Feed{ .e = e });
++        try threads.eager(e, r.tri, r.ids, out.tokens, r.cap(), r.ref);
++    }
++
++    /// Both stages' verify windows over `tokens`, each stage on its own thread and stream; rank 0's rows into `got`.
++    fn windows(r: *Run, ctx: *const cuda.Context, glue: *flash.Glue, split: usize, tokens: []const u32, got: []u8, plant: bool) !threads.Counts {
++        var other = try cuda.Stream.init(r.driver, true);
++        defer other.deinit();
++        const a = try prompt.Engine.initSpan(r.gpa, r.io, r.driver, r.stream, r.dir, try Span.ofRank(split, 0));
++        defer a.deinit();
++        const b = try prompt.Engine.initSpan(r.gpa, r.io, r.driver, &other, r.dir, try Span.ofRank(split, 1));
++        defer b.deinit();
++        const tri: flash.Tri = .{ .own = glue, .s = other };
++        var seq_a = try a.newSeq(r.cap());
++        defer seq_a.deinit(r.gpa);
++        var seq_b = try b.newSeq(r.cap());
++        defer seq_b.deinit(r.gpa);
++        var rows = try cuda.DeviceBuffer.alloc(r.driver, @min(r.ids.len, a.chunk) * wide * 2);
++        defer rows.free();
++        // the prompt in turn on one thread; the windows then cross device flags only
++        var ring: Ring = .{ .run = r, .b = b, .seq = &seq_b, .rows = rows.ptr, .tri = tri };
++        var late_a: flash.hop.Late = .{};
++        var late_b: flash.hop.Late = .{};
++        a.hop = .{ .ctx = &ring, .take = Ring.back, .give = Ring.on, .finish = Ring.finish, .late = &late_a };
++        b.hop = .{ .ctx = &ring, .take = Ring.in, .give = Ring.out, .finish = Ring.finish, .late = &late_b };
++        try (Feed{ .e = a, .ring = &ring }).forward(r, &seq_a, r.ids);
++        var pipe = try threads.Pipe.init(r.driver, r.io, flash.mtp.max_rows, plant);
++        defer pipe.deinit();
++        var ends = [2]threads.End{ .{ .pipe = &pipe, .stream = r.stream.*, .out = &pipe.on, .in = &pipe.back }, .{ .pipe = &pipe, .stream = other, .out = &pipe.back, .in = &pipe.on } };
++        a.hop = ends[0].hop();
++        b.hop = ends[1].hop();
++        var bufs: [4]cuda.DeviceBuffer = undefined;
++        for (&bufs, 0..) |*buf, i| buf.* = try cuda.DeviceBuffer.alloc(r.driver, if (i % 2 == 0) tokens.len * vocab * 2 else flash.mtp.max_rows * wide * 2);
++        defer for (&bufs) |*buf| buf.free();
++        var jobs = [2]threads.Job{
++            .{ .ctx = ctx, .pipe = &pipe, .e = a, .tri = r.tri, .seq = &seq_a, .tokens = tokens, .out = bufs[0].ptr, .streams = bufs[1].ptr },
++            .{ .ctx = ctx, .pipe = &pipe, .e = b, .tri = tri, .seq = &seq_b, .tokens = tokens, .out = bufs[2].ptr, .streams = bufs[3].ptr },
++        };
++        const counts = try threads.stages(&jobs);
++        try bufs[0].download(0, got);
++        return counts;
+     }
+ 
+     fn stages(r: *Run, split: usize, out: Out) !void {
+@@ -94,7 +154,7 @@ const Run = struct {
+         defer seq_b.deinit(r.gpa);
+         var rows = try cuda.DeviceBuffer.alloc(r.driver, @min(r.ids.len, a.chunk) * wide * 2);
+         defer rows.free();
+-        var ring: Ring = .{ .run = r, .b = b, .seq = &seq_b, .rows = rows.ptr };
++        var ring: Ring = .{ .run = r, .b = b, .seq = &seq_b, .rows = rows.ptr, .tri = r.tri };
+         var late_a: flash.hop.Late = .{};
+         var late_b: flash.hop.Late = .{};
+         a.hop = .{ .ctx = &ring, .take = Ring.back, .give = Ring.on, .finish = Ring.finish, .late = &late_a };
+@@ -126,45 +186,49 @@ fn greedy(r: *Run, out: Out, seq: *prompt.Seq, f: Feed) !void {
+     }
+ }
+ 
+-/// Both stages on one stream: rank 0's rows on to rank 1's pass over the same ids, then back, through `rows`.
++/// Both stages in turn on one thread: rank 0's rows on to rank 1's pass over the same ids, then back, through `rows`.
+ const Ring = struct {
+     run: *Run,
+     b: *prompt.Engine,
+     seq: *prompt.Seq,
+     rows: u64,
++    /// Rank 1's kernels on its engine's stream.
++    tri: flash.Tri,
+     ids: []const u32 = &.{},
+     at: usize = 0,
+ 
+-    fn copy(g: *Ring, dst: u64, src: u64, rows: usize) !void {
++    fn copy(g: *Ring, dst: u64, src: u64, rows: usize, s: *cuda.Stream) !void {
+         const d = g.run.driver;
+-        try d.check(d.api.cuMemcpyDtoDAsync_v2(dst, src, rows * wide * 2, g.run.stream.handle), "cuMemcpyDtoDAsync");
++        try d.check(d.api.cuMemcpyDtoDAsync_v2(dst, src, rows * wide * 2, s.handle), "cuMemcpyDtoDAsync");
+     }
+ 
+     /// Rank 0 gives its chunk's rows: rank 1's layers run on them before rank 0 takes them back.
+     fn on(ctx: *anyopaque, h: u64, rows: usize) anyerror!void {
+         const g: *Ring = @ptrCast(@alignCast(ctx));
+-        try g.copy(g.rows, h, rows);
+-        try g.b.forward(flash.Tri, g.run.tri, g.seq, g.ids[g.at..][0..rows], .{ .logits = .none, .stage = .{ .back = true } });
++        try g.copy(g.rows, h, rows, g.run.stream);
++        try g.run.stream.synchronize();
++        try g.b.forward(flash.Tri, g.tri, g.seq, g.ids[g.at..][0..rows], .{ .logits = .none, .stage = .{ .back = true } });
+         g.at += rows;
+     }
+ 
+     fn back(ctx: *anyopaque, h: u64, rows: usize) anyerror!void {
+         const g: *Ring = @ptrCast(@alignCast(ctx));
+-        try g.copy(h, g.rows, rows);
++        try g.copy(h, g.rows, rows, g.run.stream);
+     }
+ 
+     fn in(ctx: *anyopaque, h: u64, rows: usize) anyerror!void {
+         const g: *Ring = @ptrCast(@alignCast(ctx));
+-        try g.copy(h, g.rows, rows);
++        try g.copy(h, g.rows, rows, g.b.stream);
+     }
+ 
+     fn out(ctx: *anyopaque, h: u64, rows: usize) anyerror!void {
+         const g: *Ring = @ptrCast(@alignCast(ctx));
+-        try g.copy(g.rows, h, rows);
++        try g.copy(g.rows, h, rows, g.b.stream);
+     }
+ 
+     fn finish(ctx: *anyopaque) anyerror!void {
+         const g: *Ring = @ptrCast(@alignCast(ctx));
++        try g.b.stream.synchronize();
+         try g.run.stream.synchronize();
+     }
+ };
+diff --git a/zig/src/families/flashnext/cuda_span_threads.zig b/zig/src/families/flashnext/cuda_span_threads.zig
+new file mode 100644
+index 000000000..6a5bc3aae
+--- /dev/null
++++ b/zig/src/families/flashnext/cuda_span_threads.zig
+@@ -0,0 +1,201 @@
++//! Two pipeline stages on one GPU, a thread and a stream each, their rows through device flags a graph captures.
++const std = @import("std");
++const cuda = @import("cuda");
++const flash = @import("flashnext");
++
++const prompt = flash.prompt;
++const hops = flash.hop;
++const wide = 4 * 2560;
++const vocab = prompt.vocabulary;
++const Value = *const fn (cuda.abi.Stream, u64, u32, c_uint) callconv(.c) cuda.abi.Result;
++const wait_eq: c_uint = 1;
++
++/// Window sizes a verify pass takes in turn, so each size's graph is captured, then replayed and updated.
++pub const sizes = [_]usize{ 3, 1, 3, 1, 2, 2, 4, 4 };
++
++/// One direction's rows and its flag: 1 while rows wait for the taker, 0 once taken.
++const Slot = struct {
++    rows: cuda.DeviceBuffer,
++    flag: cuda.DeviceBuffer,
++
++    fn init(d: *cuda.Driver, bytes: usize) !Slot {
++        var s: Slot = .{ .rows = try cuda.DeviceBuffer.alloc(d, bytes), .flag = undefined };
++        errdefer s.rows.free();
++        s.flag = try cuda.DeviceBuffer.alloc(d, 256);
++        try s.flag.fill8(0, null);
++        return s;
++    }
++
++    fn deinit(s: *Slot) void {
++        s.rows.free();
++        s.flag.free();
++    }
++};
++
++/// The two stages' slots and the driver's stream memory operations.
++pub const Pipe = struct {
++    d: *cuda.Driver,
++    io: std.Io,
++    wait: Value,
++    write: Value,
++    on: Slot,
++    back: Slot,
++    /// Rank 1 spoils the first row it takes (a planted control: the check must then fail).
++    plant: bool = false,
++
++    pub fn init(d: *cuda.Driver, io: std.Io, rows: usize, plant: bool) !Pipe {
++        const wait = d.lib.lookup(Value, "cuStreamWaitValue32_v2") orelse return error.MissingSymbol;
++        const write = d.lib.lookup(Value, "cuStreamWriteValue32_v2") orelse return error.MissingSymbol;
++        var on = try Slot.init(d, rows * wide * 2);
++        errdefer on.deinit();
++        return .{ .d = d, .io = io, .wait = wait, .write = write, .on = on, .back = try Slot.init(d, rows * wide * 2), .plant = plant };
++    }
++
++    pub fn deinit(p: *Pipe) void {
++        p.on.deinit();
++        p.back.deinit();
++    }
++};
++
++/// One stage's end of the pipe on its own stream.
++pub const End = struct {
++    pipe: *Pipe,
++    stream: cuda.Stream,
++    out: *Slot,
++    in: *Slot,
++    late: hops.Late = .{},
++    planted: bool = false,
++
++    pub fn hop(e: *End) hops.Hop {
++        return .{ .ctx = e, .take = take, .give = give, .finish = finish, .late = &e.late };
++    }
++
++    fn of(ctx: *anyopaque) *End {
++        return @ptrCast(@alignCast(ctx));
++    }
++
++    fn check(e: *End, r: cuda.abi.Result, what: []const u8) !void {
++        try e.pipe.d.check(r, what);
++    }
++
++    fn give(ctx: *anyopaque, h: u64, rows: usize) anyerror!void {
++        const e = of(ctx);
++        const p = e.pipe;
++        try e.check(p.wait(e.stream.handle, e.out.flag.ptr, 0, wait_eq), "cuStreamWaitValue32");
++        try e.check(p.d.api.cuMemcpyDtoDAsync_v2(e.out.rows.ptr, h, rows * wide * 2, e.stream.handle), "cuMemcpyDtoDAsync");
++        try e.check(p.write(e.stream.handle, e.out.flag.ptr, 1, 0), "cuStreamWriteValue32");
++    }
++
++    fn take(ctx: *anyopaque, h: u64, rows: usize) anyerror!void {
++        const e = of(ctx);
++        const p = e.pipe;
++        try e.check(p.wait(e.stream.handle, e.in.flag.ptr, 1, wait_eq), "cuStreamWaitValue32");
++        try e.check(p.d.api.cuMemcpyDtoDAsync_v2(h, e.in.rows.ptr, rows * wide * 2, e.stream.handle), "cuMemcpyDtoDAsync");
++        try e.check(p.write(e.stream.handle, e.in.flag.ptr, 0, 0), "cuStreamWriteValue32");
++        if (p.plant and e.in == &p.on and !e.planted) {
++            e.planted = true;
++            try e.check(p.d.api.cuMemsetD8Async(h, 0x7f, 64, e.stream.handle), "cuMemsetD8Async");
++        }
++    }
++
++    fn finish(ctx: *anyopaque) anyerror!void {
++        const e = of(ctx);
++        try idle(e.pipe, e.stream);
++    }
++};
++
++/// A host wait for `s` that polls and sleeps: a blocking wait or busy poll keeps the driver lock from the other stage.
++fn idle(p: *const Pipe, s: cuda.Stream) !void {
++    while (true) {
++        const r = p.d.api.cuStreamQuery(s.handle);
++        if (r != cuda.abi.error_not_ready) return p.d.check(r, "cuStreamQuery");
++        p.io.sleep(.fromMicroseconds(50), .awake) catch {};
++    }
++}
++
++/// What one stage runs after its prompt: each window of `tokens`, every row's scores left on the device.
++pub const Job = struct {
++    ctx: *const cuda.Context,
++    pipe: *const Pipe,
++    e: *prompt.Engine,
++    tri: flash.Tri,
++    seq: *prompt.Seq,
++    tokens: []const u32,
++    /// Every window row's scores [tokens.len, vocab], and a window's streams [rows, wide], on the device.
++    out: u64,
++    streams: u64,
++    /// The window it is on, times 4, plus 1 while it issues it, 2 while it waits for its stream, 3 once done.
++    step: std.atomic.Value(u32) = .init(0),
++
++    /// A stage that fails ends the process: the other stage would wait on its flags forever.
++    pub fn run(j: *Job) void {
++        j.go() catch |err| {
++            std.log.err("stage at layer {d}: {t}", .{ j.e.span.first, err });
++            if (@errorReturnTrace()) |t| std.debug.dumpStackTrace(t);
++            std.process.exit(1);
++        };
++    }
++
++    fn go(j: *Job) !void {
++        try j.ctx.makeCurrent();
++        const e = j.e;
++        var at: usize = 0;
++        var i: usize = 0;
++        while (at < j.tokens.len) : (i += 1) {
++            const n = @min(sizes[i % sizes.len], j.tokens.len - at);
++            const out = j.out + at * vocab * 2;
++            j.step.store(@intCast(i * 4 + 1), .release);
++            try e.forward(flash.Tri, j.tri, j.seq, j.tokens[at..][0..n], .{ .logits = .all, .logits_out = out, .streams = j.streams, .host_logits = false });
++            at += n;
++        }
++        j.step.store(j.step.load(.acquire) + 1, .release);
++        try idle(j.pipe, e.stream.*);
++        j.step.store(j.step.load(.acquire) + 1, .release);
++    }
++};
++
++/// Every window row's scores on one engine, eagerly (host scores keep a window off the graph), into `scores`.
++pub fn eager(e: *prompt.Engine, tri: flash.Tri, ids: []const u32, tokens: []const u32, cap: usize, scores: []u8) !void {
++    const d = e.driver;
++    var seq = try e.newSeq(cap);
++    defer seq.deinit(e.gpa);
++    var out = try cuda.DeviceBuffer.alloc(d, flash.mtp.max_rows * vocab * 2);
++    defer out.free();
++    var streams = try cuda.DeviceBuffer.alloc(d, flash.mtp.max_rows * wide * 2);
++    defer streams.free();
++    try e.forward(flash.Tri, tri, &seq, ids, .{});
++    var at: usize = 0;
++    var i: usize = 0;
++    while (at < tokens.len) : (i += 1) {
++        const n = @min(sizes[i % sizes.len], tokens.len - at);
++        try e.forward(flash.Tri, tri, &seq, tokens[at..][0..n], .{ .logits = .all, .logits_out = out.ptr, .streams = streams.ptr, .host_logits = true });
++        try e.stream.synchronize();
++        try cuda.memory.download(d, out.ptr, scores[at * vocab * 2 ..][0 .. n * vocab * 2]);
++        at += n;
++    }
++}
++
++/// Rank 0's window graphs: captured, updated in place and replayed as they were.
++pub const Counts = struct { captures: u64, updates: u64, replays: u64 };
++
++/// Both stages' windows on their own threads and streams; rank 0's scores stay in its job's `out`.
++pub fn stages(jobs: *[2]Job) !Counts {
++    var threads: [2]std.Thread = undefined;
++    threads[1] = try std.Thread.spawn(.{}, Job.run, .{&jobs[1]});
++    threads[0] = std.Thread.spawn(.{}, Job.run, .{&jobs[0]}) catch |err| {
++        threads[1].join();
++        return err;
++    };
++    const io = jobs[0].pipe.io;
++    var waited: usize = 0;
++    while (jobs[0].step.load(.acquire) % 4 != 3 or jobs[1].step.load(.acquire) % 4 != 3) : (waited += 1) {
++        if (waited == 300) {
++            std.log.err("windows stalled: rank 0 at step {d}, rank 1 at step {d}", .{ jobs[0].step.load(.acquire), jobs[1].step.load(.acquire) });
++            std.process.exit(2);
++        }
++        io.sleep(.fromSeconds(1), .awake) catch {};
++    }
++    for (threads) |t| t.join();
++    const g = &jobs[0].e.graphs.window;
++    return .{ .captures = g.captures, .updates = g.updates, .replays = g.replays };
++}
+diff --git a/zig/src/families/flashnext/cuda_window_graph.zig b/zig/src/families/flashnext/cuda_window_graph.zig
+index 3e11f1a73..39130a61b 100644
+--- a/zig/src/families/flashnext/cuda_window_graph.zig
++++ b/zig/src/families/flashnext/cuda_window_graph.zig
+@@ -325,9 +325,11 @@ pub fn stageWindow(p: anytype, ids: []const u32, pos0: usize) !void {
+     try p.stage(ids);
+     const emb = s.hostEmb(n);
+     const xs = s.hostXs(n);
+-    var gather: parts.Gather = .{ .ngram = p.m.ngram, .history = p.seq.history[0..], .ids = ids, .emb = emb, .xs = xs, .io = p.io, .lanes = p.lanes };
+-    gather.main();
+-    if (gather.failed) |err| return err;
++    if (@import("cuda_batch_hop.zig").first(p.m) == 0) {
++        var gather: parts.Gather = .{ .ngram = p.m.ngram, .history = p.seq.history[0..], .ids = ids, .emb = emb, .xs = xs, .io = p.io, .lanes = p.lanes };
++        gather.main();
++        if (gather.failed) |err| return err;
++    }
+     try p.upload(s.ple_emb, std.mem.sliceAsBytes(emb));
+     try p.upload(s.ple_xs, std.mem.sliceAsBytes(xs));
+     try s.uploaded();
+-- 
+2.56.0
+

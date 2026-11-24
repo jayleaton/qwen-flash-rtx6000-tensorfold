@@ -1,0 +1,804 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jay Leaton <58495321+jayleaton@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 10:07:37 +0700
+Subject: [PATCH 68/76] flashnext cuda: --pp 2 rank 0 runs its stage on the
+ next window's guess during rank 1's behind TF_FLASHNEXT_PP_SPEC
+
+---
+ docs/environment.md                           |   5 +-
+ zig/src/families/flashnext/cuda_batch_hop.zig |  29 ++-
+ .../families/flashnext/cuda_images_test.zig   |   2 +
+ zig/src/families/flashnext/cuda_lanes.zig     |  14 +-
+ .../flashnext/cuda_lanes_admission_test.zig   |   1 +
+ .../families/flashnext/cuda_lanes_load.zig    |   3 +
+ .../flashnext/cuda_lanes_restore_test.zig     |   1 +
+ .../families/flashnext/cuda_lanes_verify.zig  |   1 +
+ zig/src/families/flashnext/cuda_mtp_draft.zig |  45 +++++
+ zig/src/families/flashnext/cuda_pp_spec.zig   | 181 ++++++++++++++++++
+ .../families/flashnext/cuda_pp_spec_pass.zig  | 170 ++++++++++++++++
+ .../families/flashnext/cuda_rank_engine.zig   |  21 +-
+ .../families/flashnext/cuda_window_graph.zig  |   1 +
+ zig/src/platform/environment.zig              |   3 +
+ .../platform/environment_flashnext_test.zig   |   4 +-
+ zig/tests/fixtures/gradient-serving.tsv       |   8 +-
+ 16 files changed, 457 insertions(+), 32 deletions(-)
+ create mode 100644 zig/src/families/flashnext/cuda_pp_spec.zig
+ create mode 100644 zig/src/families/flashnext/cuda_pp_spec_pass.zig
+
+diff --git a/docs/environment.md b/docs/environment.md
+index 818aaf5fb..bcd75fdd9 100644
+--- a/docs/environment.md
++++ b/docs/environment.md
+@@ -166,8 +166,10 @@ stops the start with the variable, the supplied text and the accepted forms.
+ | `TF_FLASHNEXT_GREEDY_WIDE` | Whole round width; default 4 |
+ | `TF_FLASHNEXT_WINDOW_ROWS` | Whole row count; default the shared round's rows, capped by them |
+ | `TF_FLASHNEXT_SPLIT_ROWS` | Whole row count; `0` or unset takes the link's default (64, the shared round's rows). At `--tp 2`, a pass of more rows than this reduce-scatters its experts' rows and gathers the sums instead of one all-reduce. Give every rank the same value. |
+-| `TF_FLASHNEXT_WINDOW_PAD` | Whole row count; default `0`, off. At `--tp 2` or `--pp 2`, a lone stream's verify window of fewer rows runs with its last token repeated up to this many (at most 32), so its window graphs see one width; the extra rows are never kept and the tokens are unchanged. |
++| `TF_FLASHNEXT_WINDOW_PAD` | Whole row count; default `0`, off. At `--tp 2` or `--pp 2`, a lone stream's verify window of fewer rows runs with its last token repeated up to this many (at most 32), so its window graphs see one width; the extra rows are never kept and the tokens are unchanged. Not applied while `TF_FLASHNEXT_PP_SPEC` is on. |
+ | `TF_FLASHNEXT_PP_WINDOW_GRAPH` | Exactly `0` or `1`; default off. `1`: at `--pp 2` each stage's verify windows run as CUDA graphs with their hop captured, whatever `TF_FLASHNEXT_WINDOW_GRAPH` says; the draft head's graphs still follow `TF_FLASHNEXT_WINDOW_GRAPH`. Same kernels and bits as the eager pass. Give every rank the same value. |
++| `TF_FLASHNEXT_PP_SPEC` | Exactly `0` or `1`; default off. `1` on both ranks of `--pp 2` (the ranks refuse to pair otherwise): during rank 1's stage of a lone greedy stream's drafted window, rank 0 runs its layers on a guess at the next window (every draft kept, the draft head's chain on from it) and sends those rows at once when that window is the one verified; a wrong guess is undone on rank 0 alone. The guess runs eagerly whatever the window graph settings say. Replies are unchanged. Inert outside `--pp 2` |
++| `TF_FLASHNEXT_PP_SPEC_LOG` | Exactly `0` or `1`; default off. `1` prints each guessing stream's guesses, hits, misses and rows rolled back when it ends |
+ | `TF_FLASHNEXT_TP_WINDOW_GRAPH` | Exactly `0` or `1`; default off. `1`: at `--tp 2` the drafted verify windows run as CUDA graphs on both ranks with their collectives captured, whatever `TF_FLASHNEXT_WINDOW_GRAPH` says; `TF_FLASHNEXT_PEER_SLOTS`' epoch moves to the device so a replay advances it. Same kernels and bits as the eager pass. Give every rank the same value. |
+ | `TF_FLASHNEXT_PEER_SLOTS` | Exactly `0` or `1`; default off. At `--tp 2` on one host, a pass of up to 128 rows exchanges its MoE slots by writing each rank's own experts' rows (and its half of the shared expert's) into the peer's mapped buffer, about half the bytes of the all-reduce or reduce-scatter, with the same sums. Refused across hosts and with `TF_FLASHNEXT_DECODE_GRAPH`. Give every rank the same value. |
+ | `TF_FLASHNEXT_READOUT_ROWS` | Whole row count; default 64; `0` never takes the tiles |
+@@ -177,6 +179,7 @@ stops the start with the variable, the supplied text and the accepted forms.
+ | `TF_FLASHNEXT_FACT_ROWS` | Whole row count; default 64; `0` never takes the tiles |
+ | `TF_FLASHNEXT_KV_PAGE_TEST` | Whole page size the kernels take: whole blocks of the indexer's ratio up to the window; unset or blank leaves the plain caches |
+ | `TF_FLASHNEXT_CONFIDENCE` | Finite number, negative values included; default -0.4, the chain's own stop |
++| `TF_FLASHNEXT_PP_SPEC_CONFIDENCE` | Finite number from 0 to 1; default 0.3. With `TF_FLASHNEXT_PP_SPEC=1`, rank 0 guesses only when the draft head's chance that the window keeps every draft and the next one starts with the guess is at least this |
+ | `TF_FLASHNEXT_PROMPT` | Exactly `rows` for the rows path; unset or blank keeps the plain path |
+ 
+ An on-by-default switch keeps the same kernels and bits as off; only the launch count changes.
+diff --git a/zig/src/families/flashnext/cuda_batch_hop.zig b/zig/src/families/flashnext/cuda_batch_hop.zig
+index d0792391c..9d1a9abee 100644
+--- a/zig/src/families/flashnext/cuda_batch_hop.zig
++++ b/zig/src/families/flashnext/cuda_batch_hop.zig
+@@ -28,7 +28,12 @@ pub const Absorb = struct {
+ };
+ 
+ /// A pass's rows at a stage: `late` lets rank 0's rows come back during the next pass; `back` tells rank 1 they return.
+-pub const Rows = struct { late: ?Absorb = null, back: bool = false };
++pub const Rows = struct {
++    late: ?Absorb = null,
++    back: bool = false,
++    split: bool = false, // rank 0: sent and no more (`rejoin` takes them back and runs the head)
++    hold: u64 = 0, // rank 0: copied to this address, none crossing
++};
+ 
+ /// Whether every chunk's rows return to the head's stage: the MTP head's streams, a keep, a late absorb.
+ pub fn always(h: anytype) bool {
+@@ -102,6 +107,7 @@ pub fn enter(pass: anytype, n: usize) !void {
+ pub fn leave(pass: anytype, logits_host: ?[]u8) !void {
+     const st = pass.m.stage orelse return pass.head(logits_host);
+     try pass.writeback(0, pass.rows);
++    if (pass.hooks.stage.hold != 0) return pass.copy(pass.hooks.stage.hold, pass.s.h, pass.rows * wt.wide * 2);
+     const returns = back(pass.hooks);
+     if (st.first > 0) {
+         if (returns) try st.hop.give(st.hop.ctx, pass.s.h, pass.rows);
+@@ -112,7 +118,7 @@ pub fn leave(pass: anytype, logits_host: ?[]u8) !void {
+     if (prior.rows > 0) try st.hop.take(st.hop.ctx, prior.landing, prior.rows);
+     try st.hop.give(st.hop.ctx, pass.s.h, pass.rows);
+     if (prior.rows > 0) if (prior.absorb) |a| try a.run(a.ctx, a.arg, prior.landing);
+-    if (!returns) return;
++    if (!returns or pass.hooks.stage.split) return;
+     if (pass.hooks.stage.late) |a| {
+         if (pass.rows * wt.wide * 2 > st.hop.late.cap) return error.UnexpectedTensor;
+         st.hop.late.rows = pass.rows;
+@@ -123,7 +129,14 @@ pub fn leave(pass: anytype, logits_host: ?[]u8) !void {
+     try pass.head(logits_host);
+ }
+ 
+-test "rank 0 posts a late chunk's receive before the next send and absorbs it after; rank 1 returns only read rows" {
++/// A split pass's rows back from the next stage, then the head over them (rank 0, after work it queued between).
++pub fn rejoin(pass: anytype) !void {
++    const st = pass.m.stage orelse return error.UnexpectedTensor;
++    try st.hop.take(st.hop.ctx, pass.s.h, pass.rows);
++    try pass.head(null);
++}
++
++test "rank 0 posts a late chunk's receive before the next send and absorbs it after; rank 1 returns only read rows; a split pass sends alone and a held one keeps its rows" {
+     const std = @import("std");
+     const Log = struct {
+         ops: [16]u8 = undefined,
+@@ -158,6 +171,9 @@ test "rank 0 posts a late chunk's receive before the next send and absorbs it af
+         fn head(f: *@This(), _: ?[]u8) !void {
+             f.log.add('H');
+         }
++        fn copy(f: *@This(), _: u64, _: u64, _: usize) !void {
++            f.log.add('C');
++        }
+     };
+     var log: Log = .{};
+     var late: Late = .{ .landing = 7, .cap = 4 * wt.wide * 2 };
+@@ -172,6 +188,13 @@ test "rank 0 posts a late chunk's receive before the next send and absorbs it af
+     try leave(&zero, null); // the late receive, this send, its absorb, then this chunk back and the head
+     try std.testing.expectEqualStrings("GGLGATH", log.ops[0..log.n]);
+     log.n = 0;
++    zero.hooks = .{ .logits = .all, .streams = 9, .stage = .{ .split = true } };
++    try leave(&zero, null); // sent alone, then back and the head once rank 0 rejoins
++    try rejoin(&zero);
++    zero.hooks = .{ .logits = .all, .stage = .{ .hold = 5 } };
++    try leave(&zero, null); // held: copied, nothing crosses
++    try std.testing.expectEqualStrings("GTHC", log.ops[0..log.n]);
++    log.n = 0;
+     var one: Fake = .{ .m = .{ .stage = .{ .first = 24, .hop = hop } }, .s = &h, .hooks = .{ .logits = .none }, .log = &log };
+     try leave(&one, null);
+     one.hooks = .{ .logits = .none, .stage = .{ .back = true } };
+diff --git a/zig/src/families/flashnext/cuda_images_test.zig b/zig/src/families/flashnext/cuda_images_test.zig
+index d22767c0c..cf15b68e1 100644
+--- a/zig/src/families/flashnext/cuda_images_test.zig
++++ b/zig/src/families/flashnext/cuda_images_test.zig
+@@ -60,6 +60,7 @@ fn run(comptime Cuda: type, comptime open: anytype, comptime drop: anytype, draf
+     self.engine = &engine;
+     self.stream = stream;
+     self.ranks = null;
++    self.spec = null;
+     self.head = if (drafting) &head else null;
+     self.vision = &v;
+     self.lanes = .empty;
+@@ -149,6 +150,7 @@ fn release(comptime Cuda: type, comptime open: anytype) !void {
+     self.engine = &engine;
+     self.stream = stream;
+     self.ranks = null;
++    self.spec = null;
+     self.head = null;
+     self.vision = null;
+     self.lanes = .empty;
+diff --git a/zig/src/families/flashnext/cuda_lanes.zig b/zig/src/families/flashnext/cuda_lanes.zig
+index e5c08ba65..16db5a3a6 100644
+--- a/zig/src/families/flashnext/cuda_lanes.zig
++++ b/zig/src/families/flashnext/cuda_lanes.zig
+@@ -159,6 +159,7 @@ pub fn Namespace(comptime Tri: type) type {
+             io: ?std.Io = null, // the load's: the arena's thread maps pieces ahead with it
+             vision: ?*@import("cuda_images.zig").Vision = null,
+             ranks: ?*ranks.Session = null,
++            spec: ?*@import("cuda_pp_spec.zig").Spec = null, // rank 0's guesses at --pp 2 (TF_FLASHNEXT_PP_SPEC)
+             head: ?*mtp.Head = null,
+             depth: usize = mtp.default_depth,
+             depth_greedy: usize = mtp.default_depth_greedy,
+@@ -197,12 +198,12 @@ pub fn Namespace(comptime Tri: type) type {
+ 
+             fn mainVerify(ptr: *anyopaque, q: *prompt.Seq, d: *mtp.Draft, ids: []const u32) anyerror!void {
+                 var wide: [mtp.max_rows]u32 = undefined;
+-                return of(ptr).ranks.?.verify(Tri, of(ptr).tri(), q, d, mtp.padded(&wide, ids, q.fed, q.cap));
++                return @import("cuda_pp_spec.zig").verify(Tri, of(ptr), q, d, if (of(ptr).spec == null) mtp.padded(&wide, ids, q.fed, q.cap) else ids);
+             }
+ 
+             fn mainRollback(ptr: *anyopaque, q: *prompt.Seq, d: *mtp.Draft, keep: usize) anyerror!void {
+                 const self = of(ptr);
+-                return self.ranks.?.keep(Tri, self.tri(), q, d, keep);
++                return @import("cuda_pp_spec.zig").rollback(Tri, self, q, d, keep);
+             }
+ 
+             pub fn backend(self: *Cuda) be.Backend {
+@@ -382,6 +383,7 @@ pub fn Namespace(comptime Tri: type) type {
+             own.engine.round_graph.clear();
+             own.logits.free();
+             if (own.head) |h| h.deinit();
++            if (own.spec) |sp| sp.deinit();
+             if (own.vision) |v| v.deinit();
+             if (own.ranks) |r| r.deinit();
+             if (own.kv.pool) |kp| kp.deinit();
+@@ -395,6 +397,7 @@ pub fn Namespace(comptime Tri: type) type {
+         fn dropLane(self: *Cuda, l: *Lane) void {
+             cuda.completion.drain(self.engine.driver, self.stream, "flashnext: a failed or closed lane did not drain");
+             snaps.dropPrepared(self, l);
++            if (self.spec) |sp| sp.drop(&l.seq);
+             if (l.draft != null and l.draft.?.late_ids.len != 0) @import("cuda_batch_hop.zig").forget(self.engine.hop.?);
+             if (l.draft) |*d| d.deinit();
+             if (self.ranks) |r| r.drop(&l.seq) else if (!self.kv.close(l.from, &l.seq)) l.seq.deinit(self.gpa);
+@@ -442,11 +445,7 @@ pub fn Namespace(comptime Tri: type) type {
+             return self.take(try self.tokenAt(&l.seq, s, position, mask));
+         }
+ 
+-        fn queueFn(ptr: *anyopaque, s: *lanes.Stream, feed: be.Feed, position: u64) anyerror!u64 {
+-            _ = ptr;
+-            _ = s;
+-            _ = feed;
+-            _ = position;
++        fn queueFn(_: *anyopaque, _: *lanes.Stream, _: be.Feed, _: u64) anyerror!u64 {
+             return error.NotPipelined;
+         }
+ 
+@@ -538,6 +537,7 @@ pub fn Namespace(comptime Tri: type) type {
+                 if (r.rows) |path| {
+                     for (path, 0..) |row, i| if (row != i) return error.TreesNotBuilt;
+                     if (r.follow.len < path.len) return error.PositionMismatch;
++                    if (try @import("cuda_pp_spec.zig").drafted(self, r, l, count)) continue;
+                     try self.ops().draft(d, r.follow[0..path.len], d.streams.ptr, r.position, count, r.stream.sampling, lanes_draft.stopFor(self, rule, r.stream.sampling), &l.chain);
+                 } else {
+                     const first = self.value(r.first orelse return error.NoFirstToken);
+diff --git a/zig/src/families/flashnext/cuda_lanes_admission_test.zig b/zig/src/families/flashnext/cuda_lanes_admission_test.zig
+index 055af0db5..5d1fc45ad 100644
+--- a/zig/src/families/flashnext/cuda_lanes_admission_test.zig
++++ b/zig/src/families/flashnext/cuda_lanes_admission_test.zig
+@@ -30,6 +30,7 @@ fn run(comptime Cuda: type, comptime open: anytype, comptime drop: anytype, coun
+     self.engine = &engine;
+     self.stream = stream;
+     self.ranks = null;
++    self.spec = null;
+     self.head = &head;
+     self.lanes = .empty;
+     self.parts = .{};
+diff --git a/zig/src/families/flashnext/cuda_lanes_load.zig b/zig/src/families/flashnext/cuda_lanes_load.zig
+index 115104a18..0a6217b9f 100644
+--- a/zig/src/families/flashnext/cuda_lanes_load.zig
++++ b/zig/src/families/flashnext/cuda_lanes_load.zig
+@@ -64,6 +64,7 @@ pub fn open(comptime F: type, gpa: std.mem.Allocator, io: std.Io, ctx: *const cu
+         id.mtp = @intFromBool(o.drafts);
+         id.kv_host = @backingInt(@import("cuda_kv_host.zig").mode);
+         id.split = if (o.pp != 1) try @import("cuda_span.zig").split() else 0;
++        id.pp_spec = @intFromBool(o.pp != 1 and try @import("cuda_pp_spec.zig").enabled());
+         if (o.vision) |v| {
+             try @import("qwen_vision").media.checkLimits(v);
+             id.image_tokens = v.image_tokens;
+@@ -117,6 +118,8 @@ pub fn open(comptime F: type, gpa: std.mem.Allocator, io: std.Io, ctx: *const cu
+         own.confidence = try @import("sys").environment.read(f64, "TF_FLASHNEXT_CONFIDENCE", mtp.default_confidence);
+     }
+     errdefer if (own.head) |h| h.deinit();
++    if (o.pp != 1 and own.head != null) own.spec = try @import("cuda_pp_spec.zig").Spec.init(gpa, own.engine, own.stream);
++    errdefer if (own.spec) |sp| sp.deinit();
+     @import("cuda_prompt_wt.zig").dropPageCache(gpa, io, dir, e.ngram.files.items);
+     const window = @min(o.context + mtp.max_rows, prompt.max_tokens);
+     // and an attention block's block scores at the window (64 MiB at 262,144 tokens)
+diff --git a/zig/src/families/flashnext/cuda_lanes_restore_test.zig b/zig/src/families/flashnext/cuda_lanes_restore_test.zig
+index e1237c357..8a09f979c 100644
+--- a/zig/src/families/flashnext/cuda_lanes_restore_test.zig
++++ b/zig/src/families/flashnext/cuda_lanes_restore_test.zig
+@@ -88,6 +88,7 @@ pub fn run(comptime Cuda: type, comptime open: anytype, comptime restore: anytyp
+     self.engine = &engine;
+     self.stream = stream;
+     self.ranks = &rank;
++    self.spec = null;
+     self.head = if (drafting) &head else null;
+     self.lanes = .empty;
+     self.parts = .{};
+diff --git a/zig/src/families/flashnext/cuda_lanes_verify.zig b/zig/src/families/flashnext/cuda_lanes_verify.zig
+index 3c67b79f5..af73deb50 100644
+--- a/zig/src/families/flashnext/cuda_lanes_verify.zig
++++ b/zig/src/families/flashnext/cuda_lanes_verify.zig
+@@ -12,6 +12,7 @@ pub fn windows(self: anytype, wins: []const be.Window, out: []be.Verified, draft
+     var seqs: [round_streams]*prompt.Seq = undefined;
+     var ds: [round_streams]*mtp.Draft = undefined;
+     var idss: [round_streams][]const u32 = undefined;
++    try @import("cuda_pp_spec.zig").before(self, wins);
+     var at: usize = 0;
+     while (at < drafted.len) {
+         var n: usize = 0;
+diff --git a/zig/src/families/flashnext/cuda_mtp_draft.zig b/zig/src/families/flashnext/cuda_mtp_draft.zig
+index 3367b74d2..a3ae06cda 100644
+--- a/zig/src/families/flashnext/cuda_mtp_draft.zig
++++ b/zig/src/families/flashnext/cuda_mtp_draft.zig
+@@ -299,6 +299,27 @@ pub const Draft = struct {
+         return d;
+     }
+ 
++    /// A window's records kept in `saved` (laid out as `l`) and `spare`, as `point` aims a draft's own (no log).
++    pub fn recordsIn(l: Layout, saved: u64, spare: []const cuda.DeviceBuffer) batch.Keep {
++        var k: batch.Keep = .{};
++        var li: usize = 0;
++        for (&k.layers, 0..) |*lk, layer| {
++            if (!wt.linearLayer(layer)) continue;
++            lk.hist = saved + l.hist_at + li * l.conv;
++            lk.proj = saved + l.proj_at + li * max_rows * l.proj;
++            lk.state_out = spare[li].ptr;
++            li += 1;
++        }
++        return k;
++    }
++
++    /// Another window's records (`saved` and `spare`, recordsIn's) become this draft's, its own theirs.
++    pub fn swapRecords(d: *Draft, saved: *cuda.DeviceBuffer, spare: []cuda.DeviceBuffer) void {
++        std.mem.swap(cuda.DeviceBuffer, &d.saved, saved);
++        for (&d.spare, spare) |*a, *b| std.mem.swap(cuda.DeviceBuffer, a, b);
++        d.point();
++    }
++
+     /// Each DeltaNet layer's window end state into its spare buffer.
+     fn aim(d: *Draft) void {
+         var li: usize = 0;
+@@ -403,3 +424,27 @@ test "the saved pieces follow one another at the model's heads, and the spares h
+     try std.testing.expectEqual(@as(usize, 41_021_440), Draft.Layout.of(.full).saved);
+     try std.testing.expectEqual(@as(usize, 20_930_560), Draft.Layout.of(.half).saved);
+ }
++
++test "a window's records swapped in aim the draft's keep where recordsIn laid them out, its own handed back" {
++    const fake = struct {
++        fn buf(ptr: u64) cuda.DeviceBuffer {
++            return .{ .d = undefined, .ptr = ptr, .len = 0, .borrowed = true };
++        }
++    };
++    var d: Draft = undefined;
++    d.layout = .of(.half);
++    d.log = null;
++    d.keep = .{};
++    d.saved = fake.buf(0x10000);
++    for (&d.spare, 0..) |*b, i| b.* = fake.buf(0x200000 + i * 0x1000);
++    d.point();
++    try std.testing.expectEqual(Draft.recordsIn(d.layout, d.saved.ptr, &d.spare), d.keep);
++    var saved = fake.buf(0x90000);
++    var spare: [linear_n]cuda.DeviceBuffer = undefined;
++    for (&spare, 0..) |*b, i| b.* = fake.buf(0x800000 + i * 0x1000);
++    const theirs = Draft.recordsIn(d.layout, saved.ptr, &spare);
++    d.swapRecords(&saved, &spare);
++    try std.testing.expectEqual(theirs, d.keep);
++    try std.testing.expectEqual(@as(u64, 0x10000), saved.ptr);
++    try std.testing.expectEqual(@as(u64, 0x200000 + 0x1000), spare[1].ptr);
++}
+diff --git a/zig/src/families/flashnext/cuda_pp_spec.zig b/zig/src/families/flashnext/cuda_pp_spec.zig
+new file mode 100644
+index 000000000..4ee3def62
+--- /dev/null
++++ b/zig/src/families/flashnext/cuda_pp_spec.zig
+@@ -0,0 +1,181 @@
++//! --pp 2 guesses (TF_FLASHNEXT_PP_SPEC): during rank 1's stage, rank 0 runs its layers on a guess at the next window.
++const std = @import("std");
++const cuda = @import("cuda");
++const lanes = @import("lanes");
++const wt = @import("cuda_prompt_wt.zig");
++const prompt = @import("cuda_prompt.zig");
++const mtp = @import("cuda_mtp.zig");
++const pass = @import("cuda_pp_spec_pass.zig");
++const be = lanes.backend;
++const environment = @import("sys").environment;
++
++/// The draft head's chance that a window keeps every draft and the next starts with the guess, below which none is run.
++pub const default_confidence: f64 = 0.3;
++
++/// TF_FLASHNEXT_PP_SPEC=1 on both ranks of --pp 2 (it joins their identity); off by default.
++pub fn enabled() !bool {
++    return environment.read(bool, "TF_FLASHNEXT_PP_SPEC", false);
++}
++
++/// Where a guess stands: none; run beside the window it follows (open); that window kept whole as guessed (held).
++pub const Phase = enum { none, open, held };
++
++/// Rank 0's guess at a lone greedy stream's next window: its rows, its records and the stream's counts.
++pub const Spec = struct {
++    gpa: std.mem.Allocator,
++    /// The guess's records as a draft lays out its own (`saved`, a spare state per DeltaNet layer) and its rows.
++    layout: mtp.Draft.Layout,
++    saved: cuda.DeviceBuffer,
++    spare: []cuda.DeviceBuffer,
++    stash: cuda.DeviceBuffer,
++    keep: prompt.batch.Keep,
++    confidence: f64,
++    log: bool,
++    phase: Phase = .none,
++    owner: ?*lanes.Stream = null,
++    owner_id: u64 = 0,
++    name: [64]u8 = undefined,
++    name_len: usize = 0,
++    /// The guessed window (its first token, then its drafts), the drafts' head probabilities, and its rows.
++    ids: [mtp.max_rows]u32 = undefined,
++    probs: [mtp.max_chain]f64 = undefined,
++    rows: usize = 0,
++    /// Rows of the window the guess follows, and the n-gram history past the guess.
++    after: usize = 0,
++    history: [2]i64 = .{ 0, 0 },
++    /// A hit's kept tokens, which the head absorbs once the guessed rows are on their way.
++    follow: [mtp.max_rows]u32 = undefined,
++    follow_n: usize = 0,
++    /// The drafts the stream's last request held at most.
++    depth: usize = mtp.default_depth_greedy,
++    attempts: u64 = 0,
++    hits: u64 = 0,
++    misses: u64 = 0,
++    rolled: u64 = 0,
++
++    /// Rank 0's buffers when TF_FLASHNEXT_PP_SPEC is on, else null.
++    pub fn init(gpa: std.mem.Allocator, e: *prompt.Engine, stream: cuda.Stream) !?*Spec {
++        if (!try enabled()) return null;
++        const layout = mtp.Draft.Layout.of(e.heads);
++        const confidence = try environment.read(f64, "TF_FLASHNEXT_PP_SPEC_CONFIDENCE", default_confidence);
++        const log = try environment.read(bool, "TF_FLASHNEXT_PP_SPEC_LOG", false);
++        const sp = try gpa.create(Spec);
++        errdefer gpa.destroy(sp);
++        sp.* = .{ .gpa = gpa, .layout = layout, .saved = undefined, .spare = undefined, .stash = undefined, .keep = .{}, .confidence = confidence, .log = log };
++        sp.saved = try cuda.DeviceBuffer.alloc(e.driver, layout.saved);
++        errdefer sp.saved.free();
++        sp.spare = try e.span.zeros(gpa, e.driver, stream, .linear, layout.state);
++        errdefer {
++            for (sp.spare) |*b| b.free();
++            gpa.free(sp.spare);
++        }
++        sp.stash = try cuda.DeviceBuffer.alloc(e.driver, mtp.max_rows * wt.wide * 2);
++        sp.keep = mtp.Draft.recordsIn(layout, sp.saved.ptr, sp.spare);
++        return sp;
++    }
++
++    pub fn deinit(sp: *Spec) void {
++        sp.stash.free();
++        for (sp.spare) |*b| b.free();
++        sp.gpa.free(sp.spare);
++        sp.saved.free();
++        sp.gpa.destroy(sp);
++    }
++
++    /// Whether `d` is the guessing stream's draft.
++    fn mine(sp: *const Spec, self: anytype, d: *const mtp.Draft) bool {
++        const l = self.lanes.getPtr(sp.owner orelse return false) orelse return false;
++        return if (l.draft) |*x| x == d else false;
++    }
++
++    /// A guess no window takes: undone on rank 0 by bit copies; a held one's kept rows still go into the head.
++    pub fn discard(sp: *Spec, self: anytype) !void {
++        const was = sp.phase;
++        if (was == .none) return;
++        sp.phase = .none;
++        const l = try self.lane(sp.owner.?);
++        try pass.undo(self.engine, sp, &l.seq);
++        sp.misses += 1;
++        sp.rolled += sp.rows;
++        if (was == .held) try pass.catchUp(self, sp, l);
++    }
++
++    /// The lone greedy text stream whose window is its whole held chain, as its own; null when it may not guess.
++    fn eligible(sp: *Spec, self: anytype, q: *prompt.Seq, d: *mtp.Draft, ids: []const u32) ?*lanes.Stream {
++        if (self.lanes.count() != 1 or ids.len < 2 or d.log != null or d.saved.borrowed or q.media != null or d.media != null) return null;
++        if (@import("cuda_batch_state.zig").verifyHostLogits()) return null;
++        var it = self.lanes.iterator();
++        const kv = it.next() orelse return null;
++        const s = kv.key_ptr.*;
++        const l = kv.value_ptr;
++        if (&l.seq != q or s.sampling != null or s.grammar != null or s.logprobs != null or s.images.len != 0) return null;
++        if (!std.meta.eql(s.penalties, lanes.Penalties{})) return null;
++        if (!std.mem.eql(u32, ids[1..], l.chain.slice()) or d.drafted > l.chain.n) return null;
++        if (sp.owner != s) {
++            sp.owner = s;
++            sp.owner_id = q.rank_id;
++            sp.name_len = @min(s.id.len, sp.name.len);
++            @memcpy(sp.name[0..sp.name_len], s.id[0..sp.name_len]);
++        }
++        return s;
++    }
++
++    /// The owner's sequence going away (TF_FLASHNEXT_PP_SPEC_LOG=1: its counts first); its guess needs no undo then.
++    pub fn drop(sp: *Spec, q: *const prompt.Seq) void {
++        if (sp.owner == null or sp.owner_id != q.rank_id) return;
++        if (sp.log) std.debug.print("PP_SPEC stream={s} attempts={d} hits={d} misses={d} rolled_back_rows={d}\n", .{ sp.name[0..sp.name_len], sp.attempts, sp.hits, sp.misses, sp.rolled });
++        sp.phase = .none;
++        sp.owner = null;
++        sp.owner_id = 0;
++        sp.attempts = 0;
++        sp.hits = 0;
++        sp.misses = 0;
++        sp.rolled = 0;
++    }
++};
++
++/// Rank 0's drafted window: the held guess's rows sent when this is the guessed window, else the pass with a guess.
++pub fn verify(comptime Tri: type, self: anytype, q: *prompt.Seq, d: *mtp.Draft, ids: []const u32) !void {
++    const r = self.ranks.?;
++    const sp = self.spec orelse return r.verify(Tri, self.tri(), q, d, ids);
++    if (sp.phase == .held and sp.mine(self, d) and std.mem.eql(u32, ids, sp.ids[0..sp.rows])) return pass.hit(Tri, self, sp, sp.owner.?, q, d);
++    try sp.discard(self);
++    const s = sp.eligible(self, q, d, ids) orelse return r.verify(Tri, self.tri(), q, d, ids);
++    return pass.attempt(Tri, self, sp, s, q, d, ids);
++}
++
++/// A keep of fewer rows than the window a guess follows drops the guess first; a held guess's window keeps whole.
++pub fn rollback(comptime Tri: type, self: anytype, q: *prompt.Seq, d: *mtp.Draft, keep: usize) !void {
++    if (self.spec) |sp| if (sp.phase != .none and keep < d.rows and sp.mine(self, d)) {
++        if (sp.phase == .held) return error.CannotRewind;
++        try sp.discard(self);
++    };
++    return self.ranks.?.keep(Tri, self.tri(), q, d, keep);
++}
++
++/// After `r`'s rollback: a whole window then the guess's first token makes the guess its chain (true); else it drops.
++pub fn drafted(self: anytype, r: be.DraftRequest, l: anytype, count: usize) !bool {
++    const sp = self.spec orelse return false;
++    if (self.lanes.count() == 1) sp.depth = r.depth;
++    if (sp.phase != .open or sp.owner != r.stream) return false;
++    const path = r.rows orelse return error.PositionMismatch;
++    if (path.len != sp.after or r.follow[path.len - 1] != sp.ids[0] or count + 1 < sp.rows) {
++        try sp.discard(self);
++        return false;
++    }
++    sp.phase = .held;
++    sp.follow_n = path.len;
++    @memcpy(sp.follow[0..path.len], r.follow[0..path.len]);
++    l.chain.n = sp.rows - 1;
++    @memcpy(l.chain.tokens[0..l.chain.n], sp.ids[1..sp.rows]);
++    @memcpy(l.chain.probs[0..l.chain.n], sp.probs[0..l.chain.n]);
++    return true;
++}
++
++/// Before a round's verify: a guess its stream's lone window cannot take (other windows beside it) is dropped first.
++pub fn before(self: anytype, wins: []const be.Window) !void {
++    if (!@hasField(@TypeOf(self.*), "spec")) return;
++    const sp = self.spec orelse return;
++    if (sp.phase == .none or (wins.len == 1 and wins[0].stream == sp.owner.?)) return;
++    try sp.discard(self);
++}
+diff --git a/zig/src/families/flashnext/cuda_pp_spec_pass.zig b/zig/src/families/flashnext/cuda_pp_spec_pass.zig
+new file mode 100644
+index 000000000..578a76d5c
+--- /dev/null
++++ b/zig/src/families/flashnext/cuda_pp_spec_pass.zig
+@@ -0,0 +1,170 @@
++//! Rank 0's device work for a --pp 2 guess: the window split at its send, the guess held, its undo and its promotion.
++const std = @import("std");
++const cuda = @import("cuda");
++const lanes = @import("lanes");
++const wt = @import("cuda_prompt_wt.zig");
++const prompt = @import("cuda_prompt.zig");
++const batch = prompt.batch;
++const mtp = @import("cuda_mtp.zig");
++const hops = @import("cuda_batch_hop.zig");
++const lanes_draft = @import("cuda_lanes_draft.zig");
++const Spec = @import("cuda_pp_spec.zig").Spec;
++
++const tail_bytes = wt.ple_tail_n * wt.wide * 2;
++
++fn copyAsync(st: cuda.Stream, dst: u64, src: u64, n: usize) !void {
++    if (n == 0) return;
++    try st.d.check(st.d.api.cuMemcpyDtoDAsync_v2(dst, src, n, st.handle), "cuMemcpyDtoDAsync");
++}
++
++/// Window `ids` (the stream's whole chain): sent as Session.verify sends it, a guess run while rank 1 runs its stage.
++pub fn attempt(comptime Tri: type, self: anytype, sp: *Spec, s: *lanes.Stream, q: *prompt.Seq, d: *mtp.Draft, ids: []const u32) !void {
++    const r = self.ranks.?;
++    if (!r.drafting or ids.len > mtp.max_rows or q.fed + ids.len > q.cap) return error.UnsupportedRankOperation;
++    for (ids) |t| if (t >= wt.vocab) return error.InvalidToken;
++    const h = try r.command(.{ .kind = .verify, .object = q.rank_id, .bytes = @intCast(ids.len * 4) }, std.mem.sliceAsBytes(ids));
++    errdefer r.poison();
++    var p = try open(Tri, self.engine, self.tri(), q, d, ids);
++    try guess(Tri, self, sp, s, q, d);
++    try hops.rejoin(&p);
++    try r.later(h);
++}
++
++/// The held guess is the window verified: its rows sent at once, its records the draft's, then the next guess.
++pub fn hit(comptime Tri: type, self: anytype, sp: *Spec, s: *lanes.Stream, q: *prompt.Seq, d: *mtp.Draft) !void {
++    const r = self.ranks.?;
++    const e = self.engine;
++    const m = sp.rows;
++    const h = try r.command(.{ .kind = .verify, .object = q.rank_id, .bytes = @intCast(m * 4) }, std.mem.sliceAsBytes(sp.ids[0..m]));
++    errdefer r.poison();
++    const hop = e.hop.?;
++    try hop.give(hop.ctx, sp.stash.ptr, m);
++    var p = try passOf(Tri, e, self.tri(), q, m, .{ .logits = .all, .logits_out = d.logits.ptr, .keep = &d.keep, .streams = d.streams.ptr, .host_logits = false, .stage = .{ .split = true } });
++    p.rows = m;
++    p.pos0 = q.fed;
++    // the window as Ops.verify leaves it: its rows and records, the sequence past it, the end states in the spares
++    d.settle(q);
++    d.fed0 = q.fed;
++    d.rows = m;
++    d.history = q.history;
++    @memcpy(d.ids[0..m], sp.ids[0..m]);
++    d.swapRecords(&sp.saved, sp.spare);
++    sp.keep = mtp.Draft.recordsIn(sp.layout, sp.saved.ptr, sp.spare);
++    q.fed += m;
++    q.history = sp.history;
++    d.open = true;
++    sp.phase = .none;
++    sp.hits += 1;
++    try catchUp(self, sp, try self.lane(s));
++    try guess(Tri, self, sp, s, q, d);
++    try hops.rejoin(&p);
++    try r.later(h);
++}
++
++/// A held guess's window's kept rows into the head (Ops.absorb, deferred past the send); scores when no chain follows.
++pub fn catchUp(self: anytype, sp: *const Spec, l: anytype) !void {
++    const d = &l.draft.?;
++    try self.ops().absorb(d, sp.follow[0..sp.follow_n], d.streams.ptr, l.chain.n == 0);
++}
++
++/// The guess undone on rank 0 with bit copies: each DeltaNet conv window and the n-gram tail as before it ran.
++pub fn undo(e: *prompt.Engine, sp: *const Spec, q: *prompt.Seq) !void {
++    const st = e.stream.*;
++    for (e.own(), e.span.first..) |*lw, layer| if (lw.linear) try copyAsync(st, q.conv[wt.linearIndex(layer)].ptr, sp.keep.layers[layer].hist, sp.layout.conv);
++    try copyAsync(st, q.tail.ptr, sp.saved.ptr + sp.layout.tail_at, tail_bytes);
++}
++
++/// Ops.verify's window on rank 0 up to its send: the records a rollback reads, then the pass split before its receive.
++fn open(comptime Tri: type, e: *prompt.Engine, tri: Tri, q: *prompt.Seq, d: *mtp.Draft, ids: []const u32) !batch.Pass(Tri) {
++    const n = ids.len;
++    if (!d.layout.heads.eql(q.heads)) return error.DraftHeads;
++    d.settle(q);
++    d.fed0 = q.fed;
++    d.rows = n;
++    d.history = q.history;
++    @memcpy(d.ids[0..n], ids);
++    const st = e.stream.*;
++    try copyAsync(st, d.saved.ptr + d.layout.tail_at, q.tail.ptr, tail_bytes);
++    const hooks: batch.Hooks = .{ .logits = .all, .logits_out = d.logits.ptr, .keep = &d.keep, .streams = d.streams.ptr, .host_logits = false, .stage = .{ .split = true } };
++    var p = try passOf(Tri, e, tri, q, n, hooks);
++    if (!try @import("cuda_prompt_windows.zig").forwardGraph(e, Tri, &p, q, ids, hooks)) {
++        try p.chunk(ids, q.fed, null);
++        q.fed += n;
++    }
++    // a replayed graph sets none of the pass's host fields: the head reads its rows, written back with none pending
++    p.rows = n;
++    p.pos0 = d.fed0;
++    p.pending = null;
++    p.pending_f32 = false;
++    try copyAsync(st, d.saved.ptr + d.layout.nrow_at, e.batch_s.?.ple_nrow, n * wt.wide * 2);
++    d.open = true;
++    return p;
++}
++
++/// A pass over `rows` rows of `q` from q.fed with `hooks`, on the engine's scratch as Engine.forward builds it.
++fn passOf(comptime Tri: type, e: *prompt.Engine, tri: Tri, q: *prompt.Seq, rows: usize, hooks: batch.Hooks) !batch.Pass(Tri) {
++    if (rows == 0 or rows > e.chunk or q.fed + rows > q.cap) return error.UnexpectedTensor;
++    const s = try e.reserve(rows);
++    const scores = try e.reserveScores(q.cap, s.cap);
++    return .{ .gpa = e.gpa, .io = e.io, .stream = e.stream.*, .tri = tri, .k = &e.batch_k, .s = s, .m = if (q.untaught) e.shipped() else e.model(), .seq = q.view(scores), .hooks = hooks };
++}
++
++/// The next window guessed past `q`'s (every draft kept, the head's chain on), held if its chance clears the cut.
++fn guess(comptime Tri: type, self: anytype, sp: *Spec, s: *lanes.Stream, q: *prompt.Seq, d: *mtp.Draft) !void {
++    if (self.lanes.count() != 1) return;
++    const l = try self.lane(s);
++    const o = self.ops();
++    const rule = lanes_draft.rule(self, 1);
++    const depth = @min(@min(sp.depth, rule.greedy), mtp.max_chain);
++    // the guess's rows in the caches, the head through the chain and the guess in its own
++    if (d.drafted > l.chain.n or q.fed + 1 + depth > q.cap or d.len + (l.chain.n - d.drafted) + depth + 1 > d.cap) return;
++    // the window's rows sent: the head's picks below wait on the host for the stream's work alone
++    try self.engine.complete();
++    var chance: f64 = 1;
++    for (l.chain.probs[0..l.chain.n]) |p| chance *= p;
++    const from = d.drafted;
++    for (l.chain.tokens[from..l.chain.n], from..) |t, i| {
++        try o.forwardHead(d, &.{t}, d.out.ptr, i + 1 == l.chain.n);
++        d.drafted += 1;
++    }
++    const first = try o.pick(d, q.fed + 1, null);
++    chance *= first.prob;
++    if (chance < sp.confidence) return;
++    sp.ids[0] = first.token;
++    var n: usize = 1;
++    var stop: mtp.Stop = .{ .c = lanes_draft.stopFor(self, rule, null) };
++    var prev = first.token;
++    var j: usize = 0;
++    while (j < depth) : (j += 1) {
++        try o.forwardHead(d, &.{prev}, d.out.ptr, true);
++        d.drafted += 1;
++        const got = try o.pick(d, q.fed + 2 + j, null);
++        const t = stop.take(j, got.prob);
++        if (!t.propose) break;
++        sp.ids[n] = got.token;
++        sp.probs[j] = got.prob;
++        n += 1;
++        if (!t.more) break;
++        prev = got.token;
++    }
++    // a lone row would verify without records (Ops.verify keeps none for it): no guess
++    if (n < 2) return;
++    sp.rows = n;
++    sp.after = d.rows;
++    try held(Tri, self.engine, self.tri(), sp, q, d, sp.ids[0..n]);
++    sp.phase = .open;
++    sp.attempts += 1;
++}
++
++/// The guess `g` on rank 0's layers from the open window's end states, eagerly: rows into the stash, records its own.
++fn held(comptime Tri: type, e: *prompt.Engine, tri: Tri, sp: *Spec, q: *prompt.Seq, d: *mtp.Draft, g: []const u32) !void {
++    const st = e.stream.*;
++    sp.history = q.history;
++    try copyAsync(st, sp.saved.ptr + sp.layout.tail_at, q.tail.ptr, tail_bytes);
++    var p = try passOf(Tri, e, tri, q, g.len, .{ .logits = .all, .keep = &sp.keep, .host_logits = false, .stage = .{ .hold = sp.stash.ptr } });
++    // the open window's end states in, the guess's to its own spares; its n-gram history its own
++    p.seq.state = &d.spare;
++    p.seq.history = &sp.history;
++    try p.chunk(g, q.fed, null);
++    try copyAsync(st, sp.saved.ptr + sp.layout.nrow_at, e.batch_s.?.ple_nrow, g.len * wt.wide * 2);
++}
+diff --git a/zig/src/families/flashnext/cuda_rank_engine.zig b/zig/src/families/flashnext/cuda_rank_engine.zig
+index 2b51bab82..357856ea1 100644
+--- a/zig/src/families/flashnext/cuda_rank_engine.zig
++++ b/zig/src/families/flashnext/cuda_rank_engine.zig
+@@ -28,6 +28,7 @@ pub const Identity = extern struct {
+     peer_slots: u64 = 0,
+     exchange: u64 = 0, // TF_FLASHNEXT_HIDDEN_SUM in bit 0 and TF_FLASHNEXT_OWNER_SLOTS in bit 1, as read at load
+     split: u64 = 0, // rank 1's first layer at --pp 2 (0: tensor ranks, every layer on both)
++    pp_spec: u64 = 0, // rank 0 guesses at the next window during rank 1's stage at --pp 2 (TF_FLASHNEXT_PP_SPEC)
+ };
+ 
+ fn fileHash(a: std.mem.Allocator, io: std.Io, path: []const u8) ![32]u8 {
+@@ -519,21 +520,11 @@ test "rank identity binds checkpoint, config, index, program and execution setti
+     other = base;
+     other.chunk += 1;
+     try std.testing.expect(!sameIdentity(base, other));
+-    other = base;
+-    other.decode_graph = 1;
+-    try std.testing.expect(!sameIdentity(base, other));
+-    other = base;
+-    other.mtp = 1;
+-    try std.testing.expect(!sameIdentity(base, other));
+-    other = base;
+-    other.head_sharded = 1;
+-    try std.testing.expect(!sameIdentity(base, other));
+-    other = base;
+-    other.kv_host = @backingInt(@import("cuda_kv_host.zig").Mode.overflow);
+-    try std.testing.expect(!sameIdentity(base, other));
+-    other = base;
+-    other.split = 24;
+-    try std.testing.expect(!sameIdentity(base, other));
++    inline for (.{ "decode_graph", "mtp", "head_sharded", "kv_host", "split", "pp_spec" }) |name| {
++        other = base;
++        @field(other, name) = 1;
++        try std.testing.expect(!sameIdentity(base, other));
++    }
+ }
+ 
+ test "rank operations refuse invalid geometry and unsupported hooks before execution" {
+diff --git a/zig/src/families/flashnext/cuda_window_graph.zig b/zig/src/families/flashnext/cuda_window_graph.zig
+index 48c348f9c..b74f2d971 100644
+--- a/zig/src/families/flashnext/cuda_window_graph.zig
++++ b/zig/src/families/flashnext/cuda_window_graph.zig
+@@ -126,6 +126,7 @@ pub const Key = struct {
+         h.geometry(.at(pos0 + rows, seq.cap));
+         h.values(&[_]u64{ seq.gen, seq.cap, pieces(seq), s.h, s.cap, scores, model, hooks.logits_out, hooks.streams });
+         h.keep(hooks.keep);
++        if (hooks.stage.split) h.fixed(2); // rank 0's split window ends at its send; a plain window's key is unchanged
+         return .{ .rows = @intCast(rows), .shape = h.shape.final(), .moving = h.moving.final() };
+     }
+ };
+diff --git a/zig/src/platform/environment.zig b/zig/src/platform/environment.zig
+index dfd03a10e..efc0b327c 100644
+--- a/zig/src/platform/environment.zig
++++ b/zig/src/platform/environment.zig
+@@ -236,6 +236,8 @@ pub const rules = [_]Rule{
+     .{ .name = "TF_FLASHNEXT_WINDOW_ROWS", .scope = .flashnext, .kind = .size, .forms = "a whole row count from 0 to the native size maximum (default the shared round's rows; capped by them)" },
+     .{ .name = "TF_FLASHNEXT_WINDOW_PAD", .scope = .flashnext, .kind = .size, .forms = "a whole row count from 0 to the native size maximum (default 0: off; a lone drafted window narrower than this runs padded to it on the rank link)" },
+     .{ .name = "TF_FLASHNEXT_PP_WINDOW_GRAPH", .scope = .flashnext, .kind = .flag, .forms = "0 or 1 (default 0; 1: at --pp 2 the stage windows run as graphs); give every rank the same" },
++    .{ .name = "TF_FLASHNEXT_PP_SPEC", .scope = .flashnext, .kind = .flag, .forms = "0 or 1 (default 0; 1: at --pp 2 rank 0 runs its stage on a guess at the next window during rank 1's); give every rank the same" },
++    .{ .name = "TF_FLASHNEXT_PP_SPEC_LOG", .scope = .flashnext, .kind = .flag, .forms = "0 or 1 (default 0)" },
+     .{ .name = "TF_FLASHNEXT_TP_WINDOW_GRAPH", .scope = .flashnext, .kind = .flag, .forms = "0 or 1 (default 0; 1: at --tp 2 the verify windows run as graphs on both ranks); give every rank the same" },
+     .{ .name = "TF_FLASHNEXT_PEER_SLOTS", .scope = .flashnext, .kind = .flag, .forms = "0 or 1 (default 0; 1: at --tp 2 on one host the MoE exchange writes each rank's slots into the peer's mapped buffer); give every rank the same" },
+     .{ .name = "TF_FLASHNEXT_SPLIT_ROWS", .scope = .flashnext, .kind = .size, .forms = "a whole row count from 0 to the native size maximum (0 or unset: one host's default; more rows a pass than this split the --tp 2 expert exchange by rows); give every rank the same" },
+@@ -246,6 +248,7 @@ pub const rules = [_]Rule{
+     .{ .name = "TF_FLASHNEXT_FACT_ROWS", .scope = .flashnext, .kind = .size, .forms = "a whole row count from 0 to the native size maximum (default 64; 0 never takes the tiles)" },
+     .{ .name = "TF_FLASHNEXT_KV_PAGE_TEST", .scope = .flashnext, .kind = .size, .forms = "a page size the kernels take, whole blocks of the indexer's ratio up to the window (unset: off)" },
+     .{ .name = "TF_FLASHNEXT_CONFIDENCE", .scope = .flashnext, .kind = .signed_real, .forms = "a finite number (default -0.4)" },
++    .{ .name = "TF_FLASHNEXT_PP_SPEC_CONFIDENCE", .scope = .flashnext, .kind = .real, .max = 1, .forms = "a finite chance from 0 to 1 (default 0.3)" },
+     .{ .name = "TF_FLASHNEXT_PROMPT", .scope = .flashnext, .kind = .word, .words = &.{"rows"}, .forms = "rows for the rows path (unset or blank keeps the plain path)" },
+     .{ .name = "TENSORFOLD_API_KEY", .scope = .chat, .kind = .path, .trim = " \t\n\r\x0b\x0c", .forms = "API keys split by commas, without control characters (checked here by tensorfold chat --url)" },
+     // Family rank and prompt settings below are read through their own family's startup scope.
+diff --git a/zig/src/platform/environment_flashnext_test.zig b/zig/src/platform/environment_flashnext_test.zig
+index cdac355d7..7287687a4 100644
+--- a/zig/src/platform/environment_flashnext_test.zig
++++ b/zig/src/platform/environment_flashnext_test.zig
+@@ -33,13 +33,13 @@ fn check(name: []const u8, raw: []const u8, valid: bool) !void {
+     try t.expect(std.mem.endsWith(u8, why.?, e.rule(name).forms));
+ }
+ 
+-test "Flash Next strict env: the table holds all 47 settings: 31 switches, 12 integers, 1 real, 3 structured" {
++test "Flash Next strict env: the table holds all 50 settings: 33 switches, 12 integers, 2 reals, 3 structured" {
+     var counts: [4]usize = @splat(0);
+     for (e.rules) |r| if (r.scope == .flashnext) {
+         try t.expect(std.mem.startsWith(u8, r.name, "TF_FLASHNEXT_"));
+         counts[@backingInt(group(r))] += 1;
+     };
+-    try t.expectEqual([4]usize{ 31, 12, 1, 3 }, counts);
++    try t.expectEqual([4]usize{ 33, 12, 2, 3 }, counts);
+ }
+ 
+ test "Flash Next strict env: unset and blank settings both read as the caller's default" {
+diff --git a/zig/tests/fixtures/gradient-serving.tsv b/zig/tests/fixtures/gradient-serving.tsv
+index 261148408..1851ce71e 100644
+--- a/zig/tests/fixtures/gradient-serving.tsv
++++ b/zig/tests/fixtures/gradient-serving.tsv
+@@ -128,10 +128,10 @@ zig/src/families/flashnext/cuda_glue.zig	0bd837ea17d1bd0a7a0820dc0ee99c4da90113c
+ zig/src/families/flashnext/cuda_hc.zig	01f897ac65d6edd2cd6ac76d97cb4d96619c25ffa85bd619d6d76f4f465cda9a	raw
+ zig/src/families/flashnext/cuda_head.zig	734cc1ccea8e99ce9a061273a2dd3042f32e4848b622b5de616aa4b6f546bdd4	raw	#3749: TF_FLASHNEXT_SHARD_HEAD read through platform/environment.zig, blank as unset
+ zig/src/families/flashnext/cuda_images.zig	5bd8a6c06cb69440522f4392794d9ef52b3760195b97d96f2316b1acac271bd4	raw
+-zig/src/families/flashnext/cuda_images_test.zig	df984d54d9de1bb732544785cddf82a124de2a7019041ed1f7483b2a4a2d7c99	raw
+-zig/src/families/flashnext/cuda_lanes.zig	08156263df6edc1b81c60379aa1bb5ee7cd20c2b4fbf92df8b9cdcc2e404c3ca	raw	main 4f6017ced (marks inside the pass), fbca90714 (shared solo-chunk rule, #2391), 80e0fd72c (#2753: non-finite draft rows refused by name; finite rows unchanged), dfd9ac5ef4 (#2585: TF_FLASHNEXT_* read through platform/environment.zig, malformed text refused at startup; valid values keep their meaning), #1953: the ladder's values through snap_intermediate, #3308 (loader host test updates the named startup-refusal expectations; no runtime edit to this pinned file); #3135 (kept_disk renamed kept_view for the shared kept image; no served change), this change (the page pool opens with the load's device and io, for its arena mapped as pages are used; a new paged stream's first prompt step waits while the arena's thread maps its pieces; paging off: unchanged); F6: block-FP8 routed experts (Qwen's FP8 release) load a rank's whole experts and are admitted at --tp 2; the NVFP4 and affine paths keep their bytes; opt-in TF_FLASHNEXT_WINDOW_PAD pads a rank-link window; the first copy window keeps 16 rows
+-zig/src/families/flashnext/cuda_lanes_admission_test.zig	4b8052db793ba81f0e73e1b9bd77b1780bbc4fd550d90976d017da47e76faaa2	raw
+-zig/src/families/flashnext/cuda_lanes_load.zig	c1068b48fa62633235e383bb2cbe3c18d4291a9d93bb17f44a309f1124e99640	raw	main dfd9ac5ef4 (#2585: TF_FLASHNEXT_* read through platform/environment.zig, malformed text refused at startup; valid values keep their meaning), #3467: after load a shard drops its page cache except the n-gram ranges, and the sweep reaches nested shards; tensors and replies are unchanged, this change (the load's device and io handed to the page pool's arena; paging off: unchanged); opt-in TF_FLASHNEXT_DECODE_GRAPH no longer refused with the dense split; default serving unchanged; #2972: the first collective waits up to 10 minutes for the peer's load, and a peer that leaves ends the wait within seconds; F6: block-FP8 routed experts (Qwen's FP8 release) load a rank's whole experts and are admitted at --tp 2; the NVFP4 and affine paths keep their bytes; opt-in TF_FLASHNEXT_TP_WINDOW_GRAPH: --tp 2 verify windows as graphs, the peer epoch on the device; default serving unchanged
++zig/src/families/flashnext/cuda_images_test.zig	49d5d97e26b5214ffe3edb12a381c84118a8bf3da255c64be8f711c7da546cc4	raw
++zig/src/families/flashnext/cuda_lanes.zig	fa002a6c1a43e07bf96d26fd230f4dd2763999e4942402778d00e75d00a1200a	raw	main 4f6017ced (marks inside the pass), fbca90714 (shared solo-chunk rule, #2391), 80e0fd72c (#2753: non-finite draft rows refused by name; finite rows unchanged), dfd9ac5ef4 (#2585: TF_FLASHNEXT_* read through platform/environment.zig, malformed text refused at startup; valid values keep their meaning), #1953: the ladder's values through snap_intermediate, #3308 (loader host test updates the named startup-refusal expectations; no runtime edit to this pinned file); #3135 (kept_disk renamed kept_view for the shared kept image; no served change), this change (the page pool opens with the load's device and io, for its arena mapped as pages are used; a new paged stream's first prompt step waits while the arena's thread maps its pieces; paging off: unchanged); F6: block-FP8 routed experts (Qwen's FP8 release) load a rank's whole experts and are admitted at --tp 2; the NVFP4 and affine paths keep their bytes; opt-in TF_FLASHNEXT_WINDOW_PAD pads a rank-link window; the first copy window keeps 16 rows
++zig/src/families/flashnext/cuda_lanes_admission_test.zig	0c04ca112ad39d045b320d4c190c4589523fad255ecc2bd0d0cde141ff6dc23f	raw
++zig/src/families/flashnext/cuda_lanes_load.zig	3f94993baaa636d9b76a4c72a4ec4f5033c504855cb1f3eb13b997665bc61108	raw	main dfd9ac5ef4 (#2585: TF_FLASHNEXT_* read through platform/environment.zig, malformed text refused at startup; valid values keep their meaning), #3467: after load a shard drops its page cache except the n-gram ranges, and the sweep reaches nested shards; tensors and replies are unchanged, this change (the load's device and io handed to the page pool's arena; paging off: unchanged); opt-in TF_FLASHNEXT_DECODE_GRAPH no longer refused with the dense split; default serving unchanged; #2972: the first collective waits up to 10 minutes for the peer's load, and a peer that leaves ends the wait within seconds; F6: block-FP8 routed experts (Qwen's FP8 release) load a rank's whole experts and are admitted at --tp 2; the NVFP4 and affine paths keep their bytes; opt-in TF_FLASHNEXT_TP_WINDOW_GRAPH: --tp 2 verify windows as graphs, the peer epoch on the device; default serving unchanged
+ zig/src/families/flashnext/cuda_lanes_restore_test.zig	5d0ef1cac8d8704676505e50a7e46cc82a71803aadf7018d3da2136fdc71759c	raw	its rig names the collective's parent communicator; test only
+ zig/src/families/flashnext/cuda_launch.zig	12b9ba75f979f431d2e306e9e3cd636893760a6b69da7f6e379c4764cf681ce9	raw	exports cuda_moe_exchange.zig for its device test; no served change; #2837 (Flash Next TP=2 graph replay); its test block reaches cuda_collective.zig's host tests, no served change; #3413 exports cuda_tiles.zig and readout_fused.zig for their tests
+ zig/src/families/flashnext/cuda_media.zig	394601e8a807f5516f501efcaefa6fb3308f392ee322db7296b11c90814f8eea	raw
+-- 
+2.56.0
+

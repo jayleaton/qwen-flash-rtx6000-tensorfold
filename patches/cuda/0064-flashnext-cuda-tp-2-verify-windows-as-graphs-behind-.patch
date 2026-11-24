@@ -1,0 +1,393 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jay Leaton <58495321+jayleaton@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 22:16:18 +0700
+Subject: [PATCH 64/76] flashnext cuda: --tp 2 verify windows as graphs behind
+ TF_FLASHNEXT_TP_WINDOW_GRAPH; the peer exchange's epoch on the device
+
+---
+ docs/environment.md                           |  1 +
+ zig/kernels/cuda/flashnext_peer.cuh           | 26 +++++++++++---
+ .../core/contract/flashnext_cuda_records.zig  |  8 ++---
+ .../families/flashnext/cuda_lanes_load.zig    |  1 +
+ .../families/flashnext/cuda_peer_slots.zig    | 27 ++++++++++----
+ zig/src/families/flashnext/cuda_prompt.zig    |  3 +-
+ .../flashnext/cuda_prompt_windows.zig         | 36 +++++++++++++++++--
+ .../families/flashnext/cuda_window_graph.zig  |  6 ++++
+ zig/src/platform/environment.zig              |  1 +
+ .../platform/environment_flashnext_test.zig   |  4 +--
+ zig/tests/cuda/flashnext_hidden_sum_tests.zig |  7 +++-
+ zig/tests/fixtures/gradient-serving.tsv       |  4 +--
+ 12 files changed, 100 insertions(+), 24 deletions(-)
+
+diff --git a/docs/environment.md b/docs/environment.md
+index 886cc626b..ffa79df96 100644
+--- a/docs/environment.md
++++ b/docs/environment.md
+@@ -166,6 +166,7 @@ stops the start with the variable, the supplied text and the accepted forms.
+ | `TF_FLASHNEXT_GREEDY_WIDE` | Whole round width; default 4 |
+ | `TF_FLASHNEXT_WINDOW_ROWS` | Whole row count; default the shared round's rows, capped by them |
+ | `TF_FLASHNEXT_SPLIT_ROWS` | Whole row count; `0` or unset takes the link's default (64, the shared round's rows). At `--tp 2`, a pass of more rows than this reduce-scatters its experts' rows and gathers the sums instead of one all-reduce. Give every rank the same value. |
++| `TF_FLASHNEXT_TP_WINDOW_GRAPH` | Exactly `0` or `1`; default off. `1`: at `--tp 2` the drafted verify windows run as CUDA graphs on both ranks with their collectives captured, whatever `TF_FLASHNEXT_WINDOW_GRAPH` says; `TF_FLASHNEXT_PEER_SLOTS`' epoch moves to the device so a replay advances it. Same kernels and bits as the eager pass. Give every rank the same value. |
+ | `TF_FLASHNEXT_PEER_SLOTS` | Exactly `0` or `1`; default off. At `--tp 2` on one host, a pass of up to 128 rows exchanges its MoE slots by writing each rank's own experts' rows (and its half of the shared expert's) into the peer's mapped buffer, about half the bytes of the all-reduce or reduce-scatter, with the same sums. Refused across hosts and with `TF_FLASHNEXT_DECODE_GRAPH`. Give every rank the same value. |
+ | `TF_FLASHNEXT_READOUT_ROWS` | Whole row count; default 64; `0` never takes the tiles |
+ | `TF_FLASHNEXT_CHUNK` | Whole prompt rows a pass, 1 through 16384; default 3072 |
+diff --git a/zig/kernels/cuda/flashnext_peer.cuh b/zig/kernels/cuda/flashnext_peer.cuh
+index c00798dbd..940363239 100644
+--- a/zig/kernels/cuda/flashnext_peer.cuh
++++ b/zig/kernels/cuda/flashnext_peer.cuh
+@@ -17,6 +17,11 @@ __device__ __forceinline__ void fn_peer_cols(int pick, int first, int count, int
+     }
+ }
+ 
++// The exchange's epoch: the host's, or with `ep` set the device word the send advances (a graph replays it).
++__device__ __forceinline__ unsigned fn_peer_epoch(const unsigned* ep, unsigned epoch, unsigned ahead) {
++    return ep ? *ep + ahead : epoch;
++}
++
+ // An all-reduce's x + 0 for each lane: -0 becomes +0, every other value keeps its bits.
+ __device__ __forceinline__ float4 fn_peer_plus0(float4 v) {
+     return make_float4(v.x + 0.0f, v.y + 0.0f, v.z + 0.0f, v.w + 0.0f);
+@@ -27,7 +32,10 @@ extern "C" __global__ void __launch_bounds__(128) fn_peer_send(const float4* __r
+                                                                const int* __restrict__ picks, int p0, int first,
+                                                                int count, int shared_id, int split_shared, int rank,
+                                                                int q, unsigned* __restrict__ counter,
+-                                                               volatile unsigned* __restrict__ flag, unsigned epoch) {
++                                                               volatile unsigned* __restrict__ flag, unsigned epoch,
++                                                               unsigned* ep, long long half) {
++    epoch = fn_peer_epoch(ep, epoch, 1u);
++    rx += (epoch & 1u) * half;
+     const int p = p0 + blockIdx.x;
+     int c0, c1;
+     fn_peer_cols(picks[p], first, count, shared_id, split_shared, rank, q, c0, c1);
+@@ -40,6 +48,7 @@ extern "C" __global__ void __launch_bounds__(128) fn_peer_send(const float4* __r
+             *counter = 0u;
+             __threadfence_system();
+             *flag = epoch;
++            if (ep) *ep = epoch;
+         }
+     }
+ }
+@@ -49,7 +58,9 @@ extern "C" __global__ void __launch_bounds__(128) fn_peer_merge(float4* __restri
+                                                                 const int* __restrict__ picks, int p0, int first,
+                                                                 int count, int shared_id, int split_shared, int rank,
+                                                                 int q, volatile unsigned* __restrict__ flag,
+-                                                                unsigned epoch) {
++                                                                unsigned epoch, const unsigned* ep, long long half) {
++    epoch = fn_peer_epoch(ep, epoch, 0u);
++    rx += (epoch & 1u) * half;
+     if (threadIdx.x == 0) {
+         const long long start = clock64();
+         while (static_cast<int>(*flag - epoch) < 0)
+@@ -70,7 +81,10 @@ extern "C" __global__ void __launch_bounds__(128) fn_peer_merge(float4* __restri
+ // Rows r0.. (one block each) of this rank's FP32 hidden partials into the peer's rx; the last block raises its flag.
+ extern "C" __global__ void __launch_bounds__(128) fn_peer_rows_send(const float4* __restrict__ src, float4* __restrict__ rx,
+                                                                     int q, unsigned* __restrict__ counter,
+-                                                                    volatile unsigned* __restrict__ flag, unsigned epoch) {
++                                                                    volatile unsigned* __restrict__ flag, unsigned epoch,
++                                                                    unsigned* ep, long long half) {
++    epoch = fn_peer_epoch(ep, epoch, 1u);
++    rx += (epoch & 1u) * half;
+     const long long base = static_cast<long long>(blockIdx.x) * q;
+     for (int c = threadIdx.x; c < q; c += blockDim.x) rx[base + c] = src[base + c];
+     __syncthreads();
+@@ -80,13 +94,17 @@ extern "C" __global__ void __launch_bounds__(128) fn_peer_rows_send(const float4
+             *counter = 0u;
+             __threadfence_system();
+             *flag = epoch;
++            if (ep) *ep = epoch;
+         }
+     }
+ }
+ 
+ // Rows (one block each), once the peer's flag reaches `epoch`: own partial plus the peer's, the all-reduce's sum.
+ extern "C" __global__ void __launch_bounds__(128) fn_peer_rows_add(float4* __restrict__ dst, const float4* rx, int q,
+-                                                                   volatile unsigned* __restrict__ flag, unsigned epoch) {
++                                                                   volatile unsigned* __restrict__ flag, unsigned epoch,
++                                                                   const unsigned* ep, long long half) {
++    epoch = fn_peer_epoch(ep, epoch, 0u);
++    rx += (epoch & 1u) * half;
+     if (threadIdx.x == 0) {
+         const long long start = clock64();
+         while (static_cast<int>(*flag - epoch) < 0)
+diff --git a/zig/src/core/contract/flashnext_cuda_records.zig b/zig/src/core/contract/flashnext_cuda_records.zig
+index c49478bc1..287b71107 100644
+--- a/zig/src/core/contract/flashnext_cuda_records.zig
++++ b/zig/src/core/contract/flashnext_cuda_records.zig
+@@ -35,10 +35,10 @@ pub const cuda = [_]CudaRecord{
+     .{ .launch = .{ .name = "flashnext_hc fn_shared_scatter", .symbol = "fn_shared_scatter", .image = "flashnext_hc", .threads = 256 }, .usage = .{ .{ .regs = 12, .static = 0, .bound = 0 }, .{ .regs = 12, .static = 0, .bound = 0 }, .{ .regs = 12, .static = 0, .bound = 0 }, .{ .regs = 14, .static = 0, .bound = 0 }, .{ .regs = 14, .static = 0, .bound = 0 } } },
+     .{ .launch = .{ .name = "flashnext_hc fn_shared_swiglu", .symbol = "fn_shared_swiglu", .image = "flashnext_hc", .threads = 256 }, .usage = .{ .{ .regs = 17, .static = 0, .bound = 0 }, .{ .regs = 18, .static = 0, .bound = 0 }, .{ .regs = 18, .static = 0, .bound = 0 }, .{ .regs = 18, .static = 0, .bound = 0 }, .{ .regs = 18, .static = 0, .bound = 0 } } },
+     .{ .launch = .{ .name = "flashnext_batch fn_ep_picks", .symbol = "fn_ep_picks", .image = "flashnext_batch", .threads = 256 }, .usage = .{ .{ .regs = 10, .static = 0, .bound = 0 }, .{ .regs = 10, .static = 0, .bound = 0 }, .{ .regs = 10, .static = 0, .bound = 0 }, .{ .regs = 14, .static = 0, .bound = 0 }, .{ .regs = 14, .static = 0, .bound = 0 } } },
+-    .{ .launch = .{ .name = "flashnext_batch fn_peer_send", .symbol = "fn_peer_send", .image = "flashnext_batch", .threads = 128 }, .usage = .{ .{ .regs = 18, .static = 0, .bound = 128 }, .{ .regs = 18, .static = 0, .bound = 128 }, .{ .regs = 18, .static = 0, .bound = 128 }, .{ .regs = 16, .static = 0, .bound = 128 }, .{ .regs = 16, .static = 0, .bound = 128 } } },
+-    .{ .launch = .{ .name = "flashnext_batch fn_peer_merge", .symbol = "fn_peer_merge", .image = "flashnext_batch", .threads = 128 }, .usage = .{ .{ .regs = 20, .static = 0, .bound = 128 }, .{ .regs = 22, .static = 0, .bound = 128 }, .{ .regs = 22, .static = 0, .bound = 128 }, .{ .regs = 22, .static = 0, .bound = 128 }, .{ .regs = 22, .static = 0, .bound = 128 } } },
+-    .{ .launch = .{ .name = "flashnext_batch fn_peer_rows_send", .symbol = "fn_peer_rows_send", .image = "flashnext_batch", .threads = 128 }, .usage = .{ .{ .regs = 14, .static = 0, .bound = 128 }, .{ .regs = 18, .static = 0, .bound = 128 }, .{ .regs = 18, .static = 0, .bound = 128 }, .{ .regs = 18, .static = 0, .bound = 128 }, .{ .regs = 18, .static = 0, .bound = 128 } } },
+-    .{ .launch = .{ .name = "flashnext_batch fn_peer_rows_add", .symbol = "fn_peer_rows_add", .image = "flashnext_batch", .threads = 128 }, .usage = .{ .{ .regs = 14, .static = 0, .bound = 128 }, .{ .regs = 14, .static = 0, .bound = 128 }, .{ .regs = 14, .static = 0, .bound = 128 }, .{ .regs = 18, .static = 0, .bound = 128 }, .{ .regs = 18, .static = 0, .bound = 128 } } },
++    .{ .launch = .{ .name = "flashnext_batch fn_peer_send", .symbol = "fn_peer_send", .image = "flashnext_batch", .threads = 128 }, .usage = .{ .{ .regs = 24, .static = 0, .bound = 128 }, .{ .regs = 24, .static = 0, .bound = 128 }, .{ .regs = 24, .static = 0, .bound = 128 }, .{ .regs = 22, .static = 0, .bound = 128 }, .{ .regs = 22, .static = 0, .bound = 128 } } },
++    .{ .launch = .{ .name = "flashnext_batch fn_peer_merge", .symbol = "fn_peer_merge", .image = "flashnext_batch", .threads = 128 }, .usage = .{ .{ .regs = 22, .static = 0, .bound = 128 }, .{ .regs = 26, .static = 0, .bound = 128 }, .{ .regs = 26, .static = 0, .bound = 128 }, .{ .regs = 26, .static = 0, .bound = 128 }, .{ .regs = 26, .static = 0, .bound = 128 } } },
++    .{ .launch = .{ .name = "flashnext_batch fn_peer_rows_send", .symbol = "fn_peer_rows_send", .image = "flashnext_batch", .threads = 128 }, .usage = .{ .{ .regs = 22, .static = 0, .bound = 128 }, .{ .regs = 22, .static = 0, .bound = 128 }, .{ .regs = 22, .static = 0, .bound = 128 }, .{ .regs = 22, .static = 0, .bound = 128 }, .{ .regs = 22, .static = 0, .bound = 128 } } },
++    .{ .launch = .{ .name = "flashnext_batch fn_peer_rows_add", .symbol = "fn_peer_rows_add", .image = "flashnext_batch", .threads = 128 }, .usage = .{ .{ .regs = 16, .static = 0, .bound = 128 }, .{ .regs = 16, .static = 0, .bound = 128 }, .{ .regs = 16, .static = 0, .bound = 128 }, .{ .regs = 20, .static = 0, .bound = 128 }, .{ .regs = 20, .static = 0, .bound = 128 } } },
+     .{ .launch = .{ .name = "flashnext_batch fn_owner_rows", .symbol = "fn_owner_rows", .image = "flashnext_batch", .threads = 1024 }, .usage = .{ .{ .regs = 22, .static = 144, .bound = 1024 }, .{ .regs = 23, .static = 144, .bound = 1024 }, .{ .regs = 23, .static = 144, .bound = 1024 }, .{ .regs = 31, .static = 144, .bound = 1024 }, .{ .regs = 31, .static = 144, .bound = 1024 } } },
+     .{ .launch = .{ .name = "flashnext_batch fn_owner_pack", .symbol = "fn_owner_pack", .image = "flashnext_batch", .threads = 256 }, .usage = .{ .{ .regs = 29, .static = 0, .bound = 256 }, .{ .regs = 30, .static = 0, .bound = 256 }, .{ .regs = 30, .static = 0, .bound = 256 }, .{ .regs = 28, .static = 0, .bound = 256 }, .{ .regs = 32, .static = 0, .bound = 256 } } },
+     .{ .launch = .{ .name = "flashnext_batch fn_owner_sum", .symbol = "fn_owner_sum", .image = "flashnext_batch", .threads = 256 }, .usage = .{ .{ .regs = 40, .static = 0, .bound = 0 }, .{ .regs = 40, .static = 0, .bound = 0 }, .{ .regs = 40, .static = 0, .bound = 0 }, .{ .regs = 40, .static = 0, .bound = 0 }, .{ .regs = 40, .static = 0, .bound = 0 } } },
+diff --git a/zig/src/families/flashnext/cuda_lanes_load.zig b/zig/src/families/flashnext/cuda_lanes_load.zig
+index 0223975d2..115104a18 100644
+--- a/zig/src/families/flashnext/cuda_lanes_load.zig
++++ b/zig/src/families/flashnext/cuda_lanes_load.zig
+@@ -92,6 +92,7 @@ pub fn open(comptime F: type, gpa: std.mem.Allocator, io: std.Io, ctx: *const cu
+                 // a captured round would replay one epoch: the exchange's epochs are launch arguments
+                 if (@import("cuda_round_graph.zig").enabled()) return error.PeerSlotsWithDecodeGraph;
+                 r.collective.peer = try peer.PeerSlots.init(driver, r.link, o.rank, 30_000);
++                r.collective.peer.?.device = @import("cuda_window_graph.zig").ranks();
+             }
+         }
+         try r.afterLoad(io, ctx, own.stream);
+diff --git a/zig/src/families/flashnext/cuda_peer_slots.zig b/zig/src/families/flashnext/cuda_peer_slots.zig
+index f348d0c9b..fb4fd009d 100644
+--- a/zig/src/families/flashnext/cuda_peer_slots.zig
++++ b/zig/src/families/flashnext/cuda_peer_slots.zig
+@@ -25,6 +25,7 @@ const quads = wt.dims / 4;
+ const half = rows * wt.slots * wt.dims * 4; // one parity's receive rows
+ const flag_at = 2 * half; // the peer's epoch, then this rank's send counter a cache line on
+ const counter_at = flag_at + 128;
++const epoch_at = flag_at + 192; // with `device`, the epoch the send kernels advance
+ const bytes = flag_at + 256;
+ 
+ pub const PeerSlots = struct {
+@@ -35,6 +36,8 @@ pub const PeerSlots = struct {
+     peer: u64,
+     rank: usize,
+     epoch: u32 = 0,
++    /// The epoch and parity live on the device (TF_FLASHNEXT_TP_WINDOW_GRAPH), so a captured exchange replays.
++    device: bool = false,
+ 
+     /// Both ranks at the same point after load: a buffer each, handles swapped over `link`, the peer's mapped.
+     pub fn init(d: *const cuda.Driver, link: wire.Link, rank: usize, timeout_ms: u64) !PeerSlots {
+@@ -78,7 +81,7 @@ pub const PeerSlots = struct {
+     pub fn exchange(p: *PeerSlots, send_fn: cuda.Function, merge_fn: cuda.Function, stream: cuda.Stream, y: u64, picks: u64, send: [2]usize, merge: [2]usize, own: Owner) !void {
+         if (send[1] <= send[0] or merge[1] <= merge[0] or send[1] > rows or merge[1] > rows) return error.UnexpectedTensor;
+         p.epoch +%= 1;
+-        const rx = (p.epoch & 1) * half;
++        const rx = p.parity();
+         var a: cuda.Args = .{};
+         a.add(y);
+         a.add(p.peer + rx);
+@@ -86,7 +89,7 @@ pub const PeerSlots = struct {
+         p.common(&a, send[0], own);
+         a.add(p.local + counter_at);
+         a.add(p.peer + flag_at);
+-        a.add(p.epoch);
++        p.stamp(&a);
+         try cuda.launch.launch(send_fn, .{ .grid = .{ .x = @intCast((send[1] - send[0]) * wt.slots) }, .block = .{ .x = 128 } }, stream, &a);
+         var b: cuda.Args = .{};
+         b.add(y);
+@@ -94,7 +97,7 @@ pub const PeerSlots = struct {
+         b.add(picks);
+         p.common(&b, merge[0], own);
+         b.add(p.local + flag_at);
+-        b.add(p.epoch);
++        p.stamp(&b);
+         try cuda.launch.launch(merge_fn, .{ .grid = .{ .x = @intCast((merge[1] - merge[0]) * wt.slots) }, .block = .{ .x = 128 } }, stream, &b);
+     }
+ 
+@@ -102,7 +105,7 @@ pub const PeerSlots = struct {
+     pub fn sumRows(p: *PeerSlots, send_fn: cuda.Function, add_fn: cuda.Function, stream: cuda.Stream, buf: u64, n: usize) !void {
+         if (n == 0 or n > rows) return error.UnexpectedTensor;
+         p.epoch +%= 1;
+-        const rx = (p.epoch & 1) * half;
++        const rx = p.parity();
+         const grid: cuda.launch.Config = .{ .grid = .{ .x = @intCast(n) }, .block = .{ .x = 128 } };
+         var a: cuda.Args = .{};
+         a.add(buf);
+@@ -110,17 +113,29 @@ pub const PeerSlots = struct {
+         a.add(@as(i32, @intCast(quads)));
+         a.add(p.local + counter_at);
+         a.add(p.peer + flag_at);
+-        a.add(p.epoch);
++        p.stamp(&a);
+         try cuda.launch.launch(send_fn, grid, stream, &a);
+         var b: cuda.Args = .{};
+         b.add(buf);
+         b.add(p.local + rx);
+         b.add(@as(i32, @intCast(quads)));
+         b.add(p.local + flag_at);
+-        b.add(p.epoch);
++        p.stamp(&b);
+         try cuda.launch.launch(add_fn, grid, stream, &b);
+     }
+ 
++    /// The receive half this exchange writes: the host's parity, or 0 when the kernels choose it from the device epoch.
++    fn parity(p: *const PeerSlots) u64 {
++        return if (p.device) 0 else (p.epoch & 1) * half;
++    }
++
++    /// The epoch arguments: the host's count, or the device word and the parity stride in float4s.
++    fn stamp(p: *const PeerSlots, a: *cuda.Args) void {
++        a.add(p.epoch);
++        a.add(if (p.device) p.local + epoch_at else @as(u64, 0));
++        a.add(@as(i64, if (p.device) half / 16 else 0));
++    }
++
+     fn common(p: *const PeerSlots, a: *cuda.Args, row0: usize, own: Owner) void {
+         a.add(@as(i32, @intCast(row0 * wt.slots)));
+         a.add(@as(i32, @intCast(own.first)));
+diff --git a/zig/src/families/flashnext/cuda_prompt.zig b/zig/src/families/flashnext/cuda_prompt.zig
+index f1379cf94..5d5ad0f7f 100644
+--- a/zig/src/families/flashnext/cuda_prompt.zig
++++ b/zig/src/families/flashnext/cuda_prompt.zig
+@@ -237,8 +237,7 @@ pub const Engine = struct {
+ 
+     pub fn deinit(e: *Engine) void {
+         if (e.kept) |*s| s.deinit();
+-        e.round_graph.clear();
+-        e.graphs.clear(e.gpa);
++        @import("cuda_prompt_windows.zig").dropGraphs(e);
+         e.pockets.deinit();
+         if (e.batch_s) |*bs| bs.free(e.gpa);
+         if (e.scores) |*b| b.free();
+diff --git a/zig/src/families/flashnext/cuda_prompt_windows.zig b/zig/src/families/flashnext/cuda_prompt_windows.zig
+index b25482224..6ce19a71b 100644
+--- a/zig/src/families/flashnext/cuda_prompt_windows.zig
++++ b/zig/src/families/flashnext/cuda_prompt_windows.zig
+@@ -10,10 +10,40 @@ const hops = @import("cuda_batch_hop.zig");
+ const Engine = prompt.Engine;
+ const Seq = prompt.Seq;
+ 
++/// Whether a window may run as a graph: one GPU or a stage under TF_FLASHNEXT_WINDOW_GRAPH, --tp 2 under ranks().
++fn graphed(e: *Engine) bool {
++    const c = e.collective orelse return window_graph.enabled();
++    if (!window_graph.ranks()) return false;
++    c.release = .{ .ctx = e, .run = release };
++    return true;
++}
++
++/// Ahead of the communicator's abort, which waits on graphs holding its plans: an open capture ended, all freed.
++fn release(ctx: *anyopaque) void {
++    const e: *Engine = @ptrCast(@alignCast(ctx));
++    if ((cuda.graph.captureStatus(e.stream.*) catch .active) != .none) {
++        if (cuda.graph.endCapture(e.stream.*)) |g| {
++            var discarded = g;
++            discarded.deinit();
++        } else |_| {}
++    }
++    e.graphs.clear(e.gpa);
++    e.round_graph.clear();
++}
++
++/// The engine's graphs freed as it goes, and the communicator's hook to them dropped first.
++pub fn dropGraphs(e: *Engine) void {
++    if (e.collective) |c| if (c.release) |r| if (r.ctx == @as(*anyopaque, e)) {
++        c.release = null;
++    };
++    e.round_graph.clear();
++    e.graphs.clear(e.gpa);
++}
++
+ /// A drafted window as a graph, a stage's with its hop (scores on the device, no media or adds); true once run.
+ pub fn forwardGraph(e: *Engine, comptime Tri: type, p: *batch.Pass(Tri), seq: *Seq, ids: []const u32, hooks: batch.Hooks) !bool {
+-    if (!window_graph.enabled() or hooks.logits != .all or hooks.host_logits or hooks.moe_add != null) return false;
+-    if (ids.len > @import("cuda_mtp.zig").max_rows or ids.len > p.s.cap or e.collective != null or !hops.graphs(e.hop) or seq.media != null or p.m.pocket != null) return false;
++    if (hooks.logits != .all or hooks.host_logits or hooks.moe_add != null) return false;
++    if (ids.len > @import("cuda_mtp.zig").max_rows or ids.len > p.s.cap or !hops.graphs(e.hop) or !graphed(e) or seq.media != null or p.m.pocket != null) return false;
+     const key = window_graph.Key.init(seq, seq.fed, ids.len, p.s, p.seq.scores, @intFromPtr(p.m.layers.ptr), hooks);
+     try window_graph.stageWindow(p, ids, seq.fed);
+     try e.graphs.window.run(e.gpa, e.stream.*, key, window_graph.Chunk(batch.Pass(Tri)){ .p = p, .ids = ids, .pos0 = seq.fed });
+@@ -71,7 +101,7 @@ pub fn windows(e: *Engine, comptime Tri: type, tri: Tri, wins: []const Window, o
+     const media = for (wins) |w| {
+         if (w.seq.media != null) break true;
+     } else false;
+-    if (window_graph.enabled() and reads == .none and p.m.pocket == null and e.collective == null and hops.graphs(e.hop) and !media) {
++    if (reads == .none and p.m.pocket == null and hops.graphs(e.hop) and !media and graphed(e)) {
+         // on one GPU: staged, then the pass as a graph keyed by every lane's buffers
+         const attn = @import("cuda_batch_lanes.zig").useAttn(&p, ids.len);
+         const key = window_graph.SharedKey.init(lanes, s, scores, @intFromPtr(p.m.layers.ptr), out, attn);
+diff --git a/zig/src/families/flashnext/cuda_window_graph.zig b/zig/src/families/flashnext/cuda_window_graph.zig
+index 39130a61b..623d57b68 100644
+--- a/zig/src/families/flashnext/cuda_window_graph.zig
++++ b/zig/src/families/flashnext/cuda_window_graph.zig
+@@ -22,6 +22,12 @@ pub fn enabled() bool {
+     return @import("sys").environment.read(bool, "TF_FLASHNEXT_WINDOW_GRAPH", true) catch true;
+ }
+ 
++/// TF_FLASHNEXT_TP_WINDOW_GRAPH: --tp 2 verify windows as graphs on both ranks, the peer epoch on the device.
++pub fn ranks() bool {
++    // the startup check refused every malformed value already, so a plain default stands here
++    return @import("sys").environment.read(bool, "TF_FLASHNEXT_TP_WINDOW_GRAPH", false) catch false;
++}
++
+ /// attnRows' host values for rows ending at `ends` in a `cap`-token cache: dense chunks, the score grid (0: none).
+ pub const Geometry = struct {
+     chunks: u32,
+diff --git a/zig/src/platform/environment.zig b/zig/src/platform/environment.zig
+index 3ffa5d269..f62c6a06f 100644
+--- a/zig/src/platform/environment.zig
++++ b/zig/src/platform/environment.zig
+@@ -234,6 +234,7 @@ pub const rules = [_]Rule{
+     .{ .name = "TF_FLASHNEXT_DRAFTS_GREEDY", .scope = .flashnext, .kind = .size, .forms = "a whole draft count from 0 to the native size maximum (default 8; clamped to 1 through 15)" },
+     .{ .name = "TF_FLASHNEXT_GREEDY_WIDE", .scope = .flashnext, .kind = .size, .forms = "a whole round width from 0 to the native size maximum (default 4)" },
+     .{ .name = "TF_FLASHNEXT_WINDOW_ROWS", .scope = .flashnext, .kind = .size, .forms = "a whole row count from 0 to the native size maximum (default the shared round's rows; capped by them)" },
++    .{ .name = "TF_FLASHNEXT_TP_WINDOW_GRAPH", .scope = .flashnext, .kind = .flag, .forms = "0 or 1 (default 0; 1: at --tp 2 the verify windows run as graphs on both ranks); give every rank the same" },
+     .{ .name = "TF_FLASHNEXT_PEER_SLOTS", .scope = .flashnext, .kind = .flag, .forms = "0 or 1 (default 0; 1: at --tp 2 on one host the MoE exchange writes each rank's slots into the peer's mapped buffer); give every rank the same" },
+     .{ .name = "TF_FLASHNEXT_SPLIT_ROWS", .scope = .flashnext, .kind = .size, .forms = "a whole row count from 0 to the native size maximum (0 or unset: one host's default; more rows a pass than this split the --tp 2 expert exchange by rows); give every rank the same" },
+     .{ .name = "TF_FLASHNEXT_READOUT_ROWS", .scope = .flashnext, .kind = .size, .forms = "a whole row count from 0 to the native size maximum (default 64; 0 never takes the tiles)" },
+diff --git a/zig/src/platform/environment_flashnext_test.zig b/zig/src/platform/environment_flashnext_test.zig
+index 6406b2734..6889304ca 100644
+--- a/zig/src/platform/environment_flashnext_test.zig
++++ b/zig/src/platform/environment_flashnext_test.zig
+@@ -33,13 +33,13 @@ fn check(name: []const u8, raw: []const u8, valid: bool) !void {
+     try t.expect(std.mem.endsWith(u8, why.?, e.rule(name).forms));
+ }
+ 
+-test "Flash Next strict env: the table holds all 44 settings: 29 switches, 11 integers, 1 real, 3 structured" {
++test "Flash Next strict env: the table holds all 45 settings: 30 switches, 11 integers, 1 real, 3 structured" {
+     var counts: [4]usize = @splat(0);
+     for (e.rules) |r| if (r.scope == .flashnext) {
+         try t.expect(std.mem.startsWith(u8, r.name, "TF_FLASHNEXT_"));
+         counts[@backingInt(group(r))] += 1;
+     };
+-    try t.expectEqual([4]usize{ 29, 11, 1, 3 }, counts);
++    try t.expectEqual([4]usize{ 30, 11, 1, 3 }, counts);
+ }
+ 
+ test "Flash Next strict env: unset and blank settings both read as the caller's default" {
+diff --git a/zig/tests/cuda/flashnext_hidden_sum_tests.zig b/zig/tests/cuda/flashnext_hidden_sum_tests.zig
+index 31479bb97..1e1611462 100644
+--- a/zig/tests/cuda/flashnext_hidden_sum_tests.zig
++++ b/zig/tests/cuda/flashnext_hidden_sum_tests.zig
+@@ -24,7 +24,12 @@ pub fn run(gpu: check.Gpu, c: *Collective, stream: cuda.Stream, rank: usize) !vo
+     var peer = try PeerSlots.init(gpu.d, c.link, rank, 30_000);
+     defer peer.deinit();
+     for ([_]usize{ 1, 4, 16, 64, 65, 128, 3072, 8192 }) |n| try pass(gpu, c, &peer, stream, k, rank, n);
+-    check.pass("rank {d}: --tp 2's hidden-size exchange, over NCCL and over the peer's buffer, equals --tp 1's owner-order bytes, within gamma_{d} of FP64; planted controls fail", .{ rank, steps });
++    // a fresh buffer whose epoch lives on the device, as TF_FLASHNEXT_TP_WINDOW_GRAPH runs it
++    var graphed = try PeerSlots.init(gpu.d, c.link, rank, 30_000);
++    defer graphed.deinit();
++    graphed.device = true;
++    for ([_]usize{ 1, 4, 128, 1, 64 }) |n| try pass(gpu, c, &graphed, stream, k, rank, n);
++    check.pass("rank {d}: --tp 2's hidden-size exchange, over NCCL and over the peer's buffer (host and device epochs), equals --tp 1's owner-order bytes, within gamma_{d} of FP64; planted controls fail", .{ rank, steps });
+ }
+ 
+ fn mix(x: u64) u64 {
+diff --git a/zig/tests/fixtures/gradient-serving.tsv b/zig/tests/fixtures/gradient-serving.tsv
+index d82f4ca69..e14c6f175 100644
+--- a/zig/tests/fixtures/gradient-serving.tsv
++++ b/zig/tests/fixtures/gradient-serving.tsv
+@@ -131,7 +131,7 @@ zig/src/families/flashnext/cuda_images.zig	5bd8a6c06cb69440522f4392794d9ef52b376
+ zig/src/families/flashnext/cuda_images_test.zig	df984d54d9de1bb732544785cddf82a124de2a7019041ed1f7483b2a4a2d7c99	raw
+ zig/src/families/flashnext/cuda_lanes.zig	e95c760a89dd5df368ab51fa695020b66d90bac2304d343fa45cb7532396b83f	raw	main 4f6017ced (marks inside the pass), fbca90714 (shared solo-chunk rule, #2391), 80e0fd72c (#2753: non-finite draft rows refused by name; finite rows unchanged), dfd9ac5ef4 (#2585: TF_FLASHNEXT_* read through platform/environment.zig, malformed text refused at startup; valid values keep their meaning), #1953: the ladder's values through snap_intermediate, #3308 (loader host test updates the named startup-refusal expectations; no runtime edit to this pinned file); #3135 (kept_disk renamed kept_view for the shared kept image; no served change), this change (the page pool opens with the load's device and io, for its arena mapped as pages are used; a new paged stream's first prompt step waits while the arena's thread maps its pieces; paging off: unchanged); F6: block-FP8 routed experts (Qwen's FP8 release) load a rank's whole experts and are admitted at --tp 2; the NVFP4 and affine paths keep their bytes
+ zig/src/families/flashnext/cuda_lanes_admission_test.zig	4b8052db793ba81f0e73e1b9bd77b1780bbc4fd550d90976d017da47e76faaa2	raw
+-zig/src/families/flashnext/cuda_lanes_load.zig	e12505bde4ec8f7e343acacda9b6aaebe1219b8ec11d4bf74d8bd8f2ecc2c76b	raw	main dfd9ac5ef4 (#2585: TF_FLASHNEXT_* read through platform/environment.zig, malformed text refused at startup; valid values keep their meaning), #3467: after load a shard drops its page cache except the n-gram ranges, and the sweep reaches nested shards; tensors and replies are unchanged, this change (the load's device and io handed to the page pool's arena; paging off: unchanged); opt-in TF_FLASHNEXT_DECODE_GRAPH no longer refused with the dense split; default serving unchanged; #2972: the first collective waits up to 10 minutes for the peer's load, and a peer that leaves ends the wait within seconds; F6: block-FP8 routed experts (Qwen's FP8 release) load a rank's whole experts and are admitted at --tp 2; the NVFP4 and affine paths keep their bytes
++zig/src/families/flashnext/cuda_lanes_load.zig	c1068b48fa62633235e383bb2cbe3c18d4291a9d93bb17f44a309f1124e99640	raw	main dfd9ac5ef4 (#2585: TF_FLASHNEXT_* read through platform/environment.zig, malformed text refused at startup; valid values keep their meaning), #3467: after load a shard drops its page cache except the n-gram ranges, and the sweep reaches nested shards; tensors and replies are unchanged, this change (the load's device and io handed to the page pool's arena; paging off: unchanged); opt-in TF_FLASHNEXT_DECODE_GRAPH no longer refused with the dense split; default serving unchanged; #2972: the first collective waits up to 10 minutes for the peer's load, and a peer that leaves ends the wait within seconds; F6: block-FP8 routed experts (Qwen's FP8 release) load a rank's whole experts and are admitted at --tp 2; the NVFP4 and affine paths keep their bytes; opt-in TF_FLASHNEXT_TP_WINDOW_GRAPH: --tp 2 verify windows as graphs, the peer epoch on the device; default serving unchanged
+ zig/src/families/flashnext/cuda_lanes_restore_test.zig	5d0ef1cac8d8704676505e50a7e46cc82a71803aadf7018d3da2136fdc71759c	raw	its rig names the collective's parent communicator; test only
+ zig/src/families/flashnext/cuda_launch.zig	12b9ba75f979f431d2e306e9e3cd636893760a6b69da7f6e379c4764cf681ce9	raw	exports cuda_moe_exchange.zig for its device test; no served change; #2837 (Flash Next TP=2 graph replay); its test block reaches cuda_collective.zig's host tests, no served change; #3413 exports cuda_tiles.zig and readout_fused.zig for their tests
+ zig/src/families/flashnext/cuda_media.zig	394601e8a807f5516f501efcaefa6fb3308f392ee322db7296b11c90814f8eea	raw
+@@ -153,7 +153,7 @@ zig/src/families/flashnext/cuda_ple_nvfp4_test.zig	742bef48f8ddbf7257c18ad78911d
+ zig/src/families/flashnext/cuda_projection.zig	42e553d337ee5b2acd2146018a4db96bc471a5cc7bc2a87f567ace934b1b40d5	raw
+ zig/src/families/flashnext/cuda_projection_load.zig	335fb41717d28673c3d58e01627e61d37d5e14cf40722335677dc2d994c73916	raw
+ zig/src/families/flashnext/cuda_projection_load_test.zig	bcbd6ed2753c863916a2163d1cf72544429c776365702e860f52cd22449354a1	raw
+-zig/src/families/flashnext/cuda_prompt.zig	485446534635168ec186186186c0d8bdef00edae0aab38280b9a0b02c906b156	raw	opt-in TF_FLASHNEXT_DECODE_GRAPH takes the dense split and leaves rounds with pockets eager; default serving unchanged (#2980)
++zig/src/families/flashnext/cuda_prompt.zig	c040528ee36d0f4012efb76bd30fa01a59981609ee8e83ddec9a1f2e38fcc54c	raw	opt-in TF_FLASHNEXT_DECODE_GRAPH takes the dense split and leaves rounds with pockets eager; default serving unchanged (#2980); opt-in TF_FLASHNEXT_TP_WINDOW_GRAPH: --tp 2 verify windows as graphs, the peer epoch on the device; default serving unchanged
+ zig/src/families/flashnext/cuda_prompt_load.zig	334d68cfca85c15c9d986d0c6b4f8f2a38569309b21bdac6d365935d73c115cd	raw
+ zig/src/families/flashnext/cuda_prompt_main.zig	2543cd166dc80cd97b1ca1ce930a6150f9d36b52ee231744606f83bf54f0669d	raw	main dfd9ac5ef4 (#2585: the TF_FLASHNEXT_* startup check), c274b45cc1 (the check through the flashnext module)
+ zig/src/families/flashnext/cuda_prompt_step.zig	e04030fb4a4fdb8780704a1bc0b5ba4b786159ab08a927fe32a636a893129d0c	raw
+-- 
+2.56.0
+

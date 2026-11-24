@@ -1,0 +1,178 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jay Leaton <58495321+jayleaton@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 14:49:02 +0700
+Subject: [PATCH 52/76] flashnext cuda: TF_FLASHNEXT_HIDDEN_SUM over
+ TF_FLASHNEXT_PEER_SLOTS' mapped buffer for passes of up to 128 rows
+
+With both on, a decode round or verify window writes its owner chain's hidden rows into the peer's buffer and adds the
+peer's (fn_peer_rows_send, fn_peer_rows_add): the all-reduce's two-term sum without an NCCL launch, 10 KiB a row a
+layer instead of PEER_SLOTS' owned slots. Longer passes keep the hidden all-reduce. TF_FLASHNEXT_OWNER_SLOTS yields to
+PEER_SLOTS for the passes the mapped buffer takes.
+---
+ zig/kernels/cuda/flashnext_peer.cuh           | 35 +++++++++++++++++++
+ .../core/contract/flashnext_cuda_records.zig  |  2 ++
+ .../families/flashnext/cuda_batch_kernels.zig |  4 +++
+ .../flashnext/cuda_moe_hidden_sum.zig         |  7 ++++
+ .../families/flashnext/cuda_moe_native.zig    |  8 +++--
+ .../families/flashnext/cuda_peer_slots.zig    | 23 ++++++++++++
+ 6 files changed, 76 insertions(+), 3 deletions(-)
+
+diff --git a/zig/kernels/cuda/flashnext_peer.cuh b/zig/kernels/cuda/flashnext_peer.cuh
+index bd6472198..c00798dbd 100644
+--- a/zig/kernels/cuda/flashnext_peer.cuh
++++ b/zig/kernels/cuda/flashnext_peer.cuh
+@@ -66,3 +66,38 @@ extern "C" __global__ void __launch_bounds__(128) fn_peer_merge(float4* __restri
+         y[base + c] = fn_peer_plus0(mine ? y[base + c] : rx[base + c]);
+     }
+ }
++
++// Rows r0.. (one block each) of this rank's FP32 hidden partials into the peer's rx; the last block raises its flag.
++extern "C" __global__ void __launch_bounds__(128) fn_peer_rows_send(const float4* __restrict__ src, float4* __restrict__ rx,
++                                                                    int q, unsigned* __restrict__ counter,
++                                                                    volatile unsigned* __restrict__ flag, unsigned epoch) {
++    const long long base = static_cast<long long>(blockIdx.x) * q;
++    for (int c = threadIdx.x; c < q; c += blockDim.x) rx[base + c] = src[base + c];
++    __syncthreads();
++    if (threadIdx.x == 0) {
++        __threadfence_system();
++        if (atomicAdd(counter, 1u) + 1u == gridDim.x) {
++            *counter = 0u;
++            __threadfence_system();
++            *flag = epoch;
++        }
++    }
++}
++
++// Rows (one block each), once the peer's flag reaches `epoch`: own partial plus the peer's, the all-reduce's sum.
++extern "C" __global__ void __launch_bounds__(128) fn_peer_rows_add(float4* __restrict__ dst, const float4* rx, int q,
++                                                                   volatile unsigned* __restrict__ flag, unsigned epoch) {
++    if (threadIdx.x == 0) {
++        const long long start = clock64();
++        while (static_cast<int>(*flag - epoch) < 0)
++            if (clock64() - start > (1ll << 35)) __trap();  // about 15 s: the peer is gone, fail rather than hang
++        __threadfence();
++    }
++    __syncthreads();
++    const long long base = static_cast<long long>(blockIdx.x) * q;
++    for (int c = threadIdx.x; c < q; c += blockDim.x) {
++        const float4 a = dst[base + c];
++        const float4 b = rx[base + c];
++        dst[base + c] = make_float4(a.x + b.x, a.y + b.y, a.z + b.z, a.w + b.w);
++    }
++}
+diff --git a/zig/src/core/contract/flashnext_cuda_records.zig b/zig/src/core/contract/flashnext_cuda_records.zig
+index 03ad4a381..c49478bc1 100644
+--- a/zig/src/core/contract/flashnext_cuda_records.zig
++++ b/zig/src/core/contract/flashnext_cuda_records.zig
+@@ -37,6 +37,8 @@ pub const cuda = [_]CudaRecord{
+     .{ .launch = .{ .name = "flashnext_batch fn_ep_picks", .symbol = "fn_ep_picks", .image = "flashnext_batch", .threads = 256 }, .usage = .{ .{ .regs = 10, .static = 0, .bound = 0 }, .{ .regs = 10, .static = 0, .bound = 0 }, .{ .regs = 10, .static = 0, .bound = 0 }, .{ .regs = 14, .static = 0, .bound = 0 }, .{ .regs = 14, .static = 0, .bound = 0 } } },
+     .{ .launch = .{ .name = "flashnext_batch fn_peer_send", .symbol = "fn_peer_send", .image = "flashnext_batch", .threads = 128 }, .usage = .{ .{ .regs = 18, .static = 0, .bound = 128 }, .{ .regs = 18, .static = 0, .bound = 128 }, .{ .regs = 18, .static = 0, .bound = 128 }, .{ .regs = 16, .static = 0, .bound = 128 }, .{ .regs = 16, .static = 0, .bound = 128 } } },
+     .{ .launch = .{ .name = "flashnext_batch fn_peer_merge", .symbol = "fn_peer_merge", .image = "flashnext_batch", .threads = 128 }, .usage = .{ .{ .regs = 20, .static = 0, .bound = 128 }, .{ .regs = 22, .static = 0, .bound = 128 }, .{ .regs = 22, .static = 0, .bound = 128 }, .{ .regs = 22, .static = 0, .bound = 128 }, .{ .regs = 22, .static = 0, .bound = 128 } } },
++    .{ .launch = .{ .name = "flashnext_batch fn_peer_rows_send", .symbol = "fn_peer_rows_send", .image = "flashnext_batch", .threads = 128 }, .usage = .{ .{ .regs = 14, .static = 0, .bound = 128 }, .{ .regs = 18, .static = 0, .bound = 128 }, .{ .regs = 18, .static = 0, .bound = 128 }, .{ .regs = 18, .static = 0, .bound = 128 }, .{ .regs = 18, .static = 0, .bound = 128 } } },
++    .{ .launch = .{ .name = "flashnext_batch fn_peer_rows_add", .symbol = "fn_peer_rows_add", .image = "flashnext_batch", .threads = 128 }, .usage = .{ .{ .regs = 14, .static = 0, .bound = 128 }, .{ .regs = 14, .static = 0, .bound = 128 }, .{ .regs = 14, .static = 0, .bound = 128 }, .{ .regs = 18, .static = 0, .bound = 128 }, .{ .regs = 18, .static = 0, .bound = 128 } } },
+     .{ .launch = .{ .name = "flashnext_batch fn_owner_rows", .symbol = "fn_owner_rows", .image = "flashnext_batch", .threads = 1024 }, .usage = .{ .{ .regs = 22, .static = 144, .bound = 1024 }, .{ .regs = 23, .static = 144, .bound = 1024 }, .{ .regs = 23, .static = 144, .bound = 1024 }, .{ .regs = 31, .static = 144, .bound = 1024 }, .{ .regs = 31, .static = 144, .bound = 1024 } } },
+     .{ .launch = .{ .name = "flashnext_batch fn_owner_pack", .symbol = "fn_owner_pack", .image = "flashnext_batch", .threads = 256 }, .usage = .{ .{ .regs = 29, .static = 0, .bound = 256 }, .{ .regs = 30, .static = 0, .bound = 256 }, .{ .regs = 30, .static = 0, .bound = 256 }, .{ .regs = 28, .static = 0, .bound = 256 }, .{ .regs = 32, .static = 0, .bound = 256 } } },
+     .{ .launch = .{ .name = "flashnext_batch fn_owner_sum", .symbol = "fn_owner_sum", .image = "flashnext_batch", .threads = 256 }, .usage = .{ .{ .regs = 40, .static = 0, .bound = 0 }, .{ .regs = 40, .static = 0, .bound = 0 }, .{ .regs = 40, .static = 0, .bound = 0 }, .{ .regs = 40, .static = 0, .bound = 0 }, .{ .regs = 40, .static = 0, .bound = 0 } } },
+diff --git a/zig/src/families/flashnext/cuda_batch_kernels.zig b/zig/src/families/flashnext/cuda_batch_kernels.zig
+index 72e05e04d..bebde3742 100644
+--- a/zig/src/families/flashnext/cuda_batch_kernels.zig
++++ b/zig/src/families/flashnext/cuda_batch_kernels.zig
+@@ -99,6 +99,8 @@ pub const Kernels = struct {
+     ep_picks: cuda.Function,
+     peer_send: cuda.Function,
+     peer_merge: cuda.Function,
++    peer_rows_send: cuda.Function,
++    peer_rows_add: cuda.Function,
+     owner_rows: cuda.Function,
+     owner_pack: cuda.Function,
+     owner_sum: cuda.Function,
+@@ -148,6 +150,8 @@ pub const Kernels = struct {
+         k.ep_picks = try k.batch.function("fn_ep_picks");
+         k.peer_send = try k.batch.function("fn_peer_send");
+         k.peer_merge = try k.batch.function("fn_peer_merge");
++        k.peer_rows_send = try k.batch.function("fn_peer_rows_send");
++        k.peer_rows_add = try k.batch.function("fn_peer_rows_add");
+         k.owner_rows = try k.batch.function("fn_owner_rows");
+         k.owner_pack = try k.batch.function("fn_owner_pack");
+         k.owner_sum = try k.batch.function("fn_owner_sum");
+diff --git a/zig/src/families/flashnext/cuda_moe_hidden_sum.zig b/zig/src/families/flashnext/cuda_moe_hidden_sum.zig
+index 6d783fb21..61154865f 100644
+--- a/zig/src/families/flashnext/cuda_moe_hidden_sum.zig
++++ b/zig/src/families/flashnext/cuda_moe_hidden_sum.zig
+@@ -31,6 +31,13 @@ pub fn run(pass: anytype, c: anytype, n: usize, rank: usize) !void {
+     pass.pending_f32 = true;
+ }
+ 
++/// run over TF_FLASHNEXT_PEER_SLOTS' mapped buffer for a pass of up to its rows: the peer's partial added, no NCCL.
++pub fn runPeer(pass: anytype, p: anytype, n: usize, rank: usize) !void {
++    try moe.sumPart(pass, 0, n, @intCast(rank));
++    try p.sumRows(pass.k.peer_rows_send, pass.k.peer_rows_add, pass.stream, pass.s.moe_f32, n);
++    pass.pending_f32 = true;
++}
++
+ test {
+     if (@import("builtin").os.tag != .windows) _ = @import("cuda_moe_hidden_sum_test.zig"); // over a Unix socket pair
+ }
+diff --git a/zig/src/families/flashnext/cuda_moe_native.zig b/zig/src/families/flashnext/cuda_moe_native.zig
+index 3831bef82..5a13450bd 100644
+--- a/zig/src/families/flashnext/cuda_moe_native.zig
++++ b/zig/src/families/flashnext/cuda_moe_native.zig
+@@ -26,7 +26,9 @@ pub fn run(self: anytype, native: *const mixed.Owned, n: usize, pairs: usize, pl
+     const hidden = hidden_sum.applies(native.world, native.split_shared);
+     if (zs.clearsY(native.world, native.rank) and !hidden) try self.stream.d.check(self.stream.d.api.cuMemsetD8Async(s.y, 0, y_bytes, self.stream.handle), "cuMemsetD8Async");
+     const split = !hidden and native.world != 1 and exchange.rowSplit(native.world, n);
+-    const planned = if (split and @import("cuda_owner_slots.zig").on and !hidden_sum.on) try exchange.plan(self, .{ .first = owned.first, .count = owned.count, .split = native.split_shared, .rank = native.rank }, n) else null;
++    // a pass the peer's mapped buffer takes (TF_FLASHNEXT_PEER_SLOTS) keeps it, ahead of the owner-slot exchange
++    const via_peer = native.world != 1 and peer.PeerSlots.fits(n) and if (self.m.collective) |c| c.peer != null else false;
++    const planned = if (split and !via_peer and @import("cuda_owner_slots.zig").on and !hidden_sum.on) try exchange.plan(self, .{ .first = owned.first, .count = owned.count, .split = native.split_shared, .rank = native.rank }, n) else null;
+     const side = try shared.fork(self, native, n);
+     switch (owned.format) {
+         .nvfp4 => {
+@@ -42,8 +44,8 @@ pub fn run(self: anytype, native: *const mixed.Owned, n: usize, pairs: usize, pl
+     if (side != null) try shared.join(self, side, native, n) else try @import("cuda_shared_split.zig").run(self, native, n);
+     if (native.world != 1) {
+         const collective = self.m.collective orelse return error.TensorParallelUnavailable;
+-        if (collective.peer) |*p| if (peer.PeerSlots.fits(n)) {
+-            const split = exchange.rowSplit(native.world, n);
++        if (collective.peer) |*p| if (via_peer) {
++            if (hidden) return hidden_sum.runPeer(self, p, n, native.rank);
+             const rows = peer.plan(n, split, native.rank);
+             try p.exchange(self.k.peer_send, self.k.peer_merge, self.stream, s.y, s.picks, rows.send, rows.merge, .{ .first = owned.first, .count = owned.count, .split_shared = native.split_shared });
+             if (split) try exchange.finish(self, collective, n);
+diff --git a/zig/src/families/flashnext/cuda_peer_slots.zig b/zig/src/families/flashnext/cuda_peer_slots.zig
+index ef6b6be00..f348d0c9b 100644
+--- a/zig/src/families/flashnext/cuda_peer_slots.zig
++++ b/zig/src/families/flashnext/cuda_peer_slots.zig
+@@ -98,6 +98,29 @@ pub const PeerSlots = struct {
+         try cuda.launch.launch(merge_fn, .{ .grid = .{ .x = @intCast((merge[1] - merge[0]) * wt.slots) }, .block = .{ .x = 128 } }, stream, &b);
+     }
+ 
++    /// `n` rows of FP32 hidden partials in `buf` to the peer, then the peer's added in: the all-reduce's sums.
++    pub fn sumRows(p: *PeerSlots, send_fn: cuda.Function, add_fn: cuda.Function, stream: cuda.Stream, buf: u64, n: usize) !void {
++        if (n == 0 or n > rows) return error.UnexpectedTensor;
++        p.epoch +%= 1;
++        const rx = (p.epoch & 1) * half;
++        const grid: cuda.launch.Config = .{ .grid = .{ .x = @intCast(n) }, .block = .{ .x = 128 } };
++        var a: cuda.Args = .{};
++        a.add(buf);
++        a.add(p.peer + rx);
++        a.add(@as(i32, @intCast(quads)));
++        a.add(p.local + counter_at);
++        a.add(p.peer + flag_at);
++        a.add(p.epoch);
++        try cuda.launch.launch(send_fn, grid, stream, &a);
++        var b: cuda.Args = .{};
++        b.add(buf);
++        b.add(p.local + rx);
++        b.add(@as(i32, @intCast(quads)));
++        b.add(p.local + flag_at);
++        b.add(p.epoch);
++        try cuda.launch.launch(add_fn, grid, stream, &b);
++    }
++
+     fn common(p: *const PeerSlots, a: *cuda.Args, row0: usize, own: Owner) void {
+         a.add(@as(i32, @intCast(row0 * wt.slots)));
+         a.add(@as(i32, @intCast(own.first)));
+-- 
+2.56.0
+

@@ -1,0 +1,1275 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jay Leaton <58495321+jayleaton@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 22:27:33 +0700
+Subject: [PATCH 50/76] flashnext cuda: the --tp 2 prompt exchange sends only
+ the half rows each rank owns
+
+At --tp 2 each rank holds whole routed experts, and the shared expert's columns in halves (or whole on rank 0), so
+every half row of a pair's slot in y is non-zero on one rank only. A prompt pass's reduce-scatter still moved all
+eleven slots of the peer's rows, 110 KiB a row.
+
+- fn_owner_rows, right after routing: each block's half rows both ways as prefix sums, copied to the host while the
+  experts run.
+- After the experts, in rounds that fit the spent expert activations: fn_owner_pack packs this rank's half rows for
+  the peer's rows, one NCCL send and receive swaps them (received into the peer's rows of y, already packed), and
+  fn_owner_sum sums this rank's rows as fn_moe_sum does, each value plus 0 as the reduce-scatter left it.
+- The sums gather is unchanged, so every sum keeps TP1's order and bits. A captured pass keeps the reduce-scatter.
+---
+ zig/kernels/cuda/flashnext_batch.cu           |   1 +
+ zig/kernels/cuda/flashnext_owner.cuh          |  92 ++++++
+ .../core/contract/flashnext_cuda_records.zig  |   3 +
+ .../families/flashnext/cuda_batch_kernels.zig |   6 +
+ .../families/flashnext/cuda_batch_state.zig   |   6 +-
+ .../families/flashnext/cuda_collective.zig    |  34 +-
+ zig/src/families/flashnext/cuda_launch.zig    |   2 +
+ .../families/flashnext/cuda_moe_exchange.zig  |  24 +-
+ .../flashnext/cuda_moe_exchange_test.zig      |   8 +-
+ .../families/flashnext/cuda_moe_native.zig    |   4 +-
+ .../families/flashnext/cuda_owner_slots.zig   | 129 ++++++++
+ .../flashnext/cuda_owner_slots_test.zig       | 190 +++++++++++
+ zig/src/families/flashnext/cuda_prompt.zig    |   2 +-
+ .../families/flashnext/cuda_scratch_sizes.zig |   2 +-
+ zig/tests/cuda/contract_family_sets.zig       |   5 +
+ zig/tests/cuda/contract_flashnext_owner.zig   | 308 ++++++++++++++++++
+ zig/tests/cuda/flashnext_exchange_tests.zig   |  53 +--
+ zig/tests/cuda/main.zig                       |   1 +
+ 18 files changed, 836 insertions(+), 34 deletions(-)
+ create mode 100644 zig/kernels/cuda/flashnext_owner.cuh
+ create mode 100644 zig/src/families/flashnext/cuda_owner_slots.zig
+ create mode 100644 zig/src/families/flashnext/cuda_owner_slots_test.zig
+ create mode 100644 zig/tests/cuda/contract_flashnext_owner.zig
+
+diff --git a/zig/kernels/cuda/flashnext_batch.cu b/zig/kernels/cuda/flashnext_batch.cu
+index a2300fc2a..80e15011c 100644
+--- a/zig/kernels/cuda/flashnext_batch.cu
++++ b/zig/kernels/cuda/flashnext_batch.cu
+@@ -585,6 +585,7 @@ extern "C" __global__ void fn_ep_picks(const int* __restrict__ picks, int* __res
+ 
+ #include "flashnext_gdn_tpr.cuh"
+ #include "flashnext_peer.cuh"
++#include "flashnext_owner.cuh"
+ 
+ // The prompt GDN block in one kernel a value head (front, chain, gated norm; their bits), no fp32 rows through memory.
+ #include "flashnext_gdn_fused.cuh"
+diff --git a/zig/kernels/cuda/flashnext_owner.cuh b/zig/kernels/cuda/flashnext_owner.cuh
+new file mode 100644
+index 000000000..d85c892c3
+--- /dev/null
++++ b/zig/kernels/cuda/flashnext_owner.cuh
+@@ -0,0 +1,92 @@
++// The --tp 2 prompt exchange by owner slots: a rank sends the peer only the half rows of y it owns for the peer's rows.
++
++// Half rows (bit u: columns from u * dims / 2) rank src owns of slot k; first/count are rank me's experts.
++__device__ __forceinline__ unsigned fn_owner_units(int pick, int k, int slots, int first, int count, int split, int me,
++                                                   int src) {
++    if (k == slots - 1) return split ? 1u << src : (src == 0 ? 3u : 0u);
++    const bool mine = pick >= first && pick < first + count;
++    return mine == (src == me) ? 3u : 0u;
++}
++
++// out[b * (h + 1) + i]: half rows of block b's rows below i (b 0: ours in the peer's rows, 1: the peer's in ours).
++extern "C" __global__ void __launch_bounds__(1024) fn_owner_rows(const int* __restrict__ picks, int* __restrict__ out,
++                                                                 int peer0, int peer_rows, int own0, int own_rows,
++                                                                 int h, int slots, int first, int count, int split,
++                                                                 int me) {
++    __shared__ int warps[32];
++    __shared__ int carry;
++    const int b = blockIdx.x, lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
++    const int row0 = b == 0 ? peer0 : own0, rows = b == 0 ? peer_rows : own_rows, src = b == 0 ? me : 1 - me;
++    int* pre = out + static_cast<long long>(b) * (h + 1);
++    if (threadIdx.x == 0) {
++        pre[0] = 0;
++        carry = 0;
++    }
++    for (int base = 0; base < h; base += 1024) {
++        const int i = base + threadIdx.x;
++        int x = 0;
++        if (i < rows)
++            for (int k = 0; k < slots; ++k)
++                x += __popc(fn_owner_units(picks[(row0 + i) * slots + k], k, slots, first, count, split, me, src));
++        for (int o = 1; o < 32; o <<= 1) {
++            const int y = __shfl_up_sync(0xffffffffu, x, o);
++            if (lane >= o) x += y;
++        }
++        if (lane == 31) warps[warp] = x;
++        __syncthreads();
++        if (warp == 0) {
++            int w = warps[lane];
++            for (int o = 1; o < 32; o <<= 1) {
++                const int y = __shfl_up_sync(0xffffffffu, w, o);
++                if (lane >= o) w += y;
++            }
++            warps[lane] = w;
++        }
++        __syncthreads();
++        const int sum = carry + x + (warp > 0 ? warps[warp - 1] : 0);
++        if (i < h) pre[i + 1] = sum;
++        __syncthreads();
++        if (threadIdx.x == 1023) carry = sum;
++        __syncthreads();
++    }
++}
++
++// The peer's rows from k0 (a block each): this rank's half rows (q float4s each) packed in pair order from pre[k0].
++extern "C" __global__ void __launch_bounds__(256) fn_owner_pack(const float4* __restrict__ y, const int* __restrict__ picks,
++                                                                const int* __restrict__ pre, float4* __restrict__ out,
++                                                                int peer0, int rows, int k0, int q, int slots,
++                                                                int first, int count, int split, int me) {
++    const int i = k0 + blockIdx.x;
++    if (i >= rows) return;
++    const long long r = peer0 + i;
++    long long at = pre[i] - pre[k0];
++    for (int k = 0; k < slots; ++k) {
++        const unsigned m = fn_owner_units(picks[r * slots + k], k, slots, first, count, split, me, me);
++        for (int u = 0; u < 2; ++u) {
++            if (!(m >> u & 1u)) continue;
++            const float4* src = y + ((r * slots + k) * 2 + u) * q;
++            for (int c = threadIdx.x; c < q; c += blockDim.x) out[at * q + c] = src[c];
++            ++at;
++        }
++    }
++}
++
++// fn_moe_sum over our rows from k0: the peer's half rows from recv, ours from y, each plus 0 as the reduce-scatter.
++extern "C" __global__ void fn_owner_sum(const float* __restrict__ y, const float* __restrict__ recv,
++                                        const float* __restrict__ wts, const int* __restrict__ picks,
++                                        const int* __restrict__ pre, float* __restrict__ out, int own0, int rows,
++                                        int k0, int d, int slots, int first, int count, int split, int me) {
++    const int i = k0 + blockIdx.x, col = blockIdx.y * blockDim.x + threadIdx.x;
++    if (i >= rows || col >= d) return;
++    const long long r = own0 + i;
++    const int half = d / 2, u = col >= half, c = col - u * half;
++    long long at = pre[i] - pre[k0];
++    float acc = 0.0f;
++    for (int k = 0; k < slots; ++k) {
++        const unsigned m = fn_owner_units(picks[r * slots + k], k, slots, first, count, split, me, 1 - me);
++        const float v = m >> u & 1u ? recv[(at + __popc(m & ((1u << u) - 1u))) * half + c] : y[(r * slots + k) * d + col];
++        acc = __fmaf_rn(v + 0.0f, wts[r * slots + k], acc);
++        at += __popc(m);
++    }
++    out[r * d + col] = acc;
++}
+diff --git a/zig/src/core/contract/flashnext_cuda_records.zig b/zig/src/core/contract/flashnext_cuda_records.zig
+index eb5aaad07..3e4c97c95 100644
+--- a/zig/src/core/contract/flashnext_cuda_records.zig
++++ b/zig/src/core/contract/flashnext_cuda_records.zig
+@@ -37,6 +37,9 @@ pub const cuda = [_]CudaRecord{
+     .{ .launch = .{ .name = "flashnext_batch fn_ep_picks", .symbol = "fn_ep_picks", .image = "flashnext_batch", .threads = 256 }, .usage = .{ .{ .regs = 10, .static = 0, .bound = 0 }, .{ .regs = 10, .static = 0, .bound = 0 }, .{ .regs = 10, .static = 0, .bound = 0 }, .{ .regs = 14, .static = 0, .bound = 0 }, .{ .regs = 14, .static = 0, .bound = 0 } } },
+     .{ .launch = .{ .name = "flashnext_batch fn_peer_send", .symbol = "fn_peer_send", .image = "flashnext_batch", .threads = 128 }, .usage = .{ .{ .regs = 18, .static = 0, .bound = 128 }, .{ .regs = 18, .static = 0, .bound = 128 }, .{ .regs = 18, .static = 0, .bound = 128 }, .{ .regs = 16, .static = 0, .bound = 128 }, .{ .regs = 16, .static = 0, .bound = 128 } } },
+     .{ .launch = .{ .name = "flashnext_batch fn_peer_merge", .symbol = "fn_peer_merge", .image = "flashnext_batch", .threads = 128 }, .usage = .{ .{ .regs = 20, .static = 0, .bound = 128 }, .{ .regs = 22, .static = 0, .bound = 128 }, .{ .regs = 22, .static = 0, .bound = 128 }, .{ .regs = 22, .static = 0, .bound = 128 }, .{ .regs = 22, .static = 0, .bound = 128 } } },
++    .{ .launch = .{ .name = "flashnext_batch fn_owner_rows", .symbol = "fn_owner_rows", .image = "flashnext_batch", .threads = 1024 }, .usage = .{ .{ .regs = 22, .static = 144, .bound = 1024 }, .{ .regs = 23, .static = 144, .bound = 1024 }, .{ .regs = 23, .static = 144, .bound = 1024 }, .{ .regs = 31, .static = 144, .bound = 1024 }, .{ .regs = 31, .static = 144, .bound = 1024 } } },
++    .{ .launch = .{ .name = "flashnext_batch fn_owner_pack", .symbol = "fn_owner_pack", .image = "flashnext_batch", .threads = 256 }, .usage = .{ .{ .regs = 29, .static = 0, .bound = 256 }, .{ .regs = 30, .static = 0, .bound = 256 }, .{ .regs = 30, .static = 0, .bound = 256 }, .{ .regs = 28, .static = 0, .bound = 256 }, .{ .regs = 32, .static = 0, .bound = 256 } } },
++    .{ .launch = .{ .name = "flashnext_batch fn_owner_sum", .symbol = "fn_owner_sum", .image = "flashnext_batch", .threads = 256 }, .usage = .{ .{ .regs = 40, .static = 0, .bound = 0 }, .{ .regs = 40, .static = 0, .bound = 0 }, .{ .regs = 40, .static = 0, .bound = 0 }, .{ .regs = 40, .static = 0, .bound = 0 }, .{ .regs = 40, .static = 0, .bound = 0 } } },
+     .{ .launch = .{ .name = "flashnext_batch fn_shift_window", .symbol = "fn_shift_window", .image = "flashnext_batch", .threads = 256 }, .usage = .{ .{ .regs = 32, .static = 0, .bound = 0 }, .{ .regs = 40, .static = 0, .bound = 0 }, .{ .regs = 40, .static = 0, .bound = 0 }, .{ .regs = 40, .static = 0, .bound = 0 }, .{ .regs = 40, .static = 0, .bound = 0 } } },
+     .{ .launch = .{ .name = "flashnext_batch fn_sum_slices", .symbol = "fn_sum_slices", .image = "flashnext_batch", .threads = 256 }, .usage = .{ .{ .regs = 32, .static = 0, .bound = 0 }, .{ .regs = 38, .static = 0, .bound = 0 }, .{ .regs = 38, .static = 0, .bound = 0 }, .{ .regs = 40, .static = 0, .bound = 0 }, .{ .regs = 40, .static = 0, .bound = 0 } } },
+     .{ .launch = .{ .name = "norms tf_rms_rows_sums_tiles", .symbol = "tf_rms_rows_sums_tiles", .image = "norms", .threads = 256 }, .usage = .{ .{ .regs = 31, .static = 20612, .bound = 256 }, .{ .regs = 48, .static = 20612, .bound = 256 }, .{ .regs = 48, .static = 20612, .bound = 256 }, .{ .regs = 48, .static = 20612, .bound = 256 }, .{ .regs = 48, .static = 20612, .bound = 256 } } },
+diff --git a/zig/src/families/flashnext/cuda_batch_kernels.zig b/zig/src/families/flashnext/cuda_batch_kernels.zig
+index e71b1b3b3..fe3e7d70c 100644
+--- a/zig/src/families/flashnext/cuda_batch_kernels.zig
++++ b/zig/src/families/flashnext/cuda_batch_kernels.zig
+@@ -97,6 +97,9 @@ pub const Kernels = struct {
+     ep_picks: cuda.Function,
+     peer_send: cuda.Function,
+     peer_merge: cuda.Function,
++    owner_rows: cuda.Function,
++    owner_pack: cuda.Function,
++    owner_sum: cuda.Function,
+     shift: cuda.Function,
+     /// Each sparse row's top blocks (attention._select / _select_tiles), native.
+     select: cuda.Function,
+@@ -143,6 +146,9 @@ pub const Kernels = struct {
+         k.ep_picks = try k.batch.function("fn_ep_picks");
+         k.peer_send = try k.batch.function("fn_peer_send");
+         k.peer_merge = try k.batch.function("fn_peer_merge");
++        k.owner_rows = try k.batch.function("fn_owner_rows");
++        k.owner_pack = try k.batch.function("fn_owner_pack");
++        k.owner_sum = try k.batch.function("fn_owner_sum");
+         k.shift = try k.batch.function("fn_shift_window");
+         k.select = try k.batch.function("fn_qsa_select");
+         k.select_lanes = try k.batch.function("fn_qsa_select_lanes");
+diff --git a/zig/src/families/flashnext/cuda_batch_state.zig b/zig/src/families/flashnext/cuda_batch_state.zig
+index 80d3d073b..d10d09ade 100644
+--- a/zig/src/families/flashnext/cuda_batch_state.zig
++++ b/zig/src/families/flashnext/cuda_batch_state.zig
+@@ -8,6 +8,7 @@ const wt = @import("cuda_prompt_wt.zig");
+ const tk = @import("cuda_tile_kernels.zig");
+ const load = @import("cuda_prompt_load.zig");
+ const shared = @import("cuda_batch_side.zig");
++const owner_slots = @import("cuda_owner_slots.zig");
+ const layers_n = wt.layers_n;
+ const linear_n = wt.linear_n;
+ const dims = wt.dims;
+@@ -325,6 +326,7 @@ pub const Scratch = struct {
+     host: ?cuda.HostBuffer = null,
+     /// The uploads from `host` and the event recorded after a pass's last one: the next pass waits before writing it.
+     staging: ?Staging(Uploads) = null,
++    owner: ?owner_slots.Bufs = null, // --tp 2: the owner-slot exchange's prefix sums
+ 
+     fn add(s: *Scratch, gpa: std.mem.Allocator, d: *const cuda.Driver, len: usize) !u64 {
+         var b = try cuda.DeviceBuffer.alloc(d, @max(len, 256));
+@@ -397,7 +399,7 @@ pub const Scratch = struct {
+         n += cap * dims * 2 + cap * (dims / 32) * 4 + cap * wide * 2 + cap * dims * 2 + 4 * cap * dims * 4;
+         n += cap * wide * 2 * 2 + cap * streams * 4 + vocab * 2 + head_rows * vocab + half * 4 + 4096;
+         n += (cap + 1) * dims * 4 + cap * pocket_stride * 4;
+-        n += cap * out_k * 4 + cap * dims * 6;
++        n += cap * out_k * 4 + cap * dims * 6 + (if (z.owner) owner_slots.Bufs.ints(cap) * 4 else 0);
+         return n;
+     }
+ 
+@@ -492,6 +494,7 @@ pub const Scratch = struct {
+         try stream.synchronize();
+         s.host = try cuda.HostBuffer.alloc(d, hostAt(cap)[5]);
+         s.staging = .{ .q = .{ .stream = stream, .event = try cuda.Event.init(d, false) } };
++        if (z.owner) s.owner = try owner_slots.Bufs.alloc(d, cap);
+         if (shared.on()) s.side = try shared.Side.init(d); // last: a refused allocation above never makes a stream
+         return s;
+     }
+@@ -502,6 +505,7 @@ pub const Scratch = struct {
+             g.ready() catch {};
+             g.q.event.deinit();
+         }
++        if (s.owner) |*o| o.free();
+         if (s.host) |*h| h.free();
+         if (s.side) |*x| x.deinit();
+         for (s.bufs.items) |*b| b.free();
+diff --git a/zig/src/families/flashnext/cuda_collective.zig b/zig/src/families/flashnext/cuda_collective.zig
+index eee8525c5..812e2243a 100644
+--- a/zig/src/families/flashnext/cuda_collective.zig
++++ b/zig/src/families/flashnext/cuda_collective.zig
+@@ -109,7 +109,8 @@ pub const Collective = struct {
+         return c.lib.check(result, "NCCL nonblocking operation");
+     }
+ 
+-    fn wait(c: *Collective, stream: ?cuda.Stream, until: u64) !void {
++    /// Until NCCL has taken the queued work and `point` (null, a stream or an event) is done.
++    fn wait(c: *Collective, point: anytype, until: u64) !void {
+         errdefer c.abort();
+         while (true) {
+             try c.link.checkPeer();
+@@ -118,9 +119,8 @@ pub const Collective = struct {
+             try c.lib.check(c.api.ncclCommGetAsyncError(c.comm, &state), "ncclCommGetAsyncError");
+             if (state != 0 and state != 7) return c.lib.check(state, "NCCL asynchronous operation");
+             if (state == 0) {
+-                if (stream) |s| {
+-                    if (try s.done()) return;
+-                } else return;
++                if (@TypeOf(point) == @TypeOf(null)) return;
++                if (try point.done()) return;
+             }
+             wire.pause();
+         }
+@@ -132,6 +132,12 @@ pub const Collective = struct {
+         try c.wait(stream, wire.deadline(c.timeout_ms));
+     }
+ 
++    /// Wait for `event` with finish's peer, asynchronous-error and timeout checks: the host reads what it recorded.
++    pub fn reached(c: *Collective, event: cuda.Event) !void {
++        if (c.failed or c.comm == null) return error.RankDisconnected;
++        try c.wait(event, wire.deadline(c.timeout_ms));
++    }
++
+     pub fn benchmarkShape(c: *Collective) !nccl.Shape {
+         if (c.failed or c.comm == null) return error.RankDisconnected;
+         const actual = try c.lib.shape(c.comm);
+@@ -191,6 +197,26 @@ pub const Collective = struct {
+         try c.wait(null, wire.deadline(c.timeout_ms));
+     }
+ 
++    /// `sent` FP32 values to the peer from `send` and `got` from it into `recv`, in one group; zero posts nothing.
++    pub fn swap(c: *Collective, stream: cuda.Stream, send: u64, sent: usize, recv: u64, got: usize) !void {
++        if (c.failed or c.comm == null) return error.RankDisconnected;
++        if (sent == 0 and got == 0) return;
++        errdefer c.abort();
++        try c.link.checkPeer();
++        const peer: c_int = @intCast(1 - c.rank);
++        try c.lib.check(c.lib.api.ncclGroupStart(), "ncclGroupStart");
++        if (sent != 0) c.submitted(c.lib.api.ncclSend(send, sent, .f32, peer, c.comm, stream.handle)) catch |e| {
++            _ = c.lib.api.ncclGroupEnd();
++            return e;
++        };
++        if (got != 0) c.submitted(c.lib.api.ncclRecv(recv, got, .f32, peer, c.comm, stream.handle)) catch |e| {
++            _ = c.lib.api.ncclGroupEnd();
++            return e;
++        };
++        try c.submitted(c.lib.api.ncclGroupEnd());
++        try c.wait(null, wire.deadline(c.timeout_ms));
++    }
++
+     /// sum's FP32 sum of block `rank` of `values` (blocks of `count`) alone, left in place there: a reduce-scatter.
+     pub fn sumBlock(c: *Collective, stream: cuda.Stream, values: u64, count: usize) !void {
+         if (c.failed or c.comm == null) return error.RankDisconnected;
+diff --git a/zig/src/families/flashnext/cuda_launch.zig b/zig/src/families/flashnext/cuda_launch.zig
+index de97f5f9e..f33cea6e9 100644
+--- a/zig/src/families/flashnext/cuda_launch.zig
++++ b/zig/src/families/flashnext/cuda_launch.zig
+@@ -20,6 +20,7 @@ pub const moe_exchange = @import("cuda_moe_exchange.zig");
+ /// --tp 2's hidden-size exchange and the owner-order slot sum, which the two-rank device test checks against --tp 1.
+ pub const moe_hidden_sum = @import("cuda_moe_hidden_sum.zig");
+ pub const moe_batch = @import("cuda_batch_moe.zig");
++pub const owner_slots = @import("cuda_owner_slots.zig");
+ pub const hc = @import("cuda_hc.zig");
+ pub const draft_affine = @import("cuda_draft_affine.zig");
+ pub const qmm = @import("cuda_qmm.zig");
+@@ -507,6 +508,7 @@ test {
+     _ = @import("cuda_rank_wire.zig");
+     _ = @import("cuda_moe_exchange.zig");
+     _ = @import("cuda_moe_hidden_sum.zig");
++    _ = @import("cuda_owner_slots.zig");
+     _ = @import("cuda_modelopt_experts.zig");
+     _ = @import("cuda_modelopt_threads.zig");
+     _ = row_path;
+diff --git a/zig/src/families/flashnext/cuda_moe_exchange.zig b/zig/src/families/flashnext/cuda_moe_exchange.zig
+index 29a00ea7e..f3acae135 100644
+--- a/zig/src/families/flashnext/cuda_moe_exchange.zig
++++ b/zig/src/families/flashnext/cuda_moe_exchange.zig
+@@ -3,6 +3,8 @@ const cuda = @import("cuda");
+ const wt = @import("cuda_prompt_wt.zig");
+ const mtp = @import("cuda_mtp.zig");
+ const moe = @import("cuda_batch_moe.zig");
++const owner = @import("cuda_owner_slots.zig");
++pub const Owner = owner.Owner;
+ 
+ const dims = wt.dims;
+ const slots = wt.slots;
+@@ -40,18 +42,36 @@ pub fn clearedRows(world: usize, n: usize) usize {
+     return if (rowSplit(world, n)) 2 * block(n) else n;
+ }
+ 
++/// Before the experts: the owner-slot exchange's sums started, or null where the reduce-scatter stays (a capture).
++pub fn plan(pass: anytype, o: Owner, n: usize) !?Owner {
++    const b = pass.s.owner orelse return error.TensorParallelUnavailable;
++    if (try cuda.graph.captureStatus(pass.stream) != .none) return null;
++    try owner.plan(pass, b, o, n, block(n));
++    return o;
++}
++
+ /// y's slots, a rank's values and the other's +0, to their fp32 sum in moe_f32 on both ranks: the pending_f32 form.
+-pub fn run(pass: anytype, c: anytype, n: usize) !void {
++pub fn run(pass: anytype, c: anytype, planned: ?Owner, n: usize) !void {
++    if (planned) |o| {
++        try owner.exchange(pass, c, pass.s.owner.?, o, n, block(n));
++        return gather(pass, c, n);
++    }
+     try c.sumBlock(pass.stream, pass.s.y, block(n) * slots * dims);
+     return finish(pass, c, n);
+ }
+ 
+ /// A split pass once this rank's rows hold every slot: their sums, gathered into moe_f32 on both ranks.
+ pub fn finish(pass: anytype, c: anytype, n: usize) !void {
++    const own = share(n, 2, c.rank);
++    try moe.sumSlots(pass, own[0], own[1] - own[0]);
++    return gather(pass, c, n);
++}
++
++/// This rank's rows' sums in moe_f32 to both ranks.
++fn gather(pass: anytype, c: anytype, n: usize) !void {
+     const s = pass.s;
+     const h = block(n);
+     const own = share(n, 2, c.rank);
+-    try moe.sumSlots(pass, own[0], own[1] - own[0]);
+     try c.gatherF32(pass.stream, s.moe_f32 + own[0] * dims * 4, s.moe_f32, h * dims);
+     pass.pending_f32 = true;
+ }
+diff --git a/zig/src/families/flashnext/cuda_moe_exchange_test.zig b/zig/src/families/flashnext/cuda_moe_exchange_test.zig
+index 953795117..2140556a5 100644
+--- a/zig/src/families/flashnext/cuda_moe_exchange_test.zig
++++ b/zig/src/families/flashnext/cuda_moe_exchange_test.zig
+@@ -65,11 +65,11 @@ const Fake = struct {
+     }
+ };
+ 
+-const Bufs = struct { y: u64 = 0x1000_0000, wts: u64 = 0x2000_0000, picks: u64 = 0x4000_0000, moe_f32: u64 = 0x3000_0000 };
++const Bufs = struct { y: u64 = 0x1000_0000, wts: u64 = 0x2000_0000, moe_f32: u64 = 0x3000_0000, picks: u64 = 0x4000_0000, moe_act: u64 = 0, cap: usize = 0, owner: ?@import("cuda_owner_slots.zig").Bufs = null };
+ 
+ const Pass = struct {
+     s: *const Bufs,
+-    k: struct { moe_sum: cuda.Function },
++    k: struct { moe_sum: cuda.Function, owner_pack: cuda.Function = undefined, owner_sum: cuda.Function = undefined },
+     stream: cuda.Stream,
+     pending_f32: bool = false,
+ };
+@@ -136,7 +136,7 @@ test "the ranks' rows cover a split pass once, in blocks that pad at most the sc
+     try expectEqual(@as(usize, 2 * 8192), exchange.clearedRows(2, batch.max_chunk));
+ }
+ 
+-test "a split pass reduce-scatters its rank's block in place, sums that block's rows and gathers the sums in place" {
++test "a split pass under capture reduce-scatters its rank's block in place, sums that block's rows and gathers the sums in place" {
+     var d: cuda.Driver = undefined;
+     d.api.cuLaunchKernel = Fake.launch;
+     const bufs: Bufs = .{};
+@@ -146,7 +146,7 @@ test "a split pass reduce-scatters its rank's block in place, sums that block's
+         defer close(pair);
+         var pass: Pass = .{ .s = &bufs, .k = .{ .moe_sum = .{ .d = &d, .handle = @ptrFromInt(1) } }, .stream = .{ .d = &d, .handle = null } };
+         Fake.reset();
+-        try exchange.run(&pass, &c, n);
++        try exchange.run(&pass, &c, null, n);
+         const h = (n + 1) / 2;
+         const lo = rank * h;
+         const rows = if (rank == 0) h else n - h;
+diff --git a/zig/src/families/flashnext/cuda_moe_native.zig b/zig/src/families/flashnext/cuda_moe_native.zig
+index 6e8618409..802db666f 100644
+--- a/zig/src/families/flashnext/cuda_moe_native.zig
++++ b/zig/src/families/flashnext/cuda_moe_native.zig
+@@ -25,6 +25,8 @@ pub fn run(self: anytype, native: *const mixed.Owned, n: usize, pairs: usize, pl
+     // the hidden-size exchange reads only the slots this rank writes, so it needs no cleared y
+     const hidden = hidden_sum.applies(native.world, native.split_shared);
+     if (zs.clearsY(native.world, native.rank) and !hidden) try self.stream.d.check(self.stream.d.api.cuMemsetD8Async(s.y, 0, y_bytes, self.stream.handle), "cuMemsetD8Async");
++    const split = !hidden and native.world != 1 and exchange.rowSplit(native.world, n);
++    const planned = if (split) try exchange.plan(self, .{ .first = owned.first, .count = owned.count, .split = native.split_shared, .rank = native.rank }, n) else null;
+     const side = try shared.fork(self, native, n);
+     switch (owned.format) {
+         .nvfp4 => {
+@@ -48,7 +50,7 @@ pub fn run(self: anytype, native: *const mixed.Owned, n: usize, pairs: usize, pl
+             return;
+         };
+         if (hidden) return hidden_sum.run(self, collective, n, native.rank);
+-        if (exchange.rowSplit(native.world, n)) return exchange.run(self, collective, n);
++        if (split) return exchange.run(self, collective, planned, n);
+         try collective.sum(self.stream, s.y, pairs * dims);
+     }
+ }
+diff --git a/zig/src/families/flashnext/cuda_owner_slots.zig b/zig/src/families/flashnext/cuda_owner_slots.zig
+new file mode 100644
+index 000000000..33b1d03e0
+--- /dev/null
++++ b/zig/src/families/flashnext/cuda_owner_slots.zig
+@@ -0,0 +1,129 @@
++//! A --tp 2 prompt pass's expert exchange by owner slots: each rank sends only the half rows of y the peer needs.
++const std = @import("std");
++const cuda = @import("cuda");
++const wt = @import("cuda_prompt_wt.zig");
++
++const dims = wt.dims;
++const slots = wt.slots;
++const share = cuda.rank_scatter.share;
++/// Floats a half row of y: the unit a rank owns, two a routed pair's owner, one each of the split shared slot.
++pub const unit = dims / 2;
++
++/// The rank's experts and shared split: what decides which half rows of each pair it owns.
++pub const Owner = struct { first: usize, count: usize, split: bool, rank: usize };
++
++/// Each block's half-row prefix sums on the device, their pinned host copy, and the event after the copy.
++pub const Bufs = struct {
++    dev: cuda.DeviceBuffer,
++    host: cuda.HostBuffer,
++    ready: cuda.Event,
++
++    /// Ints of the two blocks' prefix sums for passes of up to `cap` rows.
++    pub fn ints(cap: usize) usize {
++        return 2 * ((cap + 1) / 2 + 1);
++    }
++
++    pub fn alloc(d: *const cuda.Driver, cap: usize) !Bufs {
++        var dev = try cuda.DeviceBuffer.alloc(d, ints(cap) * 4);
++        errdefer dev.free();
++        var host = try cuda.HostBuffer.alloc(d, ints(cap) * 4);
++        errdefer host.free();
++        return .{ .dev = dev, .host = host, .ready = try cuda.Event.init(d, false) };
++    }
++
++    pub fn free(b: *Bufs) void {
++        b.ready.deinit();
++        b.host.free();
++        b.dev.free();
++    }
++};
++
++/// Rows [k0, k1) of both blocks and the half rows each way: what one send and receive move.
++pub const Round = struct { k0: usize, k1: usize, send: usize, recv: usize };
++
++/// From row k0, the most rows whose half rows each way fit `cap`: both ranks see the same two sums, so the same rounds.
++pub fn nextRound(send: []const i32, recv: []const i32, k0: usize, cap: usize) Round {
++    var k1 = k0 + 1;
++    std.debug.assert(fits(send, recv, k0, k1, cap)); // a row's 22 half rows; the pack space holds 2.75 a cap row
++    while (k1 + 1 < send.len and fits(send, recv, k0, k1 + 1, cap)) k1 += 1;
++    return .{ .k0 = k0, .k1 = k1, .send = span(send, k0, k1), .recv = span(recv, k0, k1) };
++}
++
++fn span(pre: []const i32, k0: usize, k1: usize) usize {
++    return @intCast(pre[k1] - pre[k0]);
++}
++
++fn fits(send: []const i32, recv: []const i32, k0: usize, k1: usize, cap: usize) bool {
++    return span(send, k0, k1) <= cap and span(recv, k0, k1) <= cap;
++}
++
++fn ownerArgs(a: *cuda.Args, o: Owner) void {
++    for ([_]usize{ slots, o.first, o.count, @intFromBool(o.split), o.rank }) |v| a.add(@as(i32, @intCast(v)));
++}
++
++/// Before the experts: each block's half-row sums, copied to the host while the experts run.
++pub fn plan(pass: anytype, b: Bufs, o: Owner, n: usize, h: usize) !void {
++    const peer = share(n, 2, 1 - o.rank);
++    const own = share(n, 2, o.rank);
++    var a: cuda.Args = .{};
++    a.add(pass.s.picks);
++    a.add(b.dev.ptr);
++    for ([_]usize{ peer[0], peer[1] - peer[0], own[0], own[1] - own[0], h }) |v| a.add(@as(i32, @intCast(v)));
++    ownerArgs(&a, o);
++    try cuda.launch.launch(pass.k.owner_rows, .{ .grid = .{ .x = 2 }, .block = .{ .x = 1024 } }, pass.stream, &a);
++    const d = pass.stream.d;
++    try d.check(d.api.cuMemcpyDtoHAsync_v2(b.host.bytes.ptr, b.dev.ptr, 2 * (h + 1) * 4, pass.stream.handle), "cuMemcpyDtoHAsync");
++    try b.ready.record(pass.stream);
++}
++
++/// After the experts: rounds of packed half rows each way, each round's own rows summed as fn_moe_sum would.
++pub fn exchange(pass: anytype, c: anytype, b: Bufs, o: Owner, n: usize, h: usize) !void {
++    const s = pass.s;
++    try c.reached(b.ready);
++    const pre = b.host.slice(i32);
++    const send = pre[0 .. h + 1];
++    const recv = pre[h + 1 ..][0 .. h + 1];
++    const peer = share(n, 2, 1 - o.rank);
++    const own = share(n, 2, o.rank);
++    // the experts' activations are spent by now: the packed half rows go there
++    const cap = s.cap * slots * wt.moe_w * 2 / (unit * 4);
++    var k0: usize = 0;
++    while (k0 < h) {
++        const r = nextRound(send, recv, k0, cap);
++        try pack(pass, b.dev.ptr, o, peer, r);
++        // the peer's rows in y are packed already: what arrives goes there
++        const region = s.y + (peer[0] + r.k0) * slots * dims * 4;
++        try c.swap(pass.stream, s.moe_act, r.send * unit, region, r.recv * unit);
++        try sum(pass, b.dev.ptr + (h + 1) * 4, o, region, own, r);
++        k0 = r.k1;
++    }
++}
++
++fn pack(pass: anytype, pre: u64, o: Owner, peer: [2]usize, r: Round) !void {
++    var a: cuda.Args = .{};
++    a.add(pass.s.y);
++    a.add(pass.s.picks);
++    a.add(pre);
++    a.add(pass.s.moe_act);
++    for ([_]usize{ peer[0], peer[1] - peer[0], r.k0, unit / 4 }) |v| a.add(@as(i32, @intCast(v)));
++    ownerArgs(&a, o);
++    try cuda.launch.launch(pass.k.owner_pack, .{ .grid = .{ .x = @intCast(r.k1 - r.k0) }, .block = .{ .x = 256 } }, pass.stream, &a);
++}
++
++fn sum(pass: anytype, pre: u64, o: Owner, recv: u64, own: [2]usize, r: Round) !void {
++    const s = pass.s;
++    var a: cuda.Args = .{};
++    a.add(s.y);
++    a.add(recv);
++    a.add(s.wts);
++    a.add(s.picks);
++    a.add(pre);
++    a.add(s.moe_f32);
++    for ([_]usize{ own[0], own[1] - own[0], r.k0, dims }) |v| a.add(@as(i32, @intCast(v)));
++    ownerArgs(&a, o);
++    try cuda.launch.launch(pass.k.owner_sum, .{ .grid = .{ .x = @intCast(r.k1 - r.k0), .y = dims / 256 }, .block = .{ .x = 256 } }, pass.stream, &a);
++}
++
++test {
++    _ = @import("cuda_owner_slots_test.zig");
++}
+diff --git a/zig/src/families/flashnext/cuda_owner_slots_test.zig b/zig/src/families/flashnext/cuda_owner_slots_test.zig
+new file mode 100644
+index 000000000..858ce1865
+--- /dev/null
++++ b/zig/src/families/flashnext/cuda_owner_slots_test.zig
+@@ -0,0 +1,190 @@
++//! The owner-slot exchange's rounds, and both ranks' launches and sends over a faked NCCL and driver.
++const std = @import("std");
++const cuda = @import("cuda");
++const wt = @import("cuda_prompt_wt.zig");
++const owner = @import("cuda_owner_slots.zig");
++const exchange = @import("cuda_moe_exchange.zig");
++const Collective = @import("cuda_collective.zig").Collective;
++const nccl = cuda.nccl;
++const abi = cuda.abi;
++const expect = std.testing.expect;
++const expectEqual = std.testing.expectEqual;
++
++const dims = wt.dims;
++const slots = wt.slots;
++const unit = owner.unit;
++
++/// Each row's half rows both ways from a seed: 0 to 22, as eleven slots' owners can give.
++fn prefixes(a: std.mem.Allocator, h: usize, seed: u64) ![2][]i32 {
++    var prng = std.Random.DefaultPrng.init(seed);
++    const rng = prng.random();
++    var out: [2][]i32 = undefined;
++    for (&out) |*pre| {
++        pre.* = try a.alloc(i32, h + 1);
++        pre.*[0] = 0;
++        for (0..h) |i| pre.*[i + 1] = pre.*[i] + @as(i32, @intCast(rng.uintAtMost(u32, 22)));
++    }
++    return out;
++}
++
++test "rounds cover every row once, fit the pack space both ways, take every row that fits, and match across ranks" {
++    const a = std.testing.allocator;
++    for ([_]usize{ 1, 2, 33, 4096, 8192 }) |h| for ([_]usize{ 22, 23, 500, 1 << 20 }) |cap| {
++        const pre = try prefixes(a, h, h * 31 + cap);
++        defer for (pre) |p| a.free(p);
++        var k0: usize = 0;
++        while (k0 < h) {
++            const r = owner.nextRound(pre[0], pre[1], k0, cap);
++            const mirror = owner.nextRound(pre[1], pre[0], k0, cap);
++            try expect(r.k0 == k0 and r.k1 > k0 and r.k1 <= h and mirror.k1 == r.k1 and mirror.send == r.recv);
++            try expect(r.send <= cap and r.recv <= cap);
++            try expectEqual(@as(usize, @intCast(pre[0][r.k1] - pre[0][k0])), r.send);
++            if (r.k1 < h) try expect(pre[0][r.k1 + 1] - pre[0][k0] > cap or pre[1][r.k1 + 1] - pre[1][k0] > cap);
++            k0 = r.k1;
++        }
++        try expectEqual(h, k0);
++    };
++}
++
++const Fake = struct {
++    const Call = struct { kind: enum { pack, sum, send, recv, gather, start, end }, ptr: u64 = 0, count: usize = 0, peer: c_int = 0, grid: u32 = 0, k0: i32 = 0, rows: i32 = 0 };
++    var calls: [256]Call = undefined;
++    var len: usize = 0;
++
++    fn record(c: Call) void {
++        calls[len] = c;
++        len += 1;
++    }
++    fn send(p: abi.DevicePtr, count: usize, t: nccl.DataType, peer: c_int, _: nccl.Comm, _: abi.Stream) callconv(.c) nccl.Result {
++        record(.{ .kind = .send, .ptr = p, .count = if (t == .f32) count else 0, .peer = peer });
++        return 0;
++    }
++    fn recv(p: abi.DevicePtr, count: usize, t: nccl.DataType, peer: c_int, _: nccl.Comm, _: abi.Stream) callconv(.c) nccl.Result {
++        record(.{ .kind = .recv, .ptr = p, .count = if (t == .f32) count else 0, .peer = peer });
++        return 0;
++    }
++    fn start() callconv(.c) nccl.Result {
++        record(.{ .kind = .start });
++        return 0;
++    }
++    fn end() callconv(.c) nccl.Result {
++        record(.{ .kind = .end });
++        return 0;
++    }
++    fn gather(p: abi.DevicePtr, _: abi.DevicePtr, count: usize, _: nccl.DataType, _: nccl.Comm, _: abi.Stream) callconv(.c) nccl.Result {
++        record(.{ .kind = .gather, .ptr = p, .count = count });
++        return 0;
++    }
++    fn arg(comptime T: type, args: ?[*]?*anyopaque, i: usize) T {
++        return @as(*const T, @ptrCast(@alignCast(args.?[i].?))).*;
++    }
++    // pack: four pointers, then peer0, rows, k0; sum: six pointers, then own0, rows, k0
++    fn launch(f: abi.Function, gx: c_uint, _: c_uint, _: c_uint, _: c_uint, _: c_uint, _: c_uint, _: c_uint, _: abi.Stream, args: ?[*]?*anyopaque, _: ?[*]?*anyopaque) callconv(.c) abi.Result {
++        const pack = @intFromPtr(f) == 1;
++        const at: usize = if (pack) 4 else 6;
++        record(.{ .kind = if (pack) .pack else .sum, .grid = gx, .ptr = arg(u64, args, if (pack) 3 else 1), .rows = arg(c_int, args, at + 1), .k0 = arg(c_int, args, at + 2) });
++        return 0;
++    }
++    fn query(_: abi.Event) callconv(.c) abi.Result {
++        return 0;
++    }
++    fn asyncError(_: nccl.Comm, out: *nccl.Result) callconv(.c) nccl.Result {
++        out.* = 0;
++        return 0;
++    }
++};
++
++const Bufs = struct { y: u64 = 0x1000_0000, wts: u64 = 0x2000_0000, moe_f32: u64 = 0x3000_0000, picks: u64 = 0x4000_0000, moe_act: u64 = 0x5000_0000, cap: usize, owner: ?owner.Bufs };
++const Pass = struct {
++    s: *const Bufs,
++    k: struct { moe_sum: cuda.Function, owner_pack: cuda.Function, owner_sum: cuda.Function },
++    stream: cuda.Stream,
++    pending_f32: bool = false,
++};
++
++/// One rank's calls for a split pass of `n` rows whose host prefix sums are `pre` (its sends, then its receives).
++fn runRank(d: *cuda.Driver, rank: usize, n: usize, pre: [2][]const i32, host: []align(16) u8) ![]const Fake.Call {
++    var pair: [2]c_int = .{ -1, -1 };
++    if (std.c.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0, &pair) != 0) return error.SocketPair;
++    defer for (pair) |fd| {
++        _ = std.c.close(fd);
++    };
++    var c: Collective = undefined;
++    c.failed = false;
++    c.comm = @ptrFromInt(0x1000);
++    c.link = .{ .fd = pair[0] };
++    c.timeout_ms = 1000;
++    c.rank = rank;
++    c.lib.api.ncclSend = Fake.send;
++    c.lib.api.ncclRecv = Fake.recv;
++    c.lib.api.ncclGroupStart = Fake.start;
++    c.lib.api.ncclGroupEnd = Fake.end;
++    c.lib.api.ncclAllGather = Fake.gather;
++    c.api.ncclCommGetAsyncError = Fake.asyncError;
++    const h = exchange.block(n);
++    const ints = std.mem.bytesAsSlice(i32, host[0 .. 2 * (h + 1) * 4]);
++    @memcpy(ints[0 .. h + 1], pre[0]);
++    @memcpy(ints[h + 1 ..], pre[1]);
++    const b: owner.Bufs = .{ .dev = .{ .d = d, .ptr = 0x6000_0000, .len = host.len }, .host = .{ .d = d, .bytes = host }, .ready = .{ .d = d, .handle = @ptrFromInt(8) } };
++    const bufs: Bufs = .{ .cap = n, .owner = b };
++    const f = struct {
++        fn of(dd: *cuda.Driver, x: usize) cuda.Function {
++            return .{ .d = dd, .handle = @ptrFromInt(x) };
++        }
++    };
++    var pass: Pass = .{ .s = &bufs, .k = .{ .moe_sum = f.of(d, 3), .owner_pack = f.of(d, 1), .owner_sum = f.of(d, 2) }, .stream = .{ .d = d, .handle = null } };
++    Fake.len = 0;
++    try exchange.run(&pass, &c, .{ .first = rank * 256, .count = 256, .split = true, .rank = rank }, n);
++    try expect(pass.pending_f32 and !c.failed);
++    return Fake.calls[0..Fake.len];
++}
++
++test "each round packs the peer's rows, sends what the peer receives into its packed rows, then sums its own" {
++    const a = std.testing.allocator;
++    var d: cuda.Driver = undefined;
++    d.api.cuLaunchKernel = Fake.launch;
++    d.api.cuEventQuery = Fake.query;
++    for ([_]usize{ 65, 66, 1537, 8192 }) |n| {
++        const h = exchange.block(n);
++        const pre = try prefixes(a, h, n);
++        defer for (pre) |p| a.free(p);
++        // rank 1's block is short a row when n is odd: its last offset is the pad, which holds nothing either way
++        if (n % 2 == 1) for (pre) |p| {
++            p[h] = p[h - 1];
++        };
++        const host = try a.alignedAlloc(u8, .@"16", 2 * (h + 1) * 4);
++        defer a.free(host);
++        const zero = try runRank(&d, 0, n, .{ pre[0], pre[1] }, host);
++        const got0 = try a.dupe(Fake.Call, zero);
++        defer a.free(got0);
++        const got1 = try runRank(&d, 1, n, .{ pre[1], pre[0] }, host);
++        try expectEqual(got0.len, got1.len);
++        const cap = n * slots * wt.moe_w * 2 / (unit * 4);
++        var k0: usize = 0;
++        var i: usize = 0;
++        while (k0 < h) : (i += 6) {
++            const r = owner.nextRound(pre[0], pre[1], k0, cap);
++            for ([_][]const Fake.Call{ got0, got1 }, 0..) |got, rank| {
++                const peer0 = if (rank == 0) h else 0;
++                const sent = if (rank == 0) r.send else r.recv;
++                const taken = if (rank == 0) r.recv else r.send;
++                const pk = got[i];
++                try expect(pk.kind == .pack and pk.grid == r.k1 - r.k0 and pk.k0 == r.k0 and pk.ptr == 0x5000_0000);
++                try expectEqual(@as(i32, @intCast(if (rank == 0) n - h else h)), pk.rows);
++                try expect(got[i + 1].kind == .start and got[i + 4].kind == .end);
++                const region = 0x1000_0000 + (peer0 + r.k0) * slots * dims * 4;
++                try expectEqual(Fake.Call{ .kind = .send, .ptr = 0x5000_0000, .count = sent * unit, .peer = @intCast(1 - rank) }, got[i + 2]);
++                try expectEqual(Fake.Call{ .kind = .recv, .ptr = region, .count = taken * unit, .peer = @intCast(1 - rank) }, got[i + 3]);
++                const sm = got[i + 5];
++                try expect(sm.kind == .sum and sm.grid == r.k1 - r.k0 and sm.k0 == r.k0 and sm.ptr == region);
++                try expectEqual(@as(i32, @intCast(if (rank == 0) h else n - h)), sm.rows);
++            }
++            k0 = r.k1;
++        }
++        try expect(i > 6 or n < 1000); // a full chunk takes several rounds through the experts' activations
++        for ([_][]const Fake.Call{ got0, got1 }, 0..) |got, rank| {
++            try expectEqual(i + 1, got.len);
++            try expectEqual(Fake.Call{ .kind = .gather, .ptr = 0x3000_0000 + rank * h * dims * 4, .count = h * dims }, got[i]);
++        }
++    }
++}
+diff --git a/zig/src/families/flashnext/cuda_prompt.zig b/zig/src/families/flashnext/cuda_prompt.zig
+index 3cadbe114..147976750 100644
+--- a/zig/src/families/flashnext/cuda_prompt.zig
++++ b/zig/src/families/flashnext/cuda_prompt.zig
+@@ -386,7 +386,7 @@ pub const Engine = struct {
+         }
+         // head_local: the draft head's lanes on one GPU, a pass's rows split; native_part only where the lane reduces
+         const parts = @import("cuda_batch_state.zig");
+-        const z: parts.Sizes = .{ .head_rows = if (e.collective != null) @max(rows, parts.head_rows_one) else parts.head_rows_one, .lane_reduce = !e.batch_k.native_lane.clusters };
++        const z: parts.Sizes = .{ .head_rows = if (e.collective != null) @max(rows, parts.head_rows_one) else parts.head_rows_one, .lane_reduce = !e.batch_k.native_lane.clusters, .owner = e.collective != null };
+         e.batch_s = try batch.Scratch.alloc(e.gpa, e.driver, e.stream.*, rows, z);
+         return &e.batch_s.?;
+     }
+diff --git a/zig/src/families/flashnext/cuda_scratch_sizes.zig b/zig/src/families/flashnext/cuda_scratch_sizes.zig
+index 315655b7a..93a0040d6 100644
+--- a/zig/src/families/flashnext/cuda_scratch_sizes.zig
++++ b/zig/src/families/flashnext/cuda_scratch_sizes.zig
+@@ -9,7 +9,7 @@ const att_rows = @import("cuda_batch_state.zig").att_rows;
+ pub const head_rows_one: usize = 32;
+ 
+ /// head_local's rows, and whether the lane reduces K slices through native_part (with clusters it never does).
+-pub const Sizes = struct { head_rows: usize = head_rows_one, lane_reduce: bool = true };
++pub const Sizes = struct { head_rows: usize = head_rows_one, lane_reduce: bool = true, owner: bool = false };
+ 
+ /// hc_part's rows of (low + 4) floats: hc_sk slices below 64 rows (legacy kernel), <= 8 below 256 (lane), one beyond.
+ pub fn hcPartRows(cap: usize) usize {
+diff --git a/zig/tests/cuda/contract_family_sets.zig b/zig/tests/cuda/contract_family_sets.zig
+index 83cbe1d6c..27aee1a40 100644
+--- a/zig/tests/cuda/contract_family_sets.zig
++++ b/zig/tests/cuda/contract_family_sets.zig
+@@ -16,6 +16,7 @@ pub const Sets = struct {
+     moss: *@import("contract_moss_image.zig").Set,
+     nemo_audio: *@import("contract_nemo_audio.zig").Set,
+     modelopt: *@import("contract_flashnext_modelopt.zig").Set,
++    owner: *@import("contract_flashnext_owner.zig").Set,
+     grouped: *Grouped,
+     flashnext: *@import("contract_flashnext_more.zig").Set,
+     exl3: *@import("contract_exl3.zig").Set,
+@@ -40,6 +41,8 @@ pub const Sets = struct {
+         errdefer nemo_audio.deinit();
+         const modelopt = try @import("contract_flashnext_modelopt.zig").Set.init(gpu, s, a, list);
+         errdefer modelopt.deinit();
++        const owner = try @import("contract_flashnext_owner.zig").Set.init(gpu, s, a, list);
++        errdefer owner.deinit();
+         const grouped = try gpu.gpa.create(Grouped);
+         errdefer gpu.gpa.destroy(grouped);
+         grouped.* = Grouped.init(gpu, s, affine4);
+@@ -76,6 +79,7 @@ pub const Sets = struct {
+             .moss = moss,
+             .nemo_audio = nemo_audio,
+             .modelopt = modelopt,
++            .owner = owner,
+             .grouped = grouped,
+             .flashnext = flashnext,
+             .exl3 = exl3,
+@@ -100,6 +104,7 @@ pub const Sets = struct {
+         sets.flashnext.deinit();
+         sets.grouped.deinit();
+         sets.gpa.destroy(sets.grouped);
++        sets.owner.deinit();
+         sets.modelopt.deinit();
+         sets.nemo_audio.deinit();
+         sets.moss.deinit();
+diff --git a/zig/tests/cuda/contract_flashnext_owner.zig b/zig/tests/cuda/contract_flashnext_owner.zig
+new file mode 100644
+index 000000000..6af31fee0
+--- /dev/null
++++ b/zig/tests/cuda/contract_flashnext_owner.zig
+@@ -0,0 +1,308 @@
++//! The --tp 2 owner-slot exchange's kernels: the half-row prefix sums, the pack, and the sum fn_moe_sum's bits.
++const std = @import("std");
++const cuda = @import("cuda");
++const core = @import("core");
++const check = @import("check.zig");
++const Rig = @import("contract_rig.zig").Rig;
++const c = core.contract.spec;
++const g = core.contract.gates;
++
++const dims = 2560;
++const slots = 11;
++const half = dims / 2;
++const share = cuda.rank_scatter.share;
++
++fn noSums(_: c.Shape) usize {
++    return 0;
++}
++
++// A pass's rows: past a verify window, odd and even, a default chunk and its scan tile's edges.
++const served = [_]c.Shape{ .{ .rows = 65, .n = 512, .k = 1 }, .{ .rows = 2049, .n = 512, .k = 1 }, .{ .rows = 3072, .n = 512, .k = 1 } };
++
++/// The kernels' rule on the host: the half rows (bits) rank `src` owns of slot k (fn_owner_units).
++fn units(pick: i32, k: usize, first: i32, split: bool, me: usize, src: usize) u32 {
++    if (k == slots - 1) return if (split) @as(u32, 1) << @intCast(src) else if (src == 0) 3 else 0;
++    const mine = pick >= first and pick < first + 256;
++    return if (mine == (src == me)) 3 else 0;
++}
++
++/// One pass's inputs: picks with edge experts planted, y with specials, weights, and the rank's view.
++const Case = struct {
++    n: usize,
++    h: usize,
++    me: usize,
++    split: bool,
++    picks: []i32,
++    y: []f32,
++    wts: []f32,
++    pre: []i32,
++
++    fn first(x: Case) i32 {
++        return @intCast(x.me * 256);
++    }
++
++    fn init(a: std.mem.Allocator, n: usize, me: usize, split: bool, seed: u64) !Case {
++        var prng = std.Random.DefaultPrng.init(seed);
++        const rng = prng.random();
++        const h = share(n, 2, 0)[1];
++        var x: Case = .{ .n = n, .h = h, .me = me, .split = split, .picks = try a.alloc(i32, (n + 1) * slots), .y = undefined, .wts = undefined, .pre = undefined };
++        errdefer a.free(x.picks);
++        for (x.picks, 0..) |*p, i| p.* = if (i % slots == slots - 1) 512 else @intCast(rng.uintLessThan(u32, 512));
++        for ([_]i32{ 0, 255, 256, 511 }, 0..) |e, i| x.picks[i] = e;
++        x.y = try a.alloc(f32, (n + 1) * slots * dims);
++        errdefer a.free(x.y);
++        const specials = [_]u32{ 0x8000_0000, 1, 0x8000_0001, 0x7f80_0000, 0xff80_0000, 0x7fc0_0000, 0x7f7f_ffff };
++        for (x.y, 0..) |*v, i| v.* = if (i % 997 == 3) @bitCast(specials[(i / 997) % specials.len]) else rng.float(f32) * 2 - 1;
++        x.wts = try a.alloc(f32, (n + 1) * slots);
++        errdefer a.free(x.wts);
++        for (x.wts) |*w| w.* = rng.float(f32);
++        x.wts[1] = @bitCast(@as(u32, 0x8000_0000));
++        x.pre = try a.alloc(i32, 2 * (h + 1));
++        for (0..2) |b| {
++            const row0 = if (b == 0) share(n, 2, 1 - me)[0] else share(n, 2, me)[0];
++            const rows = if (b == 0) share(n, 2, 1 - me)[1] - row0 else share(n, 2, me)[1] - row0;
++            const src = if (b == 0) me else 1 - me;
++            const pre = x.pre[b * (h + 1) ..][0 .. h + 1];
++            pre[0] = 0;
++            for (0..h) |i| {
++                var u: i32 = 0;
++                if (i < rows) for (0..slots) |k| {
++                    u += @popCount(units(x.picks[(row0 + i) * slots + k], k, x.first(), split, me, src));
++                };
++                pre[i + 1] = pre[i] + u;
++            }
++        }
++        return x;
++    }
++
++    fn deinit(x: Case, a: std.mem.Allocator) void {
++        a.free(x.picks);
++        a.free(x.y);
++        a.free(x.wts);
++        a.free(x.pre);
++    }
++
++    /// The first row of the round the pack and sum registrations run (a third in, so its offsets are not zero).
++    fn k0(x: Case) usize {
++        return x.h / 3;
++    }
++};
++
++const Kind = enum { rows, pack, sum };
++
++/// One kernel at one rank and shared split; the control launches it with the ranks swapped (or one expert off).
++pub const Owner = struct {
++    rig: Rig,
++    set: *const Set,
++    kind: Kind,
++    me: usize,
++    split: bool,
++    control: bool = false,
++    case: ?Case = null,
++    want: std.ArrayList(u8) = .empty,
++    dev: [6]u64 = @splat(0),
++    msg: [200]u8 = undefined,
++
++    const vt = g.hooks(Owner);
++
++    pub fn deinit(self: *Owner) void {
++        if (self.case) |x| x.deinit(self.rig.gpu.gpa);
++        self.want.deinit(self.rig.gpu.gpa);
++        self.rig.deinit();
++    }
++
++    pub fn kernel(self: *Owner) g.Kernel {
++        const names = [_][]const u8{ "cuda flashnext fn_owner_rows (half rows each way, prefix sums)", "cuda flashnext fn_owner_pack (a rank's half rows for the peer's rows)", "cuda flashnext fn_owner_sum (fn_moe_sum over the reduce-scatter's y)" };
++        const controls = [_][]const u8{ "control: fn_owner_rows one expert off", "control: fn_owner_pack the peer's half rows", "control: fn_owner_sum the ranks swapped" };
++        return .{ .ctx = self, .vt = &vt, .control = if (self.control) .shapes else null, .spec = .{
++            .name = if (self.control) controls[@backingInt(self.kind)] else names[@backingInt(self.kind)],
++            .accum = .none,
++            .depth = noSums,
++            .out = .raw,
++            .nan = .{ .stated = "bytes: the host rule's prefix sums and packed half rows; fn_moe_sum's bits over y with each value plus 0" },
++            .tiles = .{ .{ .size = 1024 }, .{}, .{} },
++            .served = &served,
++        } };
++    }
++
++    pub fn prepare(self: *Owner, shape: c.Shape, fill: g.Fill, seed: u64) !bool {
++        _ = fill;
++        const a = self.rig.gpu.gpa;
++        self.rig.reset();
++        if (self.case) |x| x.deinit(a);
++        self.case = null;
++        if (shape.rows < 3 or shape.n != 512) return false;
++        const x = try Case.init(a, shape.rows, self.me, self.split, seed);
++        self.case = x;
++        self.dev[0] = try self.rig.input(std.mem.sliceAsBytes(x.picks));
++        switch (self.kind) {
++            .rows => {
++                self.dev[1] = try self.rig.output(x.pre.len * 4);
++                try self.want.resize(a, x.pre.len * 4);
++                @memcpy(self.want.items, std.mem.sliceAsBytes(x.pre));
++            },
++            .pack => try self.preparePack(x),
++            .sum => try self.prepareSum(x),
++        }
++        return true;
++    }
++
++    fn preparePack(self: *Owner, x: Case) !void {
++        const a = self.rig.gpu.gpa;
++        const peer = share(x.n, 2, 1 - x.me);
++        self.dev[1] = try self.rig.input(std.mem.sliceAsBytes(x.y));
++        self.dev[2] = try self.rig.input(std.mem.sliceAsBytes(x.pre[0 .. x.h + 1]));
++        const total: usize = @intCast(x.pre[x.h] - x.pre[x.k0()]);
++        self.want.clearRetainingCapacity();
++        for (x.k0()..peer[1] - peer[0]) |i| for (0..slots) |k| {
++            const pair = (peer[0] + i) * slots + k;
++            const m = units(x.picks[pair], k, x.first(), x.split, x.me, x.me);
++            for (0..2) |u| if (m >> @intCast(u) & 1 == 1) try self.want.appendSlice(a, std.mem.sliceAsBytes(x.y[(pair * 2 + u) * half ..][0..half]));
++        };
++        self.dev[3] = try self.rig.output(@max(total, 1) * half * 4);
++        if (total == 0) try self.want.appendNTimes(a, 0xff, half * 4);
++    }
++
++    fn prepareSum(self: *Owner, x: Case) !void {
++        const a = self.rig.gpu.gpa;
++        const own = share(x.n, 2, x.me);
++        const pre = x.pre[x.h + 1 ..];
++        // the peer's half rows packed from the round's first row, and y as the reduce-scatter leaves it (each plus 0)
++        var recv: std.ArrayList(f32) = .empty;
++        defer recv.deinit(a);
++        const merged = try a.dupe(f32, x.y);
++        defer a.free(merged);
++        for (x.k0()..own[1] - own[0]) |i| for (0..slots) |k| {
++            const pair = (own[0] + i) * slots + k;
++            const m = units(x.picks[pair], k, x.first(), x.split, x.me, 1 - x.me);
++            for (0..2) |u| if (m >> @intCast(u) & 1 == 1) try recv.appendSlice(a, x.y[(pair * 2 + u) * half ..][0..half]);
++        };
++        for (merged) |*v| v.* = v.* + 0.0;
++        try recv.append(a, 0);
++        self.dev[1] = try self.rig.input(std.mem.sliceAsBytes(x.y));
++        self.dev[2] = try self.rig.input(std.mem.sliceAsBytes(recv.items));
++        self.dev[3] = try self.rig.input(std.mem.sliceAsBytes(x.wts));
++        self.dev[4] = try self.rig.input(std.mem.sliceAsBytes(pre));
++        self.dev[5] = try self.rig.output((x.n + 1) * dims * 4);
++        // fn_moe_sum over the merged rows of the round; every other row keeps the output's fill
++        var ym = try cuda.DeviceBuffer.fromHost(self.rig.gpu.d, std.mem.sliceAsBytes(merged));
++        defer ym.free();
++        var ref = try cuda.DeviceBuffer.alloc(self.rig.gpu.d, (x.n + 1) * dims * 4);
++        defer ref.free();
++        try ref.fill8(0xff, self.rig.s.handle);
++        const r0 = own[0] + x.k0();
++        var args: cuda.Args = .{};
++        args.add(ym.ptr + r0 * slots * dims * 4);
++        args.add(self.dev[3] + r0 * slots * 4);
++        args.add(ref.ptr + r0 * dims * 4);
++        args.add(@as(i32, dims));
++        args.add(@as(i32, slots));
++        try cuda.launch.launch(self.set.moe_sum, .{ .grid = .{ .x = @intCast(own[1] - r0), .y = dims / 256 }, .block = .{ .x = 256 } }, self.rig.s, &args);
++        try self.rig.s.synchronize();
++        try self.want.resize(a, (x.n + 1) * dims * 4);
++        try ref.download(0, self.want.items);
++    }
++
++    pub fn run(self: *Owner) !void {
++        const x = self.case.?;
++        const swapped = self.control and self.kind != .rows;
++        const me = if (swapped) 1 - x.me else x.me;
++        const first: i32 = x.first() + @intFromBool(self.control and self.kind == .rows);
++        const peer = share(x.n, 2, 1 - x.me);
++        const own = share(x.n, 2, x.me);
++        var a: cuda.Args = .{};
++        const tail = [_]i32{ slots, first, 256, @intFromBool(x.split), @intCast(me) };
++        switch (self.kind) {
++            .rows => {
++                a.add(self.dev[0]);
++                a.add(self.dev[1]);
++                for ([_]usize{ peer[0], peer[1] - peer[0], own[0], own[1] - own[0], x.h }) |v| a.add(@as(i32, @intCast(v)));
++                for (tail) |v| a.add(v);
++                try cuda.launch.launch(self.set.rows, .{ .grid = .{ .x = 2 }, .block = .{ .x = 1024 } }, self.rig.s, &a);
++            },
++            .pack => {
++                for ([_]u64{ self.dev[1], self.dev[0], self.dev[2], self.dev[3] }) |p| a.add(p);
++                for ([_]usize{ peer[0], peer[1] - peer[0], x.k0(), half / 4 }) |v| a.add(@as(i32, @intCast(v)));
++                for (tail) |v| a.add(v);
++                try cuda.launch.launch(self.set.pack, .{ .grid = .{ .x = @intCast(x.h - x.k0()) }, .block = .{ .x = 256 } }, self.rig.s, &a);
++            },
++            .sum => {
++                for ([_]u64{ self.dev[1], self.dev[2], self.dev[3], self.dev[0], self.dev[4], self.dev[5] }) |p| a.add(p);
++                for ([_]usize{ own[0], own[1] - own[0], x.k0(), dims }) |v| a.add(@as(i32, @intCast(v)));
++                for (tail) |v| a.add(v);
++                try cuda.launch.launch(self.set.sum, .{ .grid = .{ .x = @intCast(x.h - x.k0()), .y = dims / 256 }, .block = .{ .x = 256 } }, self.rig.s, &a);
++            },
++        }
++        try self.rig.s.synchronize();
++    }
++
++    pub fn count(self: *Owner) usize {
++        return self.want.items.len;
++    }
++
++    pub fn reference(_: *Owner, want: []f64, mag: []f64) !void {
++        @memset(want, 0);
++        @memset(mag, 0);
++    }
++
++    /// Every byte as the host rule (rows, pack) or fn_moe_sum over the merged y (sum) gives it.
++    pub fn check(self: *Owner, _: g.Gate) !?[]const u8 {
++        const got = try self.rig.outputBytes();
++        if (got.len < self.want.items.len) return try std.fmt.bufPrint(&self.msg, "{d} bytes out, {d} wanted", .{ got.len, self.want.items.len });
++        for (self.want.items, got[0..self.want.items.len], 0..) |w, b, i| {
++            if (w != b) return try std.fmt.bufPrint(&self.msg, "{t} rank {d}: byte {d} is {x:0>2}, not {x:0>2}", .{ self.kind, self.me, i, b, w });
++        }
++        return null;
++    }
++};
++
++/// The three kernels at rank 0 with the shared slot split and rank 1 with it whole, and a control each.
++pub const Set = struct {
++    gpa: std.mem.Allocator,
++    batch: cuda.Module,
++    rows: cuda.Function = undefined,
++    pack: cuda.Function = undefined,
++    sum: cuda.Function = undefined,
++    moe_sum: cuda.Function = undefined,
++    regs: [9]Owner = undefined,
++
++    pub fn init(gpu: check.Gpu, s: cuda.Stream, a: std.mem.Allocator, list: *std.ArrayList(g.Kernel)) !*Set {
++        const set = try gpu.gpa.create(Set);
++        errdefer gpu.gpa.destroy(set);
++        set.* = .{ .gpa = gpu.gpa, .batch = try cuda.Module.load(gpu.d, cuda.kernels.flashnext_batch) };
++        errdefer set.batch.unload();
++        set.rows = try set.batch.function("fn_owner_rows");
++        set.pack = try set.batch.function("fn_owner_pack");
++        set.sum = try set.batch.function("fn_owner_sum");
++        set.moe_sum = try set.batch.function("fn_moe_sum");
++        const r: Rig = .{ .gpu = gpu, .s = s };
++        for (std.enums.values(Kind), 0..) |kind, i| {
++            set.regs[i * 3 + 0] = .{ .rig = r, .set = set, .kind = kind, .me = 0, .split = true };
++            set.regs[i * 3 + 1] = .{ .rig = r, .set = set, .kind = kind, .me = 1, .split = false };
++            set.regs[i * 3 + 2] = .{ .rig = r, .set = set, .kind = kind, .me = 0, .split = true, .control = true };
++        }
++        for (&set.regs) |*x| try list.append(a, x.kernel());
++        return set;
++    }
++
++    pub fn deinit(set: *Set) void {
++        for (&set.regs) |*x| x.deinit();
++        set.batch.unload();
++        set.gpa.destroy(set);
++    }
++};
++
++/// These kernels' gates 1-4 and their controls alone (tf-cuda-test flashnext-owner-contract).
++pub fn run(gpu: check.Gpu) !void {
++    const a = gpu.gpa;
++    var s = try cuda.Stream.init(gpu.d, false);
++    defer s.deinit();
++    var list: std.ArrayList(g.Kernel) = .empty;
++    defer list.deinit(a);
++    const set = try Set.init(gpu, s, a, &list);
++    defer set.deinit();
++    var t: g.Tally = .{};
++    try g.runAll(a, list.items, 0x6f77, &t);
++    std.debug.print("SUMMARY {d} kernels: {d} pass gates 1-4, {d} fail; {d} controls: {d} red as planted, {d} missed\n", .{ t.kernels, t.passed, t.failed, t.controls, t.caught, t.missed });
++    try check.expect(t.problems() == 0, "flashnext-owner-contract: {d} gate failures, {d} controls missed", .{ t.failed, t.missed });
++}
+diff --git a/zig/tests/cuda/flashnext_exchange_tests.zig b/zig/tests/cuda/flashnext_exchange_tests.zig
+index a0f7fe2ff..602c05fa2 100644
+--- a/zig/tests/cuda/flashnext_exchange_tests.zig
++++ b/zig/tests/cuda/flashnext_exchange_tests.zig
+@@ -23,10 +23,10 @@ pub fn run(gpu: check.Gpu, c: *Collective, stream: cuda.Stream, rank: usize) !vo
+     defer glue.deinit();
+     var mod = try cuda.Module.load(gpu.d, cuda.kernels.flashnext_batch);
+     defer mod.unload();
+-    const k: Kernels = .{ .moe_sum = try mod.function("fn_moe_sum") };
++    const k: Kernels = .{ .moe_sum = try mod.function("fn_moe_sum"), .owner_rows = try mod.function("fn_owner_rows"), .owner_pack = try mod.function("fn_owner_pack"), .owner_sum = try mod.function("fn_owner_sum") };
+     const tri: flash.Tri = .{ .s = stream, .own = &glue };
+-    for ([_]usize{ 65, 66, 67, 255, 1536, 1537, 8192 }) |n| try pass(gpu, c, stream, tri, k, rank, n);
+-    check.pass("rank {d}: the exchange's written rows, square sums and normalized rows equal the all-reduce's for 65 to 8,192 rows, odd and even; a changed sum fails", .{rank});
++    for ([_]usize{ 65, 66, 67, 255, 1536, 1537, 8192 }) |n| for ([_]Mode{ .owner_split, .owner_whole, .scatter }) |mode| try pass(gpu, c, stream, tri, k, rank, n, mode);
++    check.pass("rank {d}: the owner-slot exchange's (split and whole shared slot) and the reduce-scatter's written rows, square sums and normalized rows equal the all-reduce's for 65 to 8,192 rows, odd and even; a changed sum fails", .{rank});
+ }
+ 
+ /// sumBlock leaves block `rank` of the two ranks' values summed exactly, from one value to a vocabulary half.
+@@ -76,8 +76,10 @@ fn planted(gpu: check.Gpu, c: *Collective, stream: cuda.Stream, rank: usize) !vo
+     check.pass("rank {d}: reduce-scatter equals the all-reduce on planted -0, subnormals, extremes, infinities, NaN and two-rank values", .{rank});
+ }
+ 
+-const Kernels = struct { moe_sum: cuda.Function };
+-const Bufs = struct { y: u64, wts: u64, picks: u64, moe_f32: u64 };
++const Kernels = struct { moe_sum: cuda.Function, owner_rows: cuda.Function, owner_pack: cuda.Function, owner_sum: cuda.Function };
++const Bufs = struct { y: u64, wts: u64, moe_f32: u64, picks: u64, moe_act: u64, cap: usize, owner: ?flash.owner_slots.Bufs };
++/// The owner-slot exchange with the shared slot split or whole on rank 0, or the reduce-scatter a capture keeps.
++const Mode = enum { owner_split, owner_whole, scatter };
+ const Pass = struct { s: *const Bufs, k: Kernels, stream: cuda.Stream, pending_f32: bool = false };
+ 
+ /// A writeback's outputs over the pass's rows and the spare one, poisoned so a row no launch writes shows.
+@@ -131,10 +133,11 @@ fn bf16(v: f32) u16 {
+     return @truncate(@as(u32, @bitCast(v)) >> 16);
+ }
+ 
+-/// Routed pairs owned by a rank drawn per pair, the shared slot's columns in halves; a few elements on both ranks.
+-fn fill(y: []f32, wts: []f32, n: usize, rank: usize) void {
++/// Routed owners drawn per pair (picks to match), the shared slot halved or rank 0's; a scatter's few on both ranks.
++fn fill(y: []f32, wts: []f32, picks: []i32, n: usize, rank: usize, mode: Mode) void {
+     @memset(y, 0);
+     @memset(wts, 0);
++    @memset(picks, 0);
+     for (0..n) |r| for (0..slots) |k| {
+         const pair = r * slots + k;
+         const w = mix(pair ^ 0x77);
+@@ -142,24 +145,35 @@ fn fill(y: []f32, wts: []f32, n: usize, rank: usize) void {
+         if (r == 3 and k == 4) wts[pair] = std.math.nan(f32);
+         if (r == 5 and k == 2) wts[pair] = std.math.inf(f32);
+         const owner = mix(pair ^ 0x3a) & 1;
++        picks[pair] = if (k == slots - 1) 512 else @intCast(owner * 256 + mix(pair ^ 0x91) % 256);
+         for (0..dims) |d| {
+             const at = pair * dims + d;
+             const h = mix(at);
+-            const own = if (k == slots - 1) (d >= dims / 2) == (rank == 1) else owner == rank;
+-            if (own) y[at] = value(h) else if (h % 50_021 == 7) y[at] = value(mix(h)) * 0.75;
++            const shared = if (mode == .owner_whole) rank == 0 else (d >= dims / 2) == (rank == 1);
++            const own = if (k == slots - 1) shared else owner == rank;
++            if (own) y[at] = value(h) else if (mode == .scatter and h % 50_021 == 7) y[at] = value(mix(h)) * 0.75;
+         }
+     };
+ }
+ 
+ /// The all-reduce and both mode-2 writebacks against the exchange and both mode-4 writebacks, on the same inputs.
+-fn pass(gpu: check.Gpu, c: *Collective, stream: cuda.Stream, tri: flash.Tri, k: Kernels, rank: usize, n: usize) !void {
++fn pass(gpu: check.Gpu, c: *Collective, stream: cuda.Stream, tri: flash.Tri, k: Kernels, rank: usize, n: usize, mode: Mode) !void {
+     const a = gpu.gpa;
+     const rows = n + 1;
+     const y = try a.alloc(f32, rows * slots * dims);
+     defer a.free(y);
+     const wts = try a.alloc(f32, rows * slots);
+     defer a.free(wts);
+-    fill(y, wts, n, rank);
++    const picks = try a.alloc(i32, rows * slots);
++    defer a.free(picks);
++    fill(y, wts, picks, n, rank, mode);
++    var pd = try cuda.DeviceBuffer.fromHost(gpu.d, std.mem.sliceAsBytes(picks));
++    defer pd.free();
++    // the experts' activations: the owner-slot rounds pack into them, several rounds a full chunk
++    var act = try cuda.DeviceBuffer.alloc(gpu.d, n * slots * 640 * 2);
++    defer act.free();
++    var ob = try flash.owner_slots.Bufs.alloc(gpu.d, n);
++    defer ob.free();
+     const hs = try a.alloc(u16, n * wide + n * streams);
+     defer a.free(hs);
+     for (hs, 0..) |*v, i| v.* = bf16(@as(f32, @floatFromInt(mix(i ^ 0x51) >> 40)) / (1 << 23) - 1);
+@@ -177,12 +191,8 @@ fn pass(gpu: check.Gpu, c: *Collective, stream: cuda.Stream, tri: flash.Tri, k:
+     defer y_b.free();
+     var wd = try cuda.DeviceBuffer.fromHost(gpu.d, std.mem.sliceAsBytes(wts));
+     defer wd.free();
+-    const picks = try a.alloc(i32, rows * slots);
+-    defer a.free(picks);
+-    for (picks, 0..) |*v, i| v.* = @intCast(mix(i ^ 0x91) % 513);
+-    var pd = try cuda.DeviceBuffer.fromHost(gpu.d, std.mem.sliceAsBytes(picks));
+-    defer pd.free();
+-    const slot: flash.Slots = .{ .y = y_a.ptr, .wts = wd.ptr, .picks = pd.ptr, .count = slots, .split = 256 };
++    // main's one chain in slot order, which the owner-slot exchange's sums keep
++    const slot: flash.Slots = .{ .y = y_a.ptr, .wts = wd.ptr, .picks = pd.ptr, .count = slots, .split = 0 };
+     var hd = try cuda.DeviceBuffer.fromHost(gpu.d, std.mem.sliceAsBytes(hs));
+     defer hd.free();
+     var sd = try cuda.DeviceBuffer.fromHost(gpu.d, std.mem.asBytes(&scale));
+@@ -205,9 +215,12 @@ fn pass(gpu: check.Gpu, c: *Collective, stream: cuda.Stream, tri: flash.Tri, k:
+     try tri.hcWritebackMoe(h, outs[0].hout.ptr, outs[0].pss.ptr, inj, slot, n, dims, streams);
+     try tri.hcWritebackNormMoe(h, outs[1].hout.ptr, outs[1].pss.ptr, inj, slot, sc, outs[1].norm.ptr, eps, n);
+ 
+-    const bufs: Bufs = .{ .y = y_b.ptr, .wts = wd.ptr, .picks = pd.ptr, .moe_f32 = moe.ptr };
++    const bufs: Bufs = .{ .y = y_b.ptr, .wts = wd.ptr, .moe_f32 = moe.ptr, .picks = pd.ptr, .moe_act = act.ptr, .cap = n, .owner = ob };
+     var p: Pass = .{ .s = &bufs, .k = k, .stream = stream };
+-    try flash.moe_exchange.run(&p, c, n);
++    const o: flash.moe_exchange.Owner = .{ .first = rank * 256, .count = 256, .split = mode == .owner_split, .rank = rank };
++    const planned = if (mode == .scatter) null else try flash.moe_exchange.plan(&p, o, n);
++    try check.expect((planned != null) == (mode != .scatter), "rank {d}: the owner-slot exchange plans outside a capture", .{rank});
++    try flash.moe_exchange.run(&p, c, planned, n);
+     try check.expect(p.pending_f32, "rank {d}: the exchange leaves its sum pending in fp32", .{rank});
+     try tri.hcWriteback(h, outs[2].hout.ptr, outs[2].pss.ptr, moe.ptr, "*fp32", inj, dummy.ptr, "*bf16", dummy.ptr, "*bf16", rs, n, dims, streams, 4, 1, 1, 1);
+     try tri.hcWritebackNorm(h, outs[3].hout.ptr, outs[3].pss.ptr, moe.ptr, inj, dummy.ptr, dummy.ptr, sc, outs[3].norm.ptr, eps, rs, n, dims, streams, 4, 1, 1, 1);
+@@ -241,5 +254,5 @@ fn pass(gpu: check.Gpu, c: *Collective, stream: cuda.Stream, tri: flash.Tri, k:
+     const ref = try check.download(gpu, outs[0].hout);
+     defer a.free(ref);
+     try check.expect(!std.mem.eql(u8, changed, ref), "rank {d}: a flipped sum bit at {d} changes the written rows", .{ rank, at });
+-    check.pass("rank {d}: {d} rows: exchange bytes equal the all-reduce's; nothing written past the spare row; the changed-sum control fails as planted", .{ rank, n });
++    check.pass("rank {d}: {d} rows, {t}: exchange bytes equal the all-reduce's; nothing written past the spare row; the changed-sum control fails as planted", .{ rank, n, mode });
+ }
+diff --git a/zig/tests/cuda/main.zig b/zig/tests/cuda/main.zig
+index a12b0d0eb..6cd1357cd 100644
+--- a/zig/tests/cuda/main.zig
++++ b/zig/tests/cuda/main.zig
+@@ -354,6 +354,7 @@ fn run(gpu: check.Gpu, cmd: []const u8, rest: []const [:0]const u8) !void {
+     if (std.mem.eql(u8, cmd, "kernel-contract-limits")) return contract_tests.fatbins(gpu, try arg(rest, 0));
+     if (std.mem.eql(u8, cmd, "pocket-contract")) return @import("contract_pocket.zig").run(gpu);
+     if (std.mem.eql(u8, cmd, "flashnext-modelopt-contract")) return @import("contract_flashnext_modelopt.zig").run(gpu);
++    if (std.mem.eql(u8, cmd, "flashnext-owner-contract")) return @import("contract_flashnext_owner.zig").run(gpu);
+     if (std.mem.eql(u8, cmd, "moss-contract")) return @import("contract_moss_image.zig").run(gpu);
+     if (std.mem.eql(u8, cmd, "idol-contract")) return @import("contract_idol.zig").run(gpu);
+     if (std.mem.eql(u8, cmd, "tree")) return tree_tests.run(gpu);
+-- 
+2.56.0
+

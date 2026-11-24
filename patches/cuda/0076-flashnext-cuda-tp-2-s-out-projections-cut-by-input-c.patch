@@ -1,0 +1,347 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jay Leaton <58495321+jayleaton@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 16:42:23 +0700
+Subject: [PATCH 76/76] flashnext cuda: --tp 2's out projections cut by input
+ columns, the two partials added once, behind TF_FLASHNEXT_OUTPROJ_KSPLIT
+
+Not bit-exact: each rank projects its own heads over its input columns of out_proj and o_proj, and one exchange
+(the peer's mapped buffer, or NCCL's two-rank sum) adds the FP32 partials, so both ranks hold the same rows but the
+sums differ from the whole dot products. Default off.
+---
+ docs/environment.md                           |  1 +
+ zig/src/families/flashnext/cuda_disk.zig      |  4 +-
+ .../families/flashnext/cuda_lanes_load.zig    |  1 +
+ .../flashnext/cuda_outproj_ksplit.zig         | 61 +++++++++++++++++++
+ .../families/flashnext/cuda_prompt_load.zig   |  5 +-
+ .../families/flashnext/cuda_rank_engine.zig   |  4 +-
+ .../families/flashnext/cuda_split_lane.zig    | 12 +++-
+ .../flashnext/cuda_split_lane_test.zig        | 35 ++++++++++-
+ zig/src/platform/environment.zig              |  1 +
+ .../platform/environment_flashnext_test.zig   |  4 +-
+ zig/tests/fixtures/gradient-serving.tsv       |  2 +-
+ 11 files changed, 117 insertions(+), 13 deletions(-)
+ create mode 100644 zig/src/families/flashnext/cuda_outproj_ksplit.zig
+
+diff --git a/docs/environment.md b/docs/environment.md
+index f661618d7..3e77985d5 100644
+--- a/docs/environment.md
++++ b/docs/environment.md
+@@ -179,6 +179,7 @@ stops the start with the variable, the supplied text and the accepted forms.
+ | `TF_FLASHNEXT_PEER_SLOTS` | Exactly `0` or `1`; default off. At `--tp 2` on one host, a pass of up to 128 rows exchanges its MoE slots by writing each rank's own experts' rows (and its half of the shared expert's) into the peer's mapped buffer, about half the bytes of the all-reduce or reduce-scatter, with the same sums. Refused across hosts and with `TF_FLASHNEXT_DECODE_GRAPH`. Give every rank the same value. |
+ | `TF_FLASHNEXT_GATHER_SLOTS` | Exactly `0` or `1`; default off. With `TF_FLASHNEXT_PEER_SLOTS=1` at `--tp 2`, a pass of up to 128 rows moves the out projection's two gathers (each rank's heads before it, each rank's output columns after it) by writing into the peer's mapped buffer and waiting on its flag instead of NCCL: the same bytes in the same places, so the same bits. Inert without `TF_FLASHNEXT_PEER_SLOTS` and outside `--tp 2`. Give every rank the same value. |
+ | `TF_FLASHNEXT_EP_LOG` | Exactly `0` or `1`; default off. `1`: at `--tp 2` each eager decode or verify window of up to 64 rows copies its layers' expert picks aside and reads them back once at its end (a sync a window); every 64 windows each rank logs the mean and p90 of the distinct routed experts it computed a layer, its pairs a layer, and the mean gap between the ranks in distinct experts and in pairs. Captured windows and prompt fills are not counted. Replies are unchanged. |
++| `TF_FLASHNEXT_OUTPROJ_KSPLIT` | Exactly `0` or `1`; default off. **Not bit-exact.** `1` at `--tp 2` under the dense split: each rank loads the input columns of every DeltaNet `out_proj` and attention `o_proj` that its own heads feed, runs the projection over its heads alone into a full-width FP32 partial, and one exchange adds the two partials (the peer's mapped buffer with `TF_FLASHNEXT_PEER_SLOTS` for a pass of up to 128 rows, else an NCCL sum). That replaces the two gathers around the projection with one sync a layer. The slice sums meet as (slices 0-3) + (slices 4-7) instead of in one chain, so outputs differ slightly from off; both ranks still hold identical bits, since `a + b` equals `b + a`. Gate it on token match against the reference and a quality check. Inert at `--pp 2` and one rank. Give every rank the same value. |
+ | `TF_FLASHNEXT_READOUT_ROWS` | Whole row count; default 64; `0` never takes the tiles |
+ | `TF_FLASHNEXT_CHUNK` | Whole prompt rows a pass, 1 through 16384; default 3072 |
+ | `TF_FLASHNEXT_PP_SPLIT` | At `--pp 2`, rank 1's first layer, 2 through 47; default 24. Rank 0 holds the layers before it, the embedding and the head. Give both ranks the same value. |
+diff --git a/zig/src/families/flashnext/cuda_disk.zig b/zig/src/families/flashnext/cuda_disk.zig
+index c19bbc6cf..9314069a4 100644
+--- a/zig/src/families/flashnext/cuda_disk.zig
++++ b/zig/src/families/flashnext/cuda_disk.zig
+@@ -117,8 +117,8 @@ pub fn policyOf(c: anytype) [13]u64 {
+         e.chunk,
+         e.busy_chunk,
+         @intFromBool(f.gdn_fused),
+-        // TF_FLASHNEXT_HC_FUSE, _READOUT_FUSED in bit 1 and _HIDDEN_SUM in bit 2 (unset leaves the key as it was)
+-        @intFromBool(f.hc_fuse) | @as(u64, @intFromBool(f.readout_fused)) << 1 | @as(u64, @intFromBool(@import("cuda_moe_hidden_sum.zig").on)) << 2,
++        // TF_FLASHNEXT_HC_FUSE, _READOUT_FUSED, _HIDDEN_SUM and _OUTPROJ_KSPLIT in bits 0 to 3 (unset: as it was)
++        @intFromBool(f.hc_fuse) | @as(u64, @intFromBool(f.readout_fused)) << 1 | @as(u64, @intFromBool(@import("cuda_moe_hidden_sum.zig").on)) << 2 | @as(u64, @intFromBool(@import("cuda_outproj_ksplit.zig").on)) << 3,
+         @intFromBool(f.in_pass),
+         f.readout_rows,
+         f.fact_rows,
+diff --git a/zig/src/families/flashnext/cuda_lanes_load.zig b/zig/src/families/flashnext/cuda_lanes_load.zig
+index f63b1586c..8c5c93719 100644
+--- a/zig/src/families/flashnext/cuda_lanes_load.zig
++++ b/zig/src/families/flashnext/cuda_lanes_load.zig
+@@ -50,6 +50,7 @@ pub fn open(comptime F: type, gpa: std.mem.Allocator, io: std.Io, ctx: *const cu
+     @import("cuda_moe_hidden_sum.zig").on = try @import("cuda_moe_hidden_sum.zig").enabled();
+     @import("cuda_owner_slots.zig").on = try @import("cuda_owner_slots.zig").enabled();
+     @import("cuda_peer_slots.zig").gather_on = try @import("cuda_peer_slots.zig").gatherEnabled();
++    @import("cuda_outproj_ksplit.zig").on = try @import("cuda_outproj_ksplit.zig").enabled();
+     const driver: *cuda.Driver = @constCast(ctx.d);
+     const own = try gpa.create(Cuda);
+     errdefer gpa.destroy(own);
+diff --git a/zig/src/families/flashnext/cuda_outproj_ksplit.zig b/zig/src/families/flashnext/cuda_outproj_ksplit.zig
+new file mode 100644
+index 000000000..b1e252578
+--- /dev/null
++++ b/zig/src/families/flashnext/cuda_outproj_ksplit.zig
+@@ -0,0 +1,61 @@
++//! TF_FLASHNEXT_OUTPROJ_KSPLIT: at --tp 2 each rank's out projection over its own heads, the two partials summed once.
++const std = @import("std");
++const cuda = @import("cuda");
++const wt = @import("cuda_prompt_wt.zig");
++const projections = @import("cuda_projection_load.zig");
++const Cut = @import("cuda_modelopt_experts.zig").Cut;
++const PeerSlots = @import("cuda_peer_slots.zig").PeerSlots;
++
++const dims = wt.dims;
++
++/// TF_FLASHNEXT_OUTPROJ_KSPLIT as read at load: under the head split the out projections are cut by input columns.
++pub var on = false;
++
++/// TF_FLASHNEXT_OUTPROJ_KSPLIT: unset, blank or 0 keeps the output-column cut; 1 cuts the inputs and sums partials.
++pub fn enabled() !bool {
++    return @import("sys").environment.read(bool, "TF_FLASHNEXT_OUTPROJ_KSPLIT", false) catch return error.BadOutProjSplit;
++}
++
++/// A rank's K slices: the whole projection's over its half, so each spans the inputs one of the whole one's does.
++pub fn slices(world: usize) u32 {
++    return @intCast(cuda.qmmf.splitK(dims, wt.out_k) / world);
++}
++
++/// This rank's input columns of a BF16 [dims, k] out projection: the ones its heads' outputs feed.
++pub fn load(gpa: std.mem.Allocator, driver: *const cuda.Driver, store: anytype, name: []const u8, k: usize, world: usize, rank: usize) !wt.Q4 {
++    if (k != wt.out_k) return error.UnexpectedTensor;
++    var q = try projections.loadCut(gpa, driver, store, name, dims, k, try Cut.init(k, world, rank), .cols);
++    errdefer q.free();
++    q.native = try cuda.qmmf.pinned(q.native orelse return error.UnexpectedTensor, slices(world));
++    return q;
++}
++
++/// A layer whose out weight holds this rank's input columns: whole outputs over half the inputs.
++pub fn cut(native: cuda.qmmf.Weight, width: usize) bool {
++    return native.n == dims and native.k == width;
++}
++
++/// part's FP32 [n, dims]: this rank's heads `x` [n, width] times its input columns, plus the peer's partial.
++pub fn run(self: anytype, c: anytype, x: u64, native: cuda.qmmf.Weight, width: usize) !usize {
++    const s = self.s;
++    const n = self.rows;
++    if (!cut(native, width) or 2 * width != wt.out_k or native.sk != slices(2)) return error.UnexpectedTensor;
++    try self.k.native_lane.matmulF32(self.stream, x, width, n, native, s.part, s.native_part);
++    // one add of two partials: a + b and b + a are the same IEEE sum, so both ranks hold identical rows
++    if (peer(c, n)) |p| {
++        try p.sumRows(self.k.peer_rows_send, self.k.peer_rows_add, self.stream, s.part, n);
++    } else try c.sum(self.stream, s.part, n * dims);
++    return 1;
++}
++
++/// The peer's mapped buffer (TF_FLASHNEXT_PEER_SLOTS) for a pass it takes, else null: NCCL's two-rank sum.
++fn peer(c: anytype, n: usize) ?*PeerSlots {
++    if (!PeerSlots.fits(n)) return null;
++    return if (c.peer) |*p| p else null;
++}
++
++test {
++    try std.testing.expectEqual(@as(u32, 4), slices(2));
++    try std.testing.expect(cut(cuda.modelopt.bf16Weight(0, dims, wt.out_k / 2), wt.out_k / 2));
++    try std.testing.expect(!cut(cuda.modelopt.bf16Weight(0, dims / 2, wt.out_k), wt.out_k / 2));
++}
+diff --git a/zig/src/families/flashnext/cuda_prompt_load.zig b/zig/src/families/flashnext/cuda_prompt_load.zig
+index f76c2031b..3aa0a9301 100644
+--- a/zig/src/families/flashnext/cuda_prompt_load.zig
++++ b/zig/src/families/flashnext/cuda_prompt_load.zig
+@@ -8,6 +8,7 @@ const wt = @import("cuda_prompt_wt.zig");
+ const mixed = @import("cuda_mixed_experts.zig");
+ const projections = @import("cuda_projection_load.zig");
+ const dense_split = @import("cuda_dense_split.zig");
++const ksplit = @import("cuda_outproj_ksplit.zig");
+ const Cut = @import("cuda_modelopt_experts.zig").Cut;
+ const Heads = @import("cuda_heads.zig").Heads;
+ const heads_cut = @import("heads_cut.zig");
+@@ -357,7 +358,7 @@ fn loadLayerAtRank(gpa: std.mem.Allocator, driver: *cuda.Driver, stream: *cuda.S
+             proj_q = try projections.loadStitchedCut(gpa, driver, store, lp, &heads_cut.delta_parts, &st.ranges, st.n, dims, st.sk);
+         } else proj_q = try projections.loadStitched(gpa, driver, store, lp, &heads_cut.delta_parts, gdn.proj_width, dims);
+         const out_name = try std.fmt.bufPrint(&buf, "{s}.out_proj", .{lp});
+-        out_q = if (cut) |c| try projections.loadCut(gpa, driver, store, out_name, dims, gdn.value_dim, c, .rows) else try projections.load(gpa, driver, store, out_name, dims, gdn.value_dim);
++        out_q = if (cut) |c| (if (ksplit.on) try ksplit.load(gpa, driver, store, out_name, gdn.value_dim, world, rank) else try projections.loadCut(gpa, driver, store, out_name, dims, gdn.value_dim, c, .rows)) else try projections.load(gpa, driver, store, out_name, dims, gdn.value_dim);
+         const conv = try store.tensor(try std.fmt.bufPrint(&buf, "{s}.conv1d.weight", .{lp}));
+         if (conv.bytes.len != gdn.conv_dim * gdn.taps * 2) return error.UnexpectedTensor;
+         if (cut != null) {
+@@ -385,7 +386,7 @@ fn loadLayerAtRank(gpa: std.mem.Allocator, driver: *cuda.Driver, stream: *cuda.S
+             proj_q = try projections.loadStitchedCut(gpa, driver, store, ap, &heads_cut.attention_parts, &st.ranges, st.n, dims, st.sk);
+         } else proj_q = try projections.loadStitched(gpa, driver, store, ap, &heads_cut.attention_parts, proj_n, dims);
+         const out_name = try std.fmt.bufPrint(&buf, "{s}.o_proj", .{ap});
+-        out_q = if (cut) |c| try projections.loadCut(gpa, driver, store, out_name, dims, out_k, c, .rows) else try projections.load(gpa, driver, store, out_name, dims, out_k);
++        out_q = if (cut) |c| (if (ksplit.on) try ksplit.load(gpa, driver, store, out_name, out_k, world, rank) else try projections.loadCut(gpa, driver, store, out_name, dims, out_k, c, .rows)) else try projections.load(gpa, driver, store, out_name, dims, out_k);
+         const qn = try store.normScale(gpa, try store.tensor(try std.fmt.bufPrint(&buf, "{s}.q_norm.weight", .{ap})));
+         defer gpa.free(qn);
+         const kn = try store.normScale(gpa, try store.tensor(try std.fmt.bufPrint(&buf, "{s}.k_norm.weight", .{ap})));
+diff --git a/zig/src/families/flashnext/cuda_rank_engine.zig b/zig/src/families/flashnext/cuda_rank_engine.zig
+index 65235a86c..c5e17127f 100644
+--- a/zig/src/families/flashnext/cuda_rank_engine.zig
++++ b/zig/src/families/flashnext/cuda_rank_engine.zig
+@@ -26,7 +26,7 @@ pub const Identity = extern struct {
+     split_rows: u64 = 0,
+     shared_split: u64 = 0, // TF_FLASHNEXT_SPLIT_SHARED in bit 0 and TF_FLASHNEXT_SHARED_REPLICATE in bit 1
+     peer_slots: u64 = 0,
+-    exchange: u64 = 0, // TF_FLASHNEXT_HIDDEN_SUM, _OWNER_SLOTS and _GATHER_SLOTS in bits 0 to 2, as read at load
++    exchange: u64 = 0, // TF_FLASHNEXT_HIDDEN_SUM, _OWNER_SLOTS, _GATHER_SLOTS, _OUTPROJ_KSPLIT in bits 0 to 3, at load
+     split: u64 = 0, // rank 1's first layer at --pp 2 (0: tensor ranks, every layer on both)
+     pp_spec: u64 = 0, // rank 0 guesses at the next window during rank 1's stage at --pp 2 (TF_FLASHNEXT_PP_SPEC)
+ };
+@@ -53,7 +53,7 @@ pub fn identity(a: std.mem.Allocator, io: std.Io, dir: []const u8, context: usiz
+     defer a.free(index);
+     const program = try std.process.executablePathAlloc(io, a);
+     defer a.free(program);
+-    return .{ .config = try fileHash(a, io, config), .index = try fileHash(a, io, index), .program = try fileHash(a, io, program), .checkpoint = checkpoint, .context = context, .chunk = chunk, .decode_graph = @intFromBool(@import("cuda_round_graph.zig").enabled()), .head_sharded = @intFromBool(try @import("cuda_head.zig").enabled()), .dense_split = @intFromBool(try @import("cuda_dense_split.zig").appliesDir(a, io, dir, 2)), .split_rows = try @import("cuda_moe_exchange.zig").asked(), .shared_split = @as(u64, @intFromBool(try @import("cuda_dense_split.zig").sharedSplit())) | @as(u64, @intFromBool(try @import("cuda_mixed_experts.zig").replicateOn())) << 1, .peer_slots = @intFromBool(try @import("cuda_peer_slots.zig").enabled()), .exchange = @as(u64, @intFromBool(try @import("cuda_moe_hidden_sum.zig").enabled())) | @as(u64, @intFromBool(try @import("cuda_owner_slots.zig").enabled())) << 1 | @as(u64, @intFromBool(try @import("cuda_peer_slots.zig").gatherEnabled())) << 2 };
++    return .{ .config = try fileHash(a, io, config), .index = try fileHash(a, io, index), .program = try fileHash(a, io, program), .checkpoint = checkpoint, .context = context, .chunk = chunk, .decode_graph = @intFromBool(@import("cuda_round_graph.zig").enabled()), .head_sharded = @intFromBool(try @import("cuda_head.zig").enabled()), .dense_split = @intFromBool(try @import("cuda_dense_split.zig").appliesDir(a, io, dir, 2)), .split_rows = try @import("cuda_moe_exchange.zig").asked(), .shared_split = @as(u64, @intFromBool(try @import("cuda_dense_split.zig").sharedSplit())) | @as(u64, @intFromBool(try @import("cuda_mixed_experts.zig").replicateOn())) << 1, .peer_slots = @intFromBool(try @import("cuda_peer_slots.zig").enabled()), .exchange = @as(u64, @intFromBool(try @import("cuda_moe_hidden_sum.zig").enabled())) | @as(u64, @intFromBool(try @import("cuda_owner_slots.zig").enabled())) << 1 | @as(u64, @intFromBool(try @import("cuda_peer_slots.zig").gatherEnabled())) << 2 | @as(u64, @intFromBool(try @import("cuda_outproj_ksplit.zig").enabled())) << 3 };
+ }
+ 
+ /// How long a rank waits for its peer: a minute with a given digest, 30 when the peer may be hashing every byte.
+diff --git a/zig/src/families/flashnext/cuda_split_lane.zig b/zig/src/families/flashnext/cuda_split_lane.zig
+index b2a4c1671..e760cb65b 100644
+--- a/zig/src/families/flashnext/cuda_split_lane.zig
++++ b/zig/src/families/flashnext/cuda_split_lane.zig
+@@ -1,23 +1,28 @@
+-//! Exact output-column projections: gather BF16 heads, compute full dot products, then gather FP32 outputs.
++//! Split out projections: exact output columns (gather heads, full dot products, gather outputs), or K-split partials.
+ const wt = @import("cuda_prompt_wt.zig");
+ const ops = @import("cuda_batch_ops.zig");
+ const Layer = @import("cuda_prompt_load.zig").Layer;
+ const peer_slots = @import("cuda_peer_slots.zig");
++const ksplit = @import("cuda_outproj_ksplit.zig");
+ 
+ const dims = wt.dims;
+ const out_sk = wt.out_sk;
+ 
+-/// Write full FP32 output rows into part without adding partial products across ranks.
++/// Full FP32 output rows into part: whole dot products, or under the K-split both ranks' partials added once.
+ pub fn out(self: anytype, x: u64, xs: u64, lw: *const Layer) !usize {
+     const s = self.s;
+     const n = self.rows;
+     const cut = lw.dense_cut orelse return self.lane(x, xs, lw.out, s.dummy, s.part, n, out_sk);
+     const native = lw.out.native orelse return error.UnexpectedTensor;
+     const c = self.m.collective orelse return error.TensorParallelUnavailable;
++    const width = lw.heads.valueDim();
++    if (ksplit.cut(native, width)) {
++        if (n == 0 or n > s.cap or !lw.heads.eql(.half) or cut.from != c.rank * (dims / 2)) return error.UnexpectedTensor;
++        return ksplit.run(self, c, x, native, width);
++    }
+     if (n == 0 or n > s.cap or !lw.heads.eql(.half) or cut.width() != dims / 2 or
+         cut.from != c.rank * (dims / 2) or native.n != dims / 2 or native.k != wt.out_k or
+         native.sk != @import("cuda").qmmf.splitK(dims, wt.out_k)) return error.UnexpectedTensor;
+-    const width = lw.heads.valueDim();
+     if (slots(c, n)) |p| {
+         // the same bytes in the same places as the two gathers and their copies, over the peer's mapped buffer
+         try p.gatherRows(self.k.peer_rows_send, self.k.peer_rows_take, self.stream, x, s.rank_input, width * 2, n);
+@@ -45,5 +50,6 @@ fn slots(c: anytype, n: usize) ?*peer_slots.PeerSlots {
+ 
+ test {
+     _ = @import("cuda_dense_split.zig");
++    _ = @import("cuda_outproj_ksplit.zig");
+     if (@import("builtin").os.tag != .windows) _ = @import("cuda_split_lane_test.zig");
+ }
+diff --git a/zig/src/families/flashnext/cuda_split_lane_test.zig b/zig/src/families/flashnext/cuda_split_lane_test.zig
+index 425687159..0ecf86cce 100644
+--- a/zig/src/families/flashnext/cuda_split_lane_test.zig
++++ b/zig/src/families/flashnext/cuda_split_lane_test.zig
+@@ -21,6 +21,7 @@ const strided_id = 0x500;
+ const prompt_id = 0x700;
+ const send_id = 0x800;
+ const take_id = 0x900;
++const add_id = 0xa00;
+ const x_at: u64 = 0x10_0000;
+ const part_at: u64 = 0x2000_0000;
+ const native_part_at: u64 = 0x4000_0000;
+@@ -54,7 +55,7 @@ const Rec = struct {
+                 copy_id => .{ arg(u64, args, 0), arg(i64, args, 1), arg(u64, args, 2), arg(i64, args, 3), arg(i32, args, 4), 0 },
+                 reduce_id => .{ arg(u64, args, 0), arg(u64, args, 1), arg(i64, args, 2), arg(i32, args, 3), 0, 0 },
+                 // the peer gather's source or destination, its own rows, q and rank
+-                send_id => .{ arg(u64, args, 0), 0, arg(i32, args, 2), 0, 0, 0 },
++                send_id, add_id => .{ arg(u64, args, 0), 0, arg(i32, args, 2), 0, 0, 0 },
+                 take_id => .{ arg(u64, args, 0), arg(u64, args, 1), arg(i32, args, 3), arg(i32, args, 4), 0, 0 },
+                 else => .{ arg(u64, args, 0), arg(u64, args, 6), arg(c_int, args, 7), arg(c_int, args, 8), arg(c_int, args, 9), arg(c_int, args, 10) },
+             },
+@@ -107,6 +108,7 @@ const Rig = struct {
+         r.k.copy_cols = f(&r.d, copy_id);
+         r.k.peer_rows_send = f(&r.d, send_id);
+         r.k.peer_rows_take = f(&r.d, take_id);
++        r.k.peer_rows_add = f(&r.d, add_id);
+         r.k.lane = f(&r.d, legacy_id);
+         r.k.tiles.fact = f(&r.d, legacy_id + 1);
+         r.k.tiles.fact_fold = f(&r.d, legacy_id + 2);
+@@ -133,6 +135,7 @@ const Rig = struct {
+         r.c.failed = false;
+         r.c.comm = @ptrFromInt(0x1000);
+         r.c.parent = null;
++        r.c.peer = null;
+         r.c.link = .{ .fd = r.pair[0] };
+         r.c.timeout_ms = 1000;
+         r.c.lib.api.ncclAllReduce = Rec.allReduce;
+@@ -258,6 +261,36 @@ test "split out lane: gather slots move the two gathers as peer writes to the sa
+     };
+ }
+ 
++test "split out lane: the K-split runs the rank's heads into part, then one sum of the two partials" {
++    if (builtin.os.tag == .windows) return error.SkipZigTest;
++    const peer_slots = @import("cuda_peer_slots.zig");
++    const ksplit = @import("cuda_outproj_ksplit.zig");
++    var r: Rig = undefined;
++    try r.init();
++    defer r.deinit();
++    for ([_]usize{ 1, 7, peer_slots.rows + 1 }) |n| for ([_]bool{ false, true }) |mapped| for (0..2) |rank| {
++        r.c.rank = rank;
++        r.c.peer = if (mapped) .{ .lib = undefined, .ipc = undefined, .d = &r.d, .local = 0xa000_0000, .peer = 0xb000_0000, .rank = rank } else null;
++        var lw = r.layer(out_k, true, try Cut.init(dims, 2, rank));
++        lw.out.n = dims;
++        lw.out.k = out_k / 2;
++        lw.out.native = try cuda.qmmf.pinned(cuda.modelopt.bf16Weight(0x2000, dims, out_k / 2), ksplit.slices(2));
++        var p = r.pass(n, true);
++        Rec.n = 0;
++        try std.testing.expectEqual(@as(usize, 1), try split_lane.out(&p, x_at, 0x20, &lw));
++        const calls = recorded();
++        try std.testing.expectEqual(qmmf_id, calls[0].f);
++        try std.testing.expectEqualSlices(i64, &.{ x_at, part_at }, calls[0].a[0..2]);
++        try std.testing.expectEqual(@as(i64, dims * 1_000_000 + out_k / 2), calls[0].a[4]);
++        const last = calls[calls.len - 1];
++        for (calls) |c| try std.testing.expect(c.kind != .gather and c.f != copy_id);
++        if (mapped and n <= peer_slots.rows) {
++            try std.testing.expectEqual(add_id, last.f);
++            try std.testing.expectEqual(@as(i64, part_at), last.a[0]);
++        } else try std.testing.expectEqual(Call{ .kind = .sum, .a = .{ part_at, part_at, @intCast(n * dims), @backingInt(nccl.DataType.f32), @backingInt(nccl.RedOp.sum), 0 } }, last);
++    };
++}
++
+ test "split out lane: an unsplit layer launches exactly what Pass.lane launches, with or without a collective" {
+     if (builtin.os.tag == .windows) return error.SkipZigTest;
+     var r: Rig = undefined;
+diff --git a/zig/src/platform/environment.zig b/zig/src/platform/environment.zig
+index 3109cc8b1..19a13fef9 100644
+--- a/zig/src/platform/environment.zig
++++ b/zig/src/platform/environment.zig
+@@ -247,6 +247,7 @@ pub const rules = [_]Rule{
+     .{ .name = "TF_FLASHNEXT_PEER_SLOTS", .scope = .flashnext, .kind = .flag, .forms = "0 or 1 (default 0; 1: at --tp 2 on one host the MoE exchange writes each rank's slots into the peer's mapped buffer); give every rank the same" },
+     .{ .name = "TF_FLASHNEXT_GATHER_SLOTS", .scope = .flashnext, .kind = .flag, .forms = "0 or 1 (default 0; 1: at --tp 2 with TF_FLASHNEXT_PEER_SLOTS the out projection's two gathers write into the peer's mapped buffer); give every rank the same" },
+     .{ .name = "TF_FLASHNEXT_EP_LOG", .scope = .flashnext, .kind = .flag, .forms = "0 or 1 (default 0; 1: at --tp 2 each rank logs its experts' distinct count and pairs a layer every 64 windows)" },
++    .{ .name = "TF_FLASHNEXT_OUTPROJ_KSPLIT", .scope = .flashnext, .kind = .flag, .forms = "0 or 1 (default 0; 1: at --tp 2 each rank's out projection runs over its own heads and one exchange adds the two partials; not bit-exact); give every rank the same" },
+     .{ .name = "TF_FLASHNEXT_SPLIT_ROWS", .scope = .flashnext, .kind = .size, .forms = "a whole row count from 0 to the native size maximum (0 or unset: one host's default; more rows a pass than this split the --tp 2 expert exchange by rows); give every rank the same" },
+     .{ .name = "TF_FLASHNEXT_READOUT_ROWS", .scope = .flashnext, .kind = .size, .forms = "a whole row count from 0 to the native size maximum (default 64; 0 never takes the tiles)" },
+     .{ .name = "TF_FLASHNEXT_CHUNK", .scope = .flashnext, .kind = .size, .min = 1, .max = 16384, .forms = "whole prompt rows a pass, 1 to 16384 (default 3072)" },
+diff --git a/zig/src/platform/environment_flashnext_test.zig b/zig/src/platform/environment_flashnext_test.zig
+index facf94f02..b9f9eec69 100644
+--- a/zig/src/platform/environment_flashnext_test.zig
++++ b/zig/src/platform/environment_flashnext_test.zig
+@@ -33,13 +33,13 @@ fn check(name: []const u8, raw: []const u8, valid: bool) !void {
+     try t.expect(std.mem.endsWith(u8, why.?, e.rule(name).forms));
+ }
+ 
+-test "Flash Next strict env: the table holds all 57 settings: 40 switches, 12 integers, 2 reals, 3 structured" {
++test "Flash Next strict env: the table holds all 58 settings: 41 switches, 12 integers, 2 reals, 3 structured" {
+     var counts: [4]usize = @splat(0);
+     for (e.rules) |r| if (r.scope == .flashnext) {
+         try t.expect(std.mem.startsWith(u8, r.name, "TF_FLASHNEXT_"));
+         counts[@backingInt(group(r))] += 1;
+     };
+-    try t.expectEqual([4]usize{ 40, 12, 2, 3 }, counts);
++    try t.expectEqual([4]usize{ 41, 12, 2, 3 }, counts);
+ }
+ 
+ test "Flash Next strict env: unset and blank settings both read as the caller's default" {
+diff --git a/zig/tests/fixtures/gradient-serving.tsv b/zig/tests/fixtures/gradient-serving.tsv
+index d881fe06e..885aa631a 100644
+--- a/zig/tests/fixtures/gradient-serving.tsv
++++ b/zig/tests/fixtures/gradient-serving.tsv
+@@ -131,7 +131,7 @@ zig/src/families/flashnext/cuda_images.zig	5bd8a6c06cb69440522f4392794d9ef52b376
+ zig/src/families/flashnext/cuda_images_test.zig	49d5d97e26b5214ffe3edb12a381c84118a8bf3da255c64be8f711c7da546cc4	raw
+ zig/src/families/flashnext/cuda_lanes.zig	fa002a6c1a43e07bf96d26fd230f4dd2763999e4942402778d00e75d00a1200a	raw	main 4f6017ced (marks inside the pass), fbca90714 (shared solo-chunk rule, #2391), 80e0fd72c (#2753: non-finite draft rows refused by name; finite rows unchanged), dfd9ac5ef4 (#2585: TF_FLASHNEXT_* read through platform/environment.zig, malformed text refused at startup; valid values keep their meaning), #1953: the ladder's values through snap_intermediate, #3308 (loader host test updates the named startup-refusal expectations; no runtime edit to this pinned file); #3135 (kept_disk renamed kept_view for the shared kept image; no served change), this change (the page pool opens with the load's device and io, for its arena mapped as pages are used; a new paged stream's first prompt step waits while the arena's thread maps its pieces; paging off: unchanged); F6: block-FP8 routed experts (Qwen's FP8 release) load a rank's whole experts and are admitted at --tp 2; the NVFP4 and affine paths keep their bytes; opt-in TF_FLASHNEXT_WINDOW_PAD pads a rank-link window; the first copy window keeps 16 rows
+ zig/src/families/flashnext/cuda_lanes_admission_test.zig	0c04ca112ad39d045b320d4c190c4589523fad255ecc2bd0d0cde141ff6dc23f	raw
+-zig/src/families/flashnext/cuda_lanes_load.zig	65c1c9c583fbecf3ddaa1eb593d3fbea494f10c903aca9a41452fbdfd939a2bb	raw	main dfd9ac5ef4 (#2585: TF_FLASHNEXT_* read through platform/environment.zig, malformed text refused at startup; valid values keep their meaning), #3467: after load a shard drops its page cache except the n-gram ranges, and the sweep reaches nested shards; tensors and replies are unchanged, this change (the load's device and io handed to the page pool's arena; paging off: unchanged); opt-in TF_FLASHNEXT_DECODE_GRAPH no longer refused with the dense split; default serving unchanged; #2972: the first collective waits up to 10 minutes for the peer's load, and a peer that leaves ends the wait within seconds; F6: block-FP8 routed experts (Qwen's FP8 release) load a rank's whole experts and are admitted at --tp 2; the NVFP4 and affine paths keep their bytes; opt-in TF_FLASHNEXT_TP_WINDOW_GRAPH: --tp 2 verify windows as graphs, the peer epoch on the device; default serving unchanged
++zig/src/families/flashnext/cuda_lanes_load.zig	9e361e1bda00afe49cb54d1ce8c51cf2fbad3d47707c8e5a625de117b68b4315	raw	main dfd9ac5ef4 (#2585: TF_FLASHNEXT_* read through platform/environment.zig, malformed text refused at startup; valid values keep their meaning), #3467: after load a shard drops its page cache except the n-gram ranges, and the sweep reaches nested shards; tensors and replies are unchanged, this change (the load's device and io handed to the page pool's arena; paging off: unchanged); opt-in TF_FLASHNEXT_DECODE_GRAPH no longer refused with the dense split; default serving unchanged; #2972: the first collective waits up to 10 minutes for the peer's load, and a peer that leaves ends the wait within seconds; F6: block-FP8 routed experts (Qwen's FP8 release) load a rank's whole experts and are admitted at --tp 2; the NVFP4 and affine paths keep their bytes; opt-in TF_FLASHNEXT_TP_WINDOW_GRAPH: --tp 2 verify windows as graphs, the peer epoch on the device; default serving unchanged
+ zig/src/families/flashnext/cuda_lanes_restore_test.zig	5d0ef1cac8d8704676505e50a7e46cc82a71803aadf7018d3da2136fdc71759c	raw	its rig names the collective's parent communicator; test only
+ zig/src/families/flashnext/cuda_launch.zig	12b9ba75f979f431d2e306e9e3cd636893760a6b69da7f6e379c4764cf681ce9	raw	exports cuda_moe_exchange.zig for its device test; no served change; #2837 (Flash Next TP=2 graph replay); its test block reaches cuda_collective.zig's host tests, no served change; #3413 exports cuda_tiles.zig and readout_fused.zig for their tests
+ zig/src/families/flashnext/cuda_media.zig	394601e8a807f5516f501efcaefa6fb3308f392ee322db7296b11c90814f8eea	raw
+-- 
+2.56.0
+

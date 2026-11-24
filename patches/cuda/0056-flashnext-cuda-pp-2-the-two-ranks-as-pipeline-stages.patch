@@ -1,0 +1,784 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jay Leaton <58495321+jayleaton@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 22:43:27 +0700
+Subject: [PATCH 56/76] flashnext cuda: --pp 2, the two ranks as pipeline
+ stages over the rank link
+
+Rank 0 holds layers [0, split), the embedding, the n-gram block and the head;
+rank 1 holds [split, 48). The boundary rows cross by NCCL send and receive on
+the compute stream; rank 1 replays each leader op on its own layers, and the
+hello proves both ranks' split (TF_FLASHNEXT_PP_SPLIT, default 24).
+
+Placement memory counts a stage's own layers, in the stored formats too (block
+FP8 experts load whole at world 1); the draft head stays on rank 0. Stages keep
+no prompt states yet: the cache defaults to 0, and a prompt cache, --spill-gib
+or --learn-conversations is refused by name. The serve flag --pp takes 1 to 64;
+above 1 it is refused for every other family and backend, above 2 for Flash
+Next, and with --tp above 1. TF_FLASHNEXT_PEER_SLOTS' mapped buffer opens for
+tensor ranks only.
+---
+ docs/environment.md                           |  1 +
+ zig/src/core/engine_api.zig                   |  2 +
+ zig/src/families/flashnext/cuda_batch.zig     |  1 +
+ zig/src/families/flashnext/cuda_batch_hop.zig |  2 +
+ .../families/flashnext/cuda_collective.zig    | 23 +++++++-
+ zig/src/families/flashnext/cuda_lanes.zig     |  2 +-
+ .../families/flashnext/cuda_lanes_bytes.zig   | 17 +++---
+ .../families/flashnext/cuda_lanes_load.zig    | 48 ++++++++++-------
+ zig/src/families/flashnext/cuda_prompt.zig    |  1 +
+ zig/src/families/flashnext/cuda_prompt_wt.zig |  6 +--
+ .../families/flashnext/cuda_rank_engine.zig   |  7 +++
+ zig/src/families/flashnext/cuda_rank_hop.zig  | 34 ++++++++++++
+ .../families/flashnext/cuda_rank_memory.zig   |  3 +-
+ zig/src/families/flashnext/cuda_span.zig      | 53 +++++++++++++++++--
+ zig/src/families/flashnext/cuda_span_main.zig |  9 +++-
+ zig/src/native/cuda.zig                       |  6 +++
+ zig/src/native/cuda_family_memory.zig         |  6 +--
+ zig/src/native/cuda_options.zig               |  1 +
+ zig/src/native/cuda_refusal.zig               | 15 ++++++
+ zig/src/platform/environment.zig              |  1 +
+ .../platform/environment_flashnext_test.zig   |  4 +-
+ zig/src/server/cli.zig                        |  3 ++
+ zig/src/server/cli_gpu_flags.zig              | 27 ++++++++--
+ zig/src/server/engines.zig                    | 15 ++++++
+ 24 files changed, 241 insertions(+), 46 deletions(-)
+ create mode 100644 zig/src/families/flashnext/cuda_rank_hop.zig
+
+diff --git a/docs/environment.md b/docs/environment.md
+index 82cad92f6..b52fa1449 100644
+--- a/docs/environment.md
++++ b/docs/environment.md
+@@ -169,6 +169,7 @@ stops the start with the variable, the supplied text and the accepted forms.
+ | `TF_FLASHNEXT_PEER_SLOTS` | Exactly `0` or `1`; default off. At `--tp 2` on one host, a pass of up to 128 rows exchanges its MoE slots by writing each rank's own experts' rows (and its half of the shared expert's) into the peer's mapped buffer, about half the bytes of the all-reduce or reduce-scatter, with the same sums. Refused across hosts and with `TF_FLASHNEXT_DECODE_GRAPH`. Give every rank the same value. |
+ | `TF_FLASHNEXT_READOUT_ROWS` | Whole row count; default 64; `0` never takes the tiles |
+ | `TF_FLASHNEXT_CHUNK` | Whole prompt rows a pass, 1 through 16384; default 3072 |
++| `TF_FLASHNEXT_PP_SPLIT` | At `--pp 2`, rank 1's first layer, 2 through 47; default 24. Rank 0 holds the layers before it, the embedding and the head. Give both ranks the same value. |
+ | `TF_FLASHNEXT_CHUNK_SOLO` | Whole prompt rows a pass with no stream decoding, from the chunk `TF_FLASHNEXT_CHUNK` resolves to through 16384; unset or blank is the larger of that chunk and 8192 on a server of one stream, and that chunk elsewhere |
+ | `TF_FLASHNEXT_FACT_ROWS` | Whole row count; default 64; `0` never takes the tiles |
+ | `TF_FLASHNEXT_KV_PAGE_TEST` | Whole page size the kernels take: whole blocks of the indexer's ratio up to the window; unset or blank leaves the plain caches |
+diff --git a/zig/src/core/engine_api.zig b/zig/src/core/engine_api.zig
+index 1d0bd4c89..de111bb00 100644
+--- a/zig/src/core/engine_api.zig
++++ b/zig/src/core/engine_api.zig
+@@ -344,6 +344,8 @@ pub const Open = struct {
+     keep: ?i64 = null,
+     /// Tensor parallelism: this process is `rank` of `tp`; rank 0 listens on `master`:`master_port` for the others.
+     tp: u32 = 1,
++    /// Pipeline stages (--pp): rank `rank` holds its stage's layers; a family without stages refuses above 1.
++    pp: u32 = 1,
+     rank: u32 = 0,
+     master: []const u8 = "",
+     master_port: u16 = 29551,
+diff --git a/zig/src/families/flashnext/cuda_batch.zig b/zig/src/families/flashnext/cuda_batch.zig
+index 9b72344c9..a0407fb44 100644
+--- a/zig/src/families/flashnext/cuda_batch.zig
++++ b/zig/src/families/flashnext/cuda_batch.zig
+@@ -561,6 +561,7 @@ pub fn Pass(comptime Tri: type) type {
+ 
+         pub fn complete(self: *Self) !void {
+             if (self.m.collective) |c| return c.finish(self.stream);
++            if (self.m.stage) |st| return st.hop.finish(st.hop.ctx);
+             try self.stream.synchronize();
+         }
+ 
+diff --git a/zig/src/families/flashnext/cuda_batch_hop.zig b/zig/src/families/flashnext/cuda_batch_hop.zig
+index 461cca0b4..6b01069ab 100644
+--- a/zig/src/families/flashnext/cuda_batch_hop.zig
++++ b/zig/src/families/flashnext/cuda_batch_hop.zig
+@@ -6,6 +6,8 @@ pub const Hop = struct {
+     ctx: *anyopaque,
+     take: *const fn (ctx: *anyopaque, h: u64, rows: usize) anyerror!void,
+     give: *const fn (ctx: *anyopaque, h: u64, rows: usize) anyerror!void,
++    /// A host wait for the stream's work, hops included, that ends when the other stage is lost.
++    finish: *const fn (ctx: *anyopaque) anyerror!void,
+ };
+ 
+ /// A stage's layers from `first` (an absolute index); its rows cross through `hop`.
+diff --git a/zig/src/families/flashnext/cuda_collective.zig b/zig/src/families/flashnext/cuda_collective.zig
+index a7ab12b34..52951682e 100644
+--- a/zig/src/families/flashnext/cuda_collective.zig
++++ b/zig/src/families/flashnext/cuda_collective.zig
+@@ -187,6 +187,27 @@ pub const Collective = struct {
+         try c.wait(null, wire.deadline(c.timeout_ms));
+     }
+ 
++    /// `bytes` at `ptr` to the other rank, enqueued on the compute stream: a pipeline rank's boundary rows.
++    pub fn send(c: *Collective, stream: cuda.Stream, ptr: u64, bytes: usize) !void {
++        return c.direct(stream, ptr, bytes, true);
++    }
++
++    /// `bytes` from the other rank into `ptr`, enqueued on the compute stream; later kernels there read them.
++    pub fn recv(c: *Collective, stream: cuda.Stream, ptr: u64, bytes: usize) !void {
++        return c.direct(stream, ptr, bytes, false);
++    }
++
++    fn direct(c: *Collective, stream: cuda.Stream, ptr: u64, bytes: usize, out: bool) !void {
++        if (c.failed or c.comm == null) return error.RankDisconnected;
++        if (bytes == 0) return;
++        errdefer c.abort();
++        try c.link.checkPeer();
++        const other: c_int = @intCast(1 - c.rank);
++        const api = c.lib.api;
++        try c.submitted(if (out) api.ncclSend(ptr, bytes, .u8, other, c.comm, stream.handle) else api.ncclRecv(ptr, bytes, .u8, other, c.comm, stream.handle));
++        try c.wait(null, wire.deadline(c.timeout_ms));
++    }
++
+     /// FP32 sum is enqueued on the compute stream; later kernels on that stream observe its result.
+     pub fn sum(c: *Collective, stream: cuda.Stream, values: u64, count: usize) !void {
+         if (c.failed or c.comm == null) return error.RankDisconnected;
+@@ -436,5 +457,5 @@ test "this file calls NCCL only to start, poll and abort, and for collectives NC
+         try std.testing.expect(known);
+         at = i + needle.len;
+     }
+-    try std.testing.expectEqual(@as(usize, 17), calls);
++    try std.testing.expectEqual(@as(usize, 19), calls);
+ }
+diff --git a/zig/src/families/flashnext/cuda_lanes.zig b/zig/src/families/flashnext/cuda_lanes.zig
+index a3b01d26f..2d67d0f59 100644
+--- a/zig/src/families/flashnext/cuda_lanes.zig
++++ b/zig/src/families/flashnext/cuda_lanes.zig
+@@ -65,7 +65,7 @@ pub fn Namespace(comptime Tri: type) type {
+             pub const min_gap: u32 = 256;
+             pub const min_prompt: u32 = 512;
+         };
+-        pub const Options = struct { vision: ?@import("cuda_images.zig").Limits = null, context: usize, drafts: bool, segments: usize = 1, slide: bool = false, tp: usize = 1, rank: usize = 0, master: ?[]const u8 = null, master_port: u16 = 29551, one_stream: bool = false };
++        pub const Options = struct { vision: ?@import("cuda_images.zig").Limits = null, context: usize, drafts: bool, segments: usize = 1, slide: bool = false, tp: usize = 1, pp: usize = 1, rank: usize = 0, master: ?[]const u8 = null, master_port: u16 = 29551, one_stream: bool = false };
+         /// Living Weights' learner (--slide): lessons put neurons in each layer's pocket beside its shared expert.
+         pub const slide = slide_mod.Slide(Tri);
+         /// The first file a lesson would rewrite through a link, or null: a teaching copy may hard-link the others.
+diff --git a/zig/src/families/flashnext/cuda_lanes_bytes.zig b/zig/src/families/flashnext/cuda_lanes_bytes.zig
+index 7a6b18f98..9e5059788 100644
+--- a/zig/src/families/flashnext/cuda_lanes_bytes.zig
++++ b/zig/src/families/flashnext/cuda_lanes_bytes.zig
+@@ -3,24 +3,29 @@ const std = @import("std");
+ const weights = @import("cuda_prompt_wt.zig");
+ const mtp = @import("cuda_mtp.zig");
+ const config = @import("cuda_config.zig");
++const Span = @import("cuda_span.zig").Span;
+ 
+ /// Device bytes of the checkpoint: the n-gram tables stay mapped, the MTP head counts; 0 if unread.
+ pub fn deviceWeightBytes(gpa: std.mem.Allocator, io: std.Io, dir: []const u8) u64 {
+-    const main = weights.deviceBytes(gpa, io, dir) catch return 0;
++    const main = weights.deviceBytes(gpa, io, dir, .whole) catch return 0;
+     return main + mtp.headBytes(headFp8(gpa, io, dir) catch return 0);
+ }
+ 
+-pub fn placementWeightBytes(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, world: usize, rank: usize, drafts: bool) !u64 {
+-    if ((world != 1 and world != 2) or rank >= world) return error.BadRank;
++/// Rank `rank`'s weights at `tp` tensor ranks or `pp` pipeline stages (one of them 1); the draft head on rank 0.
++pub fn placementWeightBytes(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, tp: usize, pp: usize, rank: usize, drafts: bool) !u64 {
++    if (tp != 1 and pp != 1) return error.FlashNextTensorAndPipeline;
++    const span = try Span.ofPlacement(pp, rank);
++    const world = tp;
++    if ((world != 1 and world != 2) or rank >= world * pp) return error.BadRank;
+     const mode = try config.mode(gpa, io, dir);
+     if (mode.stored()) {
+-        const main = try @import("cuda_rank_memory.zig").estimate(gpa, io, dir, world, rank);
++        const main = try @import("cuda_rank_memory.zig").estimate(gpa, io, dir, world, if (pp != 1) 0 else rank, span);
+         // Dense draft projections and vocabulary rows exceed the affine head's estimate.
+         return main + if (drafts and rank == 0) mtp.headBytes(try headFp8(gpa, io, dir)) + (1 << 30) else @as(u64, 0);
+     }
+     if (world != 1) return error.UnsupportedQuantization;
+-    const main = try weights.deviceBytes(gpa, io, dir);
+-    return main + if (drafts) mtp.headBytes(try headFp8(gpa, io, dir)) else @as(u64, 0);
++    const main = try weights.deviceBytes(gpa, io, dir, span);
++    return main + if (drafts and rank == 0) mtp.headBytes(try headFp8(gpa, io, dir)) else @as(u64, 0);
+ }
+ 
+ /// Whether the MTP head's routed experts are block FP8: its first expert's gate weight is F8_E4M3 (absent: false).
+diff --git a/zig/src/families/flashnext/cuda_lanes_load.zig b/zig/src/families/flashnext/cuda_lanes_load.zig
+index 41659c020..3e7d2e26b 100644
+--- a/zig/src/families/flashnext/cuda_lanes_load.zig
++++ b/zig/src/families/flashnext/cuda_lanes_load.zig
+@@ -10,32 +10,36 @@ const images = @import("cuda_images.zig");
+ pub fn open(comptime F: type, gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: []const u8, captured: ?[]const u8, o: F.Options) !F.Loaded {
+     try @import("env_validate.zig").startup();
+     if (o.vision) |v| try @import("qwen_vision").media.checkLimits(v);
+-    var load_cache = @import("core").checkpoint.cache.Load.begin(io, o.tp > 1);
++    // two ranks: tensor ranks (--tp 2) or pipeline stages (--pp 2), never both
++    const world = @max(o.tp, o.pp);
++    if (o.tp != 1 and o.pp != 1) return error.FlashNextTensorAndPipeline;
++    var load_cache = @import("core").checkpoint.cache.Load.begin(io, world > 1);
+     defer load_cache.deinit();
+     const Cuda = F.Cuda;
+     const round_streams = 32;
+ 
+     if (o.context > prompt.max_tokens) return error.ContextOverWindow;
+     if (o.segments != 1) return error.UnsupportedOption;
+-    if (o.tp != 1 and o.tp != 2) return error.FlashNextRanksOverTwo;
+-    if (o.rank >= o.tp) return error.BadRank;
++    if (world != 1 and world != 2) return error.FlashNextRanksOverTwo;
++    if (o.rank >= world) return error.BadRank;
++    const span = try @import("cuda_span.zig").Span.ofPlacement(o.pp, o.rank);
+     // refused before the stream, the glue or a captured set loads: the largest pass, wider at --parallel 1 on one rank
+-    const chunk = try @import("cuda_chunk.zig").soloRows(try prompt.chunkRows(), o.one_stream and o.tp == 1);
++    const chunk = try @import("cuda_chunk.zig").soloRows(try prompt.chunkRows(), o.one_stream and world == 1);
+     _ = try @import("cuda_modelopt_threads.zig").configured(); // TF_FLASHNEXT_LOAD_THREADS, refused before any load
+     const mode = try config.mode(gpa, io, dir);
+     if (o.tp != 1 and !mode.stored()) return error.FlashNextRanksNeedModelopt;
+-    if (o.tp != 1 and captured != null) return error.FlashNextRanksOnCapturedGlue;
+-    if (o.slide and (mode != .affine or o.tp != 1)) return error.UnsupportedLearningFormat;
++    if (world != 1 and captured != null) return error.FlashNextRanksOnCapturedGlue;
++    if (o.slide and (mode != .affine or world != 1)) return error.UnsupportedLearningFormat;
+     if (o.slide and captured != null) return error.TrainingOnCapturedGlue;
+     const page_tokens = try @import("cuda_kv_lanes.zig").paging();
+-    if (page_tokens > 0 and (o.tp != 1 or o.slide or captured != null)) return error.FlashNextPagesUnsupported;
++    if (page_tokens > 0 and (world != 1 or o.slide or captured != null)) return error.FlashNextPagesUnsupported;
+     // TF_FLASHNEXT_KV_HOST places a stream's K/V rows on mapped host pages: a pool lane's rows are pages already
+     const kv_host = @import("cuda_kv_host.zig");
+     kv_host.mode = kv_host.readMode();
+     if (kv_host.mode != .off and page_tokens > 0) return error.FlashNextKvHostUnsupported;
+     // pending DeltaNet rows run on one GPU only: TF_FLASHNEXT_KEEP_LATE=1 with tensor parallel is refused
+     const Draft = @import("cuda_mtp_draft.zig").Draft;
+-    const late_fits = o.tp == 1;
++    const late_fits = world == 1;
+     if (Draft.lateWanted() == true and !late_fits) return error.FlashNextKeepLateUnsupported;
+     Draft.late_on = (Draft.lateWanted() orelse true) and late_fits;
+     // both ranks of --tp 2 must agree on these: the rank identity carries them
+@@ -54,10 +58,11 @@ pub fn open(comptime F: type, gpa: std.mem.Allocator, io: std.Io, ctx: *const cu
+     // a captured set replaces our glue, for comparison, when it holds every entry point this engine launches
+     if (captured) |kernels| own.set = try F.comparison(gpa, io, driver, ctx, kernels, o.drafts);
+     errdefer if (own.set) |*x| x.deinit();
+-    if (o.tp == 2) {
++    if (world == 2) {
+         var id = try ranks.identity(gpa, io, dir, o.context, chunk);
+         id.mtp = @intFromBool(o.drafts);
+         id.kv_host = @backingInt(@import("cuda_kv_host.zig").mode);
++        id.split = if (o.pp != 1) try @import("cuda_span.zig").split() else 0;
+         if (o.vision) |v| {
+             try @import("qwen_vision").media.checkLimits(v);
+             id.image_tokens = v.image_tokens;
+@@ -69,19 +74,24 @@ pub fn open(comptime F: type, gpa: std.mem.Allocator, io: std.Io, ctx: *const cu
+         r.poison();
+         r.deinit();
+     };
+-    own.engine = try prompt.Engine.initRank(gpa, io, driver, &own.stream, dir, o.tp, o.rank);
++    own.engine = if (o.pp != 1) try prompt.Engine.initSpan(gpa, io, driver, &own.stream, dir, span) else try prompt.Engine.initRank(gpa, io, driver, &own.stream, dir, o.tp, o.rank);
+     errdefer own.engine.deinit();
+     own.engine.chunk = chunk;
+     own.engine.kept = if (try @import("cuda_snap.zig").onHost(ctx)) .{ .mapped = true } else null;
+     if (own.ranks) |r| {
+         r.engine = own.engine;
+-        own.engine.collective = &r.collective;
+-        const peer = @import("cuda_peer_slots.zig");
+-        if (try peer.enabled()) {
+-            if (r.collective.parent == null) return error.PeerSlotsNeedOneHost;
+-            // a captured round would replay one epoch: the exchange's epochs are launch arguments
+-            if (@import("cuda_round_graph.zig").enabled()) return error.PeerSlotsWithDecodeGraph;
+-            r.collective.peer = try peer.PeerSlots.init(driver, r.link, o.rank, 30_000);
++        if (o.pp != 1) {
++            r.rows = .{ .c = &r.collective, .stream = own.stream };
++            own.engine.hop = r.rows.hop();
++        } else {
++            own.engine.collective = &r.collective;
++            const peer = @import("cuda_peer_slots.zig");
++            if (try peer.enabled()) {
++                if (r.collective.parent == null) return error.PeerSlotsNeedOneHost;
++                // a captured round would replay one epoch: the exchange's epochs are launch arguments
++                if (@import("cuda_round_graph.zig").enabled()) return error.PeerSlotsWithDecodeGraph;
++                r.collective.peer = try peer.PeerSlots.init(driver, r.link, o.rank, 30_000);
++            }
+         }
+         try r.afterLoad(io, ctx, own.stream);
+     }
+@@ -96,7 +106,7 @@ pub fn open(comptime F: type, gpa: std.mem.Allocator, io: std.Io, ctx: *const cu
+     // the pass's scratch for a full chunk, once for the engine (every prompt, window, round and head pass)
+     _ = try own.engine.reserve(@max(@min(o.context, own.engine.chunk), if (o.slide) @as(usize, @import("cuda_train.zig").pack_rows) else 0));
+     // the MTP head unless --no-drafts (TF_FLASHNEXT_DRAFTS and _CONFIDENCE: the chain's rule, 6 and -0.4)
+-    if (o.drafts and (o.tp == 1 or o.rank == 0)) {
++    if (o.drafts and o.rank == 0) {
+         own.head = try mtp.Head.init(gpa, io, driver, &own.stream, dir);
+         const drafts = try @import("sys").environment.read(usize, "TF_FLASHNEXT_DRAFTS", mtp.default_depth);
+         own.depth = @max(1, @min(mtp.max_chain, drafts));
+@@ -119,7 +129,7 @@ pub fn open(comptime F: type, gpa: std.mem.Allocator, io: std.Io, ctx: *const cu
+     var stream_bytes = own_seq_bytes;
+     if (own.head) |h| {
+         stream_bytes += mtp.Draft.bytes(window, h.ids.len, own.engine.chunk, own.engine.heads);
+-    } else if (o.drafts and o.tp == 2) stream_bytes += mtp.Draft.bytes(window, 1, own.engine.chunk, own.engine.heads);
++    } else if (o.drafts and world == 2) stream_bytes += mtp.Draft.bytes(window, 1, own.engine.chunk, own.engine.heads);
+     if (o.vision) |v| stream_bytes += @as(usize, v.image_tokens) * @import("cuda_prompt_wt.zig").dims * 2 + 16 * o.context;
+     stream_bytes = kv_host.deviceStreamBytes(stream_bytes, window, own.engine.heads);
+     if (page_tokens > 0) {
+diff --git a/zig/src/families/flashnext/cuda_prompt.zig b/zig/src/families/flashnext/cuda_prompt.zig
+index a3e39e8b7..686d05587 100644
+--- a/zig/src/families/flashnext/cuda_prompt.zig
++++ b/zig/src/families/flashnext/cuda_prompt.zig
+@@ -373,6 +373,7 @@ pub const Engine = struct {
+ 
+     pub fn complete(e: *Engine) !void {
+         if (e.collective) |c| return c.finish(e.stream.*);
++        if (e.hop) |h| return h.finish(h.ctx);
+         try e.stream.synchronize();
+     }
+ 
+diff --git a/zig/src/families/flashnext/cuda_prompt_wt.zig b/zig/src/families/flashnext/cuda_prompt_wt.zig
+index d94dec717..5037d3f3c 100644
+--- a/zig/src/families/flashnext/cuda_prompt_wt.zig
++++ b/zig/src/families/flashnext/cuda_prompt_wt.zig
+@@ -408,8 +408,8 @@ pub fn hostOnly(name: []const u8) bool {
+         std.mem.startsWith(u8, name, "vision_tower.");
+ }
+ 
+-/// The checkpoint's tensor bytes the engine uploads, every shard the index names read for its header alone.
+-pub fn deviceBytes(gpa: std.mem.Allocator, io: std.Io, dir: []const u8) !u64 {
++/// The checkpoint's tensor bytes a stage's engine uploads, every shard the index names read for its header alone.
++pub fn deviceBytes(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, span: @import("cuda_span.zig").Span) !u64 {
+     var store = try Store.open(gpa, io, dir);
+     defer store.deinit();
+     const wm = store.parsed.value.object.get("weight_map") orelse return error.MissingTensor;
+@@ -426,7 +426,7 @@ pub fn deviceBytes(gpa: std.mem.Allocator, io: std.Io, dir: []const u8) !u64 {
+         defer sh.close();
+         var ni = sh.f.names.iterator();
+         while (ni.next()) |e| {
+-            if (!hostOnly(e.key_ptr.*)) total += e.value_ptr.end - e.value_ptr.begin;
++            if (!hostOnly(e.key_ptr.*) and span.keeps(e.key_ptr.*)) total += e.value_ptr.end - e.value_ptr.begin;
+         }
+     }
+     return total;
+diff --git a/zig/src/families/flashnext/cuda_rank_engine.zig b/zig/src/families/flashnext/cuda_rank_engine.zig
+index 0ce94009c..247a24009 100644
+--- a/zig/src/families/flashnext/cuda_rank_engine.zig
++++ b/zig/src/families/flashnext/cuda_rank_engine.zig
+@@ -28,6 +28,8 @@ pub const Identity = extern struct {
+     peer_slots: u64 = 0,
+     /// TF_FLASHNEXT_HIDDEN_SUM in bit 0 and TF_FLASHNEXT_OWNER_SLOTS in bit 1, as read at load.
+     exchange: u64 = 0,
++    /// Rank 1's first layer at --pp 2 (0: tensor ranks, every layer on both).
++    split: u64 = 0,
+ };
+ 
+ fn fileHash(a: std.mem.Allocator, io: std.Io, path: []const u8) ![32]u8 {
+@@ -75,6 +77,8 @@ pub const Session = struct {
+     drafting: bool = false,
+     stopped: bool = false,
+     available: std.atomic.Value(bool) = .init(true),
++    /// A pipeline rank's boundary rows over `collective` (--pp 2).
++    rows: @import("cuda_rank_hop.zig").Rows = undefined,
+ 
+     /// `wait_ms` bounds the link and the hello: the peer may still be reading every byte for its digest (`linkWait`).
+     pub fn init(a: std.mem.Allocator, io: std.Io, host: []const u8, port: u16, rank: usize, mine: Identity, wait_ms: u64) !*Session {
+@@ -503,6 +507,9 @@ test "rank identity binds checkpoint, config, index, program and execution setti
+     other = base;
+     other.kv_host = @backingInt(@import("cuda_kv_host.zig").Mode.overflow);
+     try std.testing.expect(!sameIdentity(base, other));
++    other = base;
++    other.split = 24;
++    try std.testing.expect(!sameIdentity(base, other));
+ }
+ 
+ test "rank operations refuse invalid geometry and unsupported hooks before execution" {
+diff --git a/zig/src/families/flashnext/cuda_rank_hop.zig b/zig/src/families/flashnext/cuda_rank_hop.zig
+new file mode 100644
+index 000000000..26c5f91b4
+--- /dev/null
++++ b/zig/src/families/flashnext/cuda_rank_hop.zig
+@@ -0,0 +1,34 @@
++//! A pipeline rank's boundary rows over the two ranks' NCCL communicator, on the engine's stream.
++const cuda = @import("cuda");
++const wt = @import("cuda_prompt_wt.zig");
++const Collective = @import("cuda_collective.zig").Collective;
++const Hop = @import("cuda_batch_hop.zig").Hop;
++
++pub const Rows = struct {
++    c: *Collective,
++    stream: cuda.Stream,
++
++    pub fn hop(r: *Rows) Hop {
++        return .{ .ctx = r, .take = take, .give = give, .finish = finish };
++    }
++
++    fn of(ctx: *anyopaque) *Rows {
++        return @ptrCast(@alignCast(ctx));
++    }
++
++    fn give(ctx: *anyopaque, h: u64, rows: usize) anyerror!void {
++        const r = of(ctx);
++        try r.c.send(r.stream, h, rows * wt.wide * 2);
++    }
++
++    fn take(ctx: *anyopaque, h: u64, rows: usize) anyerror!void {
++        const r = of(ctx);
++        try r.c.recv(r.stream, h, rows * wt.wide * 2);
++    }
++
++    /// A host wait on the stream that still sees the peer, its errors and the deadline.
++    fn finish(ctx: *anyopaque) anyerror!void {
++        const r = of(ctx);
++        try r.c.finish(r.stream);
++    }
++};
+diff --git a/zig/src/families/flashnext/cuda_rank_memory.zig b/zig/src/families/flashnext/cuda_rank_memory.zig
+index 5d3063b71..c9d0820cc 100644
+--- a/zig/src/families/flashnext/cuda_rank_memory.zig
++++ b/zig/src/families/flashnext/cuda_rank_memory.zig
+@@ -6,7 +6,7 @@ const wt = @import("cuda_prompt_wt.zig");
+ const dense_split = @import("cuda_dense_split.zig");
+ const Entry = core.safetensors.Entry;
+ 
+-pub fn estimate(a: std.mem.Allocator, io: std.Io, dir: []const u8, world: usize, rank: usize) !u64 {
++pub fn estimate(a: std.mem.Allocator, io: std.Io, dir: []const u8, world: usize, rank: usize, span: @import("cuda_span.zig").Span) !u64 {
+     if ((world != 1 and world != 2) or rank >= world) return error.BadRank;
+     var store = try wt.Store.open(a, io, dir);
+     defer store.deinit();
+@@ -25,6 +25,7 @@ pub fn estimate(a: std.mem.Allocator, io: std.Io, dir: []const u8, world: usize,
+         defer file.close(io);
+         var tensors = file.names.iterator();
+         while (tensors.next()) |tensor| {
++            if (!span.keeps(tensor.key_ptr.*)) continue;
+             total = try std.math.add(u64, total, try tensorBytes(tensor.key_ptr.*, tensor.value_ptr.*, world, rank, split));
+         }
+     }
+diff --git a/zig/src/families/flashnext/cuda_span.zig b/zig/src/families/flashnext/cuda_span.zig
+index 33c164bfb..45ffafba2 100644
+--- a/zig/src/families/flashnext/cuda_span.zig
++++ b/zig/src/families/flashnext/cuda_span.zig
+@@ -8,12 +8,12 @@ pub const Span = struct {
+ 
+     pub const whole: Span = .{};
+ 
+-    /// The two stages of a split at `split` (rank 1's first layer); layer 1's n-gram block stays on rank 0.
+-    pub fn ofRank(split: usize, rank: usize) !Span {
+-        if (split <= wt.ple_layer or split >= wt.layers_n) return error.BadPipelineSplit;
++    /// The two stages of a split at `at` (rank 1's first layer); layer 1's n-gram block stays on rank 0.
++    pub fn ofRank(at: usize, rank: usize) !Span {
++        if (at <= wt.ple_layer or at >= wt.layers_n) return error.BadPipelineSplit;
+         return switch (rank) {
+-            0 => .{ .end = split },
+-            1 => .{ .first = split },
++            0 => .{ .end = at },
++            1 => .{ .first = at },
+             else => error.BadRank,
+         };
+     }
+@@ -34,8 +34,38 @@ pub const Span = struct {
+     pub fn owns(s: Span, layer: usize) bool {
+         return layer >= s.first and layer < s.end;
+     }
++
++    /// Whether a checkpoint tensor loads on this stage: every tensor outside the decoder layers, and its own layers'.
++    pub fn keeps(s: Span, name: []const u8) bool {
++        return s.owns(layerOf(name) orelse return true);
++    }
++
++    /// Rank `rank`'s layers at `stages` pipeline stages (1: the whole model), split at TF_FLASHNEXT_PP_SPLIT.
++    pub fn ofPlacement(stages: usize, rank: usize) !Span {
++        if (stages == 1) return .whole;
++        if (stages != 2) return error.FlashNextStagesOverTwo;
++        return ofRank(try split(), rank);
++    }
+ };
+ 
++/// Rank 1's first layer at --pp 2 unless TF_FLASHNEXT_PP_SPLIT sets it.
++pub const default_split: usize = 24;
++
++pub fn split() !usize {
++    return @import("sys").environment.read(usize, "TF_FLASHNEXT_PP_SPLIT", default_split) catch error.BadPipelineSplit;
++}
++
++/// A decoder layer's index in a tensor's name (`...model.layers.N.`); null outside them, the MTP head's layer too.
++pub fn layerOf(name: []const u8) ?usize {
++    const key = "layers.";
++    const at = std.mem.indexOf(u8, name, key) orelse return null;
++    if (at >= 4 and std.mem.eql(u8, name[at - 4 .. at], "mtp.")) return null;
++    if (at > 0 and name[at - 1] != '.') return null;
++    const rest = name[at + key.len ..];
++    const end = std.mem.indexOfScalar(u8, rest, '.') orelse return null;
++    return std.fmt.parseInt(usize, rest[0..end], 10) catch null;
++}
++
+ test "a split puts layer 1's n-gram block on rank 0 and refuses an empty stage" {
+     const a = try Span.ofRank(24, 0);
+     const b = try Span.ofRank(24, 1);
+@@ -48,6 +78,19 @@ test "a split puts layer 1's n-gram block on rank 0 and refuses an empty stage"
+     try std.testing.expectEqual(Span{ .first = 47 }, try Span.ofRank(47, 1));
+ }
+ 
++test "a stage keeps its own layers' tensors and every tensor outside the decoder layers" {
++    const b = try Span.ofRank(24, 1);
++    try std.testing.expectEqual(@as(?usize, 24), layerOf("language_model.model.layers.24.mlp.experts.0.gate_proj.weight"));
++    try std.testing.expectEqual(@as(?usize, 3), layerOf("model.language_model.layers.3.self_attn.q_norm.weight"));
++    try std.testing.expectEqual(@as(?usize, null), layerOf("language_model.mtp.layers.0.self_attn.q_proj.weight"));
++    try std.testing.expectEqual(@as(?usize, null), layerOf("mtp.layers.0.mlp.gate.weight"));
++    try std.testing.expectEqual(@as(?usize, null), layerOf("language_model.lm_head.weight"));
++    try std.testing.expect(b.keeps("model.language_model.layers.47.mlp.gate.weight") and !b.keeps("model.language_model.layers.23.mlp.gate.weight"));
++    try std.testing.expect(b.keeps("language_model.model.embed_tokens.weight") and Span.whole.keeps("model.language_model.layers.0.mlp.gate.weight"));
++    try std.testing.expectEqual(Span.whole, try Span.ofPlacement(1, 0));
++    try std.testing.expectError(error.FlashNextStagesOverTwo, Span.ofPlacement(3, 0));
++}
++
+ test "linear layers skip every fourth index and attention starts at 3" {
+     try std.testing.expect(wt.linearLayer(0));
+     try std.testing.expect(!wt.linearLayer(3));
+diff --git a/zig/src/families/flashnext/cuda_span_main.zig b/zig/src/families/flashnext/cuda_span_main.zig
+index 94535484c..8cfe92a86 100644
+--- a/zig/src/families/flashnext/cuda_span_main.zig
++++ b/zig/src/families/flashnext/cuda_span_main.zig
+@@ -95,8 +95,8 @@ const Run = struct {
+         var rows = try cuda.DeviceBuffer.alloc(r.driver, @min(r.ids.len, a.chunk) * wide * 2);
+         defer rows.free();
+         var ring: Ring = .{ .run = r, .b = b, .seq = &seq_b, .rows = rows.ptr };
+-        a.hop = .{ .ctx = &ring, .take = Ring.back, .give = Ring.on };
+-        b.hop = .{ .ctx = &ring, .take = Ring.in, .give = Ring.out };
++        a.hop = .{ .ctx = &ring, .take = Ring.back, .give = Ring.on, .finish = Ring.finish };
++        b.hop = .{ .ctx = &ring, .take = Ring.in, .give = Ring.out, .finish = Ring.finish };
+         try greedy(r, out, &seq_a, Feed{ .e = a, .ring = &ring });
+     }
+ };
+@@ -160,4 +160,9 @@ const Ring = struct {
+         const g: *Ring = @ptrCast(@alignCast(ctx));
+         try g.copy(g.rows, h, rows);
+     }
++
++    fn finish(ctx: *anyopaque) anyerror!void {
++        const g: *Ring = @ptrCast(@alignCast(ctx));
++        try g.run.stream.synchronize();
++    }
+ };
+diff --git a/zig/src/native/cuda.zig b/zig/src/native/cuda.zig
+index 524b626f4..0026d2876 100644
+--- a/zig/src/native/cuda.zig
++++ b/zig/src/native/cuda.zig
+@@ -155,6 +155,12 @@ pub const Host = struct {
+ };
+ const refusals = @import("cuda_refusal.zig");
+ const record = @import("cuda_record.zig");
++/// Whether a family for `model_type` serves pipeline stages (its options take `pp`).
++pub fn pipeline(model_type: []const u8) bool {
++    inline for (registry) |F| if (comptime @hasDecl(F, "Options") and @hasField(F.Options, "pp")) if (std.mem.eql(u8, model_type, F.model_type)) return true;
++    return false;
++}
++
+ /// The engine for `o.dir`, or null with `problem` set when `refusal` names a flag or no CUDA family reads it.
+ pub fn open(a: Allocator, gpa: Allocator, io: std.Io, o: api.Open, problem: *[]const u8) !?api.Opened {
+     const report = platform.optional_libraries.atBoundary();
+diff --git a/zig/src/native/cuda_family_memory.zig b/zig/src/native/cuda_family_memory.zig
+index 56db251f4..1a7e139cf 100644
+--- a/zig/src/native/cuda_family_memory.zig
++++ b/zig/src/native/cuda_family_memory.zig
+@@ -61,7 +61,7 @@ pub fn weights(comptime F: type, a: Allocator, io: std.Io, o: api.Open, problem:
+         problem.* = try std.fmt.allocPrint(a, "cannot estimate checkpoint weight files ({s}); refusing CUDA admission", .{@errorName(err)});
+         return null;
+     };
+-    const text = if (@hasDecl(F, "placementWeightBytes")) try F.placementWeightBytes(a, io, o.dir, o.tp, o.rank, o.drafts) else if (@hasDecl(F, "weightShare")) share(F, a, io, o.dir, whole, o.drafts) catch |err| {
++    const text = if (@hasDecl(F, "placementWeightBytes")) try F.placementWeightBytes(a, io, o.dir, o.tp, o.pp, o.rank, o.drafts) else if (@hasDecl(F, "weightShare")) share(F, a, io, o.dir, whole, o.drafts) catch |err| {
+         problem.* = (if (@hasDecl(F, "explains_open")) F.explain(null, err) else null) orelse try std.fmt.allocPrint(a, "cannot size this rank's weights ({s})", .{@errorName(err)});
+         return null;
+     } else whole;
+@@ -86,10 +86,10 @@ pub fn room(comptime F: type, ptr: *anyopaque, local: u64) !u64 {
+ 
+ /// `o` with the family's own prompt-cache budget (`prompt_cache_gib`) when --prompt-cache-gib is not given.
+ pub fn familyOpen(comptime F: type, o: api.Open) api.Open {
+-    if (comptime !@hasDecl(F, "prompt_cache_gib")) return o;
+     if (o.prompt_cache_gib != null) return o;
+     var q = o;
+-    q.prompt_cache_gib = F.prompt_cache_gib;
++    // pipeline stages keep no prompt states yet: no cache unless asked for, which `cuda_refusal.family` refuses
++    if (o.pp != 1) q.prompt_cache_gib = 0 else if (comptime @hasDecl(F, "prompt_cache_gib")) q.prompt_cache_gib = F.prompt_cache_gib else return o;
+     return q;
+ }
+ 
+diff --git a/zig/src/native/cuda_options.zig b/zig/src/native/cuda_options.zig
+index 98cb42bec..e645b397f 100644
+--- a/zig/src/native/cuda_options.zig
++++ b/zig/src/native/cuda_options.zig
+@@ -12,6 +12,7 @@ pub fn set(comptime F: type, o: api.Open, opts: *F.Options, problem: *[]const u8
+     if (@hasField(F.Options, "one_stream")) opts.one_stream = o.lanes == 1;
+     if (@hasField(F.Options, "rank")) {
+         opts.tp = @intCast(o.tp);
++        if (@hasField(F.Options, "pp")) opts.pp = @intCast(o.pp);
+         opts.rank = @intCast(o.rank);
+         opts.master = if (o.master.len > 0) o.master else null;
+         opts.master_port = o.master_port;
+diff --git a/zig/src/native/cuda_refusal.zig b/zig/src/native/cuda_refusal.zig
+index 070dd3294..007ab3265 100644
+--- a/zig/src/native/cuda_refusal.zig
++++ b/zig/src/native/cuda_refusal.zig
+@@ -39,9 +39,13 @@ pub fn lfm2(o: api.Open) ?[]const u8 {
+ }
+ 
+ pub const no_ranks = "this CUDA family has no tensor-parallel ranks: serve without --tp";
++pub const no_stages = "--pp: this CUDA family has no pipeline stages: serve with --pp 1";
++pub const two_stages = "--pp: pipeline stages run on two ranks: serve with --pp 2";
++pub const stage_states = "--pp: pipeline stages keep no prompt states yet: serve without --prompt-cache-gib, --spill-gib and --learn-conversations";
+ 
+ /// --tp for a family that opens outside `family()` (Fish, Qwen4, LFM2): refused, never ignored.
+ pub fn unranked(o: api.Open) ?[]const u8 {
++    if (o.pp != 1) return no_stages;
+     return if (o.tp != 1) no_ranks else null;
+ }
+ 
+@@ -54,6 +58,9 @@ pub fn family(comptime F: type, o: api.Open) ?[]const u8 {
+     if (o.vision != null and !(@hasDecl(F, "Options") and @hasField(F.Options, "vision")))
+         return "--vision: this CUDA family reads no images; serve it without --vision";
+     const ranked = @hasDecl(F, "Options") and @hasField(F.Options, "rank");
++    if (o.pp != 1 and !(@hasDecl(F, "Options") and @hasField(F.Options, "pp"))) return no_stages;
++    if (o.pp > 2) return two_stages;
++    if (o.pp != 1 and ((o.prompt_cache_gib orelse 0) > 0 or o.spill != .off or o.learn_conversations)) return stage_states;
+     if (o.tp != 1 and !ranked) return no_ranks;
+     // ahead of the drafter's and --learn-conversations' refusals (--spill-gib sets that flag), on a line of its own
+     if (o.spill == .evicted and F != nemotron.native and @import("cuda_disk.zig").keptDisk(F) == null) return "--spill-gib keeps evicted states on disk for Nemotron, the Qwen hybrids, Flash Next, Gemma 4, Dory and Spark2.5 only on CUDA: serve this model without it";
+@@ -396,3 +403,11 @@ pub fn startup(a: std.mem.Allocator, o: api.Open, problem: *[]const u8) !bool {
+     }
+     return false;
+ }
++
++test "--pp: a family without stages, more than two stages and stage prompt states refuse by name" {
++    const fnx = @import("flashnext").native;
++    try std.testing.expect(family(fnx, .{ .dir = "d", .model_type = "m", .pp = 2, .prompt_cache_gib = 0 }) == null);
++    try std.testing.expectEqualStrings(two_stages, family(fnx, .{ .dir = "d", .model_type = "m", .pp = 3, .prompt_cache_gib = 0 }).?);
++    try std.testing.expectEqualStrings(stage_states, family(fnx, .{ .dir = "d", .model_type = "m", .pp = 2, .prompt_cache_gib = 4 }).?);
++    try std.testing.expectEqualStrings(no_stages, unranked(.{ .dir = "d", .model_type = "qwen4", .pp = 2 }).?);
++}
+diff --git a/zig/src/platform/environment.zig b/zig/src/platform/environment.zig
+index b801f81e8..3ffa5d269 100644
+--- a/zig/src/platform/environment.zig
++++ b/zig/src/platform/environment.zig
+@@ -238,6 +238,7 @@ pub const rules = [_]Rule{
+     .{ .name = "TF_FLASHNEXT_SPLIT_ROWS", .scope = .flashnext, .kind = .size, .forms = "a whole row count from 0 to the native size maximum (0 or unset: one host's default; more rows a pass than this split the --tp 2 expert exchange by rows); give every rank the same" },
+     .{ .name = "TF_FLASHNEXT_READOUT_ROWS", .scope = .flashnext, .kind = .size, .forms = "a whole row count from 0 to the native size maximum (default 64; 0 never takes the tiles)" },
+     .{ .name = "TF_FLASHNEXT_CHUNK", .scope = .flashnext, .kind = .size, .min = 1, .max = 16384, .forms = "whole prompt rows a pass, 1 to 16384 (default 3072)" },
++    .{ .name = "TF_FLASHNEXT_PP_SPLIT", .scope = .flashnext, .kind = .size, .min = 2, .max = 47, .forms = "rank 1's first layer at --pp 2, 2 to 47 (default 24)" },
+     .{ .name = "TF_FLASHNEXT_CHUNK_SOLO", .scope = .flashnext, .kind = .size, .max = 16384, .forms = "whole prompt rows a pass with no stream decoding, TF_FLASHNEXT_CHUNK to 16384 (unset: 8192 alone at --parallel 1, else off)" },
+     .{ .name = "TF_FLASHNEXT_FACT_ROWS", .scope = .flashnext, .kind = .size, .forms = "a whole row count from 0 to the native size maximum (default 64; 0 never takes the tiles)" },
+     .{ .name = "TF_FLASHNEXT_KV_PAGE_TEST", .scope = .flashnext, .kind = .size, .forms = "a page size the kernels take, whole blocks of the indexer's ratio up to the window (unset: off)" },
+diff --git a/zig/src/platform/environment_flashnext_test.zig b/zig/src/platform/environment_flashnext_test.zig
+index e380db2b6..6406b2734 100644
+--- a/zig/src/platform/environment_flashnext_test.zig
++++ b/zig/src/platform/environment_flashnext_test.zig
+@@ -33,13 +33,13 @@ fn check(name: []const u8, raw: []const u8, valid: bool) !void {
+     try t.expect(std.mem.endsWith(u8, why.?, e.rule(name).forms));
+ }
+ 
+-test "Flash Next strict env: the table holds all 43 settings: 29 switches, 10 integers, 1 real, 3 structured" {
++test "Flash Next strict env: the table holds all 44 settings: 29 switches, 11 integers, 1 real, 3 structured" {
+     var counts: [4]usize = @splat(0);
+     for (e.rules) |r| if (r.scope == .flashnext) {
+         try t.expect(std.mem.startsWith(u8, r.name, "TF_FLASHNEXT_"));
+         counts[@backingInt(group(r))] += 1;
+     };
+-    try t.expectEqual([4]usize{ 29, 10, 1, 3 }, counts);
++    try t.expectEqual([4]usize{ 29, 11, 1, 3 }, counts);
+ }
+ 
+ test "Flash Next strict env: unset and blank settings both read as the caller's default" {
+diff --git a/zig/src/server/cli.zig b/zig/src/server/cli.zig
+index ffd4b76b0..28049a713 100644
+--- a/zig/src/server/cli.zig
++++ b/zig/src/server/cli.zig
+@@ -135,6 +135,7 @@ pub const flags = [_]Flag{
+     .{ .name = "--no-update-check", .kind = .store_true, .native = true },
+     .{ .name = "--backend", .choices = &.{ "auto", "mlx", "cuda", "rocm" }, .native = true, .native_values = backend_values },
+     .{ .name = "--tp", .choices = &.{ "1", "2", "4", "8" }, .native = served("--tp") },
++    .{ .name = "--pp", .native = served("--tp") }, // 1 to 64; a family with pipeline stages admits its own
+     .{ .name = "--rank", .native = served("--tp") },
+     .{ .name = "--master", .native = served("--tp") },
+     .{ .name = "--master-port", .native = served("--tp") },
+@@ -255,6 +256,7 @@ pub const Args = struct {
+     checkpoint_slots: ?i64 = null,
+     spill_gib: ?f64 = null, // disk for states evicted from the prompt cache, every model together (null or 0: off)
+     tp: u32 = 1,
++    pp: u32 = 1,
+     rank: u32 = 0,
+     master: []const u8 = "",
+     master_port: u16 = 29551,
+@@ -569,6 +571,7 @@ pub fn request(a: Allocator, dir: []const u8, model_type: []const u8, args: Args
+         .decode_share = args.decode_share,
+         .keep = args.checkpoint_slots,
+         .tp = args.tp,
++        .pp = args.pp,
+         .rank = args.rank,
+         .master = args.master,
+         .master_port = args.master_port,
+diff --git a/zig/src/server/cli_gpu_flags.zig b/zig/src/server/cli_gpu_flags.zig
+index 7d493308c..0a3ec5baa 100644
+--- a/zig/src/server/cli_gpu_flags.zig
++++ b/zig/src/server/cli_gpu_flags.zig
+@@ -23,9 +23,11 @@ pub fn cudaFlag(a: Allocator, out: *Args, name: []const u8, v: []const u8, u: *U
+     return true;
+ }
+ 
+-/// A rank names one of the `tp` processes.
++/// A rank names one of the `tp` processes or the `pp` stages.
+ pub fn ranks(u: *Usage, a: Allocator, out: Args) error{ Usage, OutOfMemory }!void {
+-    if (out.rank >= out.tp) return fail(u, a, "argument --rank: {d} is not below --tp {d}", .{ out.rank, out.tp });
++    if (out.pp > 1 and out.tp > 1) return fail(u, a, "argument --pp: tensor ranks and pipeline stages together are not served: serve with --tp 1 or --pp 1", .{});
++    if (out.pp > 1 and out.rank >= out.pp) return fail(u, a, "argument --rank: {d} is not below --pp {d}", .{ out.rank, out.pp });
++    if (out.pp == 1 and out.rank >= out.tp) return fail(u, a, "argument --rank: {d} is not below --tp {d}", .{ out.rank, out.tp });
+ }
+ 
+ /// The GPU engine's tensor-parallel, MTP, kept-entry and policy flags; false for any other flag.
+@@ -35,7 +37,11 @@ pub fn gpuFlag(a: Allocator, out: *Args, name: []const u8, v: []const u8, u: *Us
+             return std.mem.eql(u8, x, y);
+         }
+     }.f;
+-    if (is(name, "--tp")) out.tp = @intCast(try int(u, a, name, v)) else if (is(name, "--rank")) {
++    if (is(name, "--tp")) out.tp = @intCast(try int(u, a, name, v)) else if (is(name, "--pp")) {
++        const n = try int(u, a, name, v);
++        if (n < 1 or n > 64) return fail(u, a, "argument --pp: a stage count from 1 to 64: '{s}'", .{v});
++        out.pp = @intCast(n);
++    } else if (is(name, "--rank")) {
+         out.rank = std.math.cast(u32, try int(u, a, name, v)) orelse return fail(u, a, "argument --rank: a rank from 0: '{s}'", .{v});
+     } else if (is(name, "--master")) out.master = v else if (is(name, "--master-port")) {
+         const p = try int(u, a, name, v);
+@@ -61,3 +67,18 @@ pub fn gpuFlag(a: Allocator, out: *Args, name: []const u8, v: []const u8, u: *Us
+ }
+ 
+ const Allocator = std.mem.Allocator;
++
++test "--pp takes 1 to 64, not with --tp above 1, and a rank below it" {
++    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
++    defer arena.deinit();
++    const a = arena.allocator();
++    var u: Usage = .{};
++    var args: Args = .{};
++    try std.testing.expect(try gpuFlag(a, &args, "--pp", "2", &u));
++    try std.testing.expectEqual(@as(u32, 2), args.pp);
++    for ([_][]const u8{ "0", "65" }) |v| try std.testing.expectError(error.Usage, gpuFlag(a, &args, "--pp", v, &u));
++    try ranks(&u, a, .{ .pp = 2, .rank = 1 });
++    try std.testing.expectError(error.Usage, ranks(&u, a, .{ .pp = 2, .rank = 2 }));
++    try std.testing.expectError(error.Usage, ranks(&u, a, .{ .pp = 2, .tp = 2 }));
++    try std.testing.expectEqual(@as(u32, 2), (try cli.request(a, "d", "t", args)).pp);
++}
+diff --git a/zig/src/server/engines.zig b/zig/src/server/engines.zig
+index 7aa4f7f8f..d2ba42efb 100644
+--- a/zig/src/server/engines.zig
++++ b/zig/src/server/engines.zig
+@@ -65,6 +65,10 @@ pub fn open(a: Allocator, gpa: Allocator, io: std.Io, dir: []const u8, model_typ
+             return null;
+         }
+     }
++    if (stages(model_type, args)) |why| {
++        problem.* = why;
++        return null;
++    }
+     if (args.record != null and !@hasDecl(native, "records")) {
+         problem.* = "--record writes rows from the CUDA engine only so far: serve without --record";
+         return null;
+@@ -72,6 +76,13 @@ pub fn open(a: Allocator, gpa: Allocator, io: std.Io, dir: []const u8, model_typ
+     return native.open(a, gpa, io, try cli.request(a, dir, model_type, args), problem);
+ }
+ 
++/// --pp above 1 where the build's backend serves no pipeline stages for `model_type`: refused, never ignored.
++fn stages(model_type: []const u8, args: cli.Args) ?[]const u8 {
++    if (args.pp == 1) return null;
++    if (@hasDecl(native, "pipeline") and native.pipeline(model_type)) return null;
++    return "--pp: pipeline stages serve Flash Next on CUDA only: serve with --pp 1";
++}
++
+ /// A tensor-parallel rank above 0 runs rank 0's steps until it stops; false with ``problem`` set when it cannot.
+ pub fn follow(a: Allocator, gpa: Allocator, io: std.Io, dir: []const u8, model_type: []const u8, args: cli.Args, problem: *[]const u8) !bool {
+     if (try environment(a, args)) |why| {
+@@ -82,6 +93,10 @@ pub fn follow(a: Allocator, gpa: Allocator, io: std.Io, dir: []const u8, model_t
+         problem.* = "this build has no tensor-parallel ranks";
+         return false;
+     }
++    if (stages(model_type, args)) |why| {
++        problem.* = why;
++        return false;
++    }
+     return native.follow(a, gpa, io, try cli.request(a, dir, model_type, args), problem);
+ }
+ 
+-- 
+2.56.0
+

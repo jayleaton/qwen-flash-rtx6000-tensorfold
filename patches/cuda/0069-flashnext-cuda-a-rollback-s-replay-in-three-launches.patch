@@ -1,0 +1,334 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jay Leaton <58495321+jayleaton@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 15:16:55 +0700
+Subject: [PATCH 69/76] flashnext cuda: a rollback's replay in three launches
+ (TF_FLASHNEXT_ROLL_BATCH), and rank waits without sleeps
+ (TF_FLASHNEXT_SPIN_WAIT)
+
+TF_FLASHNEXT_ROLL_BATCH=1 runs a partial keep's replay as fn_replay_front, fn_replay_chain and fn_late_roll over
+every DeltaNet layer at once (blockIdx.z the layer), the lone launches' programs on their own slices, so the state
+and conv windows come out bit for bit as the per-layer loop leaves them. TF_FLASHNEXT_SPIN_WAIT=1 drops the 50 us
+sleeps from a rank's collective waits. Both default off.
+---
+ docs/environment.md                           |  2 +
+ zig/kernels/cuda/flashnext_batch.cu           |  1 +
+ zig/kernels/cuda/flashnext_gdn_replay.cuh     | 59 ++++++++++++++++
+ .../core/contract/flashnext_tile_records.zig  |  4 ++
+ .../families/flashnext/cuda_batch_kernels.zig | 11 ++-
+ .../families/flashnext/cuda_collective.zig    |  9 ++-
+ zig/src/families/flashnext/cuda_mtp_roll.zig  | 68 +++++++++++++++++++
+ zig/src/platform/environment.zig              |  2 +
+ .../platform/environment_flashnext_test.zig   |  4 +-
+ 9 files changed, 155 insertions(+), 5 deletions(-)
+ create mode 100644 zig/kernels/cuda/flashnext_gdn_replay.cuh
+
+diff --git a/docs/environment.md b/docs/environment.md
+index bcd75fdd9..5d7ad1cc0 100644
+--- a/docs/environment.md
++++ b/docs/environment.md
+@@ -168,6 +168,8 @@ stops the start with the variable, the supplied text and the accepted forms.
+ | `TF_FLASHNEXT_SPLIT_ROWS` | Whole row count; `0` or unset takes the link's default (64, the shared round's rows). At `--tp 2`, a pass of more rows than this reduce-scatters its experts' rows and gathers the sums instead of one all-reduce. Give every rank the same value. |
+ | `TF_FLASHNEXT_WINDOW_PAD` | Whole row count; default `0`, off. At `--tp 2` or `--pp 2`, a lone stream's verify window of fewer rows runs with its last token repeated up to this many (at most 32), so its window graphs see one width; the extra rows are never kept and the tokens are unchanged. Not applied while `TF_FLASHNEXT_PP_SPEC` is on. |
+ | `TF_FLASHNEXT_PP_WINDOW_GRAPH` | Exactly `0` or `1`; default off. `1`: at `--pp 2` each stage's verify windows run as CUDA graphs with their hop captured, whatever `TF_FLASHNEXT_WINDOW_GRAPH` says; the draft head's graphs still follow `TF_FLASHNEXT_WINDOW_GRAPH`. Same kernels and bits as the eager pass. Give every rank the same value. |
++| `TF_FLASHNEXT_ROLL_BATCH` | Exactly `0` or `1`; default off. `1`: a drafted window's partial keep replays its kept rows over every DeltaNet layer in three launches (all fronts, all chains, all window shifts) instead of about four a layer; the same programs, so replies are unchanged |
++| `TF_FLASHNEXT_SPIN_WAIT` | Exactly `0` or `1`; default off. `1`: at `--tp 2` or `--pp 2`, a host wait for the GPU or NCCL polls without its 50 µs sleeps, which can wake up to about 110 µs after the work is done; each rank keeps one core busy while it waits. Replies are unchanged |
+ | `TF_FLASHNEXT_PP_SPEC` | Exactly `0` or `1`; default off. `1` on both ranks of `--pp 2` (the ranks refuse to pair otherwise): during rank 1's stage of a lone greedy stream's drafted window, rank 0 runs its layers on a guess at the next window (every draft kept, the draft head's chain on from it) and sends those rows at once when that window is the one verified; a wrong guess is undone on rank 0 alone. The guess runs eagerly whatever the window graph settings say. Replies are unchanged. Inert outside `--pp 2` |
+ | `TF_FLASHNEXT_PP_SPEC_LOG` | Exactly `0` or `1`; default off. `1` prints each guessing stream's guesses, hits, misses and rows rolled back when it ends |
+ | `TF_FLASHNEXT_TP_WINDOW_GRAPH` | Exactly `0` or `1`; default off. `1`: at `--tp 2` the drafted verify windows run as CUDA graphs on both ranks with their collectives captured, whatever `TF_FLASHNEXT_WINDOW_GRAPH` says; `TF_FLASHNEXT_PEER_SLOTS`' epoch moves to the device so a replay advances it. Same kernels and bits as the eager pass. Give every rank the same value. |
+diff --git a/zig/kernels/cuda/flashnext_batch.cu b/zig/kernels/cuda/flashnext_batch.cu
+index 80e15011c..aa18f1c45 100644
+--- a/zig/kernels/cuda/flashnext_batch.cu
++++ b/zig/kernels/cuda/flashnext_batch.cu
+@@ -322,6 +322,7 @@ extern "C" __global__ void fn_late_roll(const fn_roll::Jobs t, int keep) {
+ 
+ // A shared pass's lanes, one launch a DeltaNet step: fn_gdn_lanes_keep / front / chain / shift.
+ #include "flashnext_gdn_lanes.cuh"
++#include "flashnext_gdn_replay.cuh"
+ 
+ // fn_gdn_rows and fn_gdn_rows_to on one rank's 8 key and 24 value heads.
+ extern "C" __global__ void __launch_bounds__(128) fn_gdn_rows_h8(
+diff --git a/zig/kernels/cuda/flashnext_gdn_replay.cuh b/zig/kernels/cuda/flashnext_gdn_replay.cuh
+new file mode 100644
+index 000000000..dac58fc7d
+--- /dev/null
++++ b/zig/kernels/cuda/flashnext_gdn_replay.cuh
+@@ -0,0 +1,59 @@
++// A rollback's replay over every DeltaNet layer, one launch a step (blockIdx.z the layer, its lone launch's program).
++namespace fn_replay {
++constexpr int MAXL = 40;
++struct Layer {
++    const __nv_bfloat16* proj;  // the kept rows' projections
++    const __nv_bfloat16* hist;  // the conv window before them (the window's start)
++    const __nv_bfloat16* cw;
++    const float* a_log;
++    const float* dt_bias;
++    float* state;  // the layer's DeltaNet state, replayed in place
++};
++struct Layers {
++    Layer l[MAXL];
++    int n;
++};
++}  // namespace fn_replay
++
++// fn_gdn_front of each layer on grid (keep, NK + NV, layers): layer z's q, k, v and gates at its own keep rows.
++template <int NK, int NV>
++static __device__ __forceinline__ void replay_front(const fn_replay::Layers& t, int keep, float* qn, float* kn, float* v, float* gb) {
++    using namespace fn_gdn;
++    const fn_replay::Layer& l = t.l[blockIdx.z];
++    const size_t z = blockIdx.z, rows = (size_t)keep;
++    gdn_front<NK, NV, false>(l.proj, l.hist, l.cw, l.a_log, l.dt_bias, qn + z * rows * NK * DK, kn + z * rows * NK * DK,
++                             v + z * rows * NV * DV, gb + z * rows * NV * 2, nullptr, 1);
++}
++
++// fn_gdn_rows of each layer on grid (NV, DV / 16, layers): its state through its keep rows (ys discarded per layer).
++template <int NK, int NV>
++static __device__ __forceinline__ void replay_chain(const fn_replay::Layers& t, int keep, const float* qn, const float* kn,
++                                                    const float* v, const float* gb, float* ys) {
++    using namespace fn_gdn;
++    const fn_replay::Layer& l = t.l[blockIdx.z];
++    const size_t z = blockIdx.z, rows = (size_t)keep;
++    gdn_rows<NK, NV>(qn + z * rows * NK * DK, kn + z * rows * NK * DK, v + z * rows * NV * DV, gb + z * rows * NV * 2, l.state,
++                     l.state, keep, ys + z * rows * NV * DV);
++}
++
++extern "C" __global__ void __launch_bounds__(256) fn_replay_front(const fn_replay::Layers t, int keep, float* qn, float* kn,
++                                                                  float* v, float* gb) {
++    replay_front<16, 48>(t, keep, qn, kn, v, gb);
++}
++
++extern "C" __global__ void __launch_bounds__(256) fn_replay_front_h8(const fn_replay::Layers t, int keep, float* qn,
++                                                                     float* kn, float* v, float* gb) {
++    replay_front<8, 24>(t, keep, qn, kn, v, gb);
++}
++
++extern "C" __global__ void __launch_bounds__(128) fn_replay_chain(const fn_replay::Layers t, int keep, const float* qn,
++                                                                  const float* kn, const float* v, const float* gb,
++                                                                  float* ys) {
++    replay_chain<16, 48>(t, keep, qn, kn, v, gb, ys);
++}
++
++extern "C" __global__ void __launch_bounds__(128) fn_replay_chain_h8(const fn_replay::Layers t, int keep, const float* qn,
++                                                                     const float* kn, const float* v, const float* gb,
++                                                                     float* ys) {
++    replay_chain<8, 24>(t, keep, qn, kn, v, gb, ys);
++}
+diff --git a/zig/src/core/contract/flashnext_tile_records.zig b/zig/src/core/contract/flashnext_tile_records.zig
+index 7cd5a97e7..5d343a7b9 100644
+--- a/zig/src/core/contract/flashnext_tile_records.zig
++++ b/zig/src/core/contract/flashnext_tile_records.zig
+@@ -20,6 +20,10 @@ pub const cuda = [_]CudaRecord{
+     .{ .launch = .{ .name = "flashnext_batch fn_gdn_front_log", .symbol = "fn_gdn_front_log", .image = "flashnext_batch", .threads = 256 }, .usage = .{ .{ .regs = 26, .static = 1024, .bound = 256 }, .{ .regs = 26, .static = 1024, .bound = 256 }, .{ .regs = 26, .static = 1024, .bound = 256 }, .{ .regs = 32, .static = 1024, .bound = 256 }, .{ .regs = 32, .static = 1024, .bound = 256 } } },
+     .{ .launch = .{ .name = "flashnext_batch fn_gdn_rows_late", .symbol = "fn_gdn_rows_late", .image = "flashnext_batch", .threads = 128 }, .usage = .{ .{ .regs = 44, .static = 0, .bound = 128 }, .{ .regs = 40, .static = 0, .bound = 128 }, .{ .regs = 40, .static = 0, .bound = 128 }, .{ .regs = 48, .static = 0, .bound = 128 }, .{ .regs = 48, .static = 0, .bound = 128 } } },
+     .{ .launch = .{ .name = "flashnext_batch fn_late_roll", .symbol = "fn_late_roll", .image = "flashnext_batch", .threads = 256 }, .usage = .{ .{ .regs = 22, .static = 0, .bound = 0 }, .{ .regs = 22, .static = 0, .bound = 0 }, .{ .regs = 22, .static = 0, .bound = 0 }, .{ .regs = 20, .static = 0, .bound = 0 }, .{ .regs = 20, .static = 0, .bound = 0 } } },
++    .{ .launch = .{ .name = "flashnext_batch fn_replay_front", .symbol = "fn_replay_front", .image = "flashnext_batch", .threads = 256 }, .usage = .{ .{ .regs = 27, .static = 1024, .bound = 256 }, .{ .regs = 27, .static = 1024, .bound = 256 }, .{ .regs = 27, .static = 1024, .bound = 256 }, .{ .regs = 34, .static = 1024, .bound = 256 }, .{ .regs = 34, .static = 1024, .bound = 256 } } },
++    .{ .launch = .{ .name = "flashnext_batch fn_replay_front_h8", .symbol = "fn_replay_front_h8", .image = "flashnext_batch", .threads = 256 }, .usage = .{ .{ .regs = 27, .static = 1024, .bound = 256 }, .{ .regs = 27, .static = 1024, .bound = 256 }, .{ .regs = 27, .static = 1024, .bound = 256 }, .{ .regs = 34, .static = 1024, .bound = 256 }, .{ .regs = 34, .static = 1024, .bound = 256 } } },
++    .{ .launch = .{ .name = "flashnext_batch fn_replay_chain", .symbol = "fn_replay_chain", .image = "flashnext_batch", .threads = 128 }, .usage = .{ .{ .regs = 64, .static = 0, .bound = 128 }, .{ .regs = 64, .static = 0, .bound = 128 }, .{ .regs = 64, .static = 0, .bound = 128 }, .{ .regs = 64, .static = 0, .bound = 128 }, .{ .regs = 64, .static = 0, .bound = 128 } } },
++    .{ .launch = .{ .name = "flashnext_batch fn_replay_chain_h8", .symbol = "fn_replay_chain_h8", .image = "flashnext_batch", .threads = 128 }, .usage = .{ .{ .regs = 64, .static = 0, .bound = 128 }, .{ .regs = 64, .static = 0, .bound = 128 }, .{ .regs = 64, .static = 0, .bound = 128 }, .{ .regs = 64, .static = 0, .bound = 128 }, .{ .regs = 64, .static = 0, .bound = 128 } } },
+     .{ .launch = .{ .name = "flashnext_batch fn_gdn_lanes_keep", .symbol = "fn_gdn_lanes_keep", .image = "flashnext_batch", .threads = 256 }, .usage = .{ .{ .regs = 30, .static = 0, .bound = 0 }, .{ .regs = 32, .static = 0, .bound = 0 }, .{ .regs = 32, .static = 0, .bound = 0 }, .{ .regs = 32, .static = 0, .bound = 0 }, .{ .regs = 38, .static = 0, .bound = 0 } } },
+     .{ .launch = .{ .name = "flashnext_batch fn_gdn_lanes_front", .symbol = "fn_gdn_lanes_front", .image = "flashnext_batch", .threads = 256 }, .usage = .{ .{ .regs = 29, .static = 2048, .bound = 256 }, .{ .regs = 29, .static = 2048, .bound = 256 }, .{ .regs = 29, .static = 2048, .bound = 256 }, .{ .regs = 34, .static = 2048, .bound = 256 }, .{ .regs = 34, .static = 2048, .bound = 256 } } },
+     .{ .launch = .{ .name = "flashnext_batch fn_gdn_lanes_chain", .symbol = "fn_gdn_lanes_chain", .image = "flashnext_batch", .threads = 128 }, .usage = .{ .{ .regs = 64, .static = 0, .bound = 128 }, .{ .regs = 64, .static = 0, .bound = 128 }, .{ .regs = 64, .static = 0, .bound = 128 }, .{ .regs = 64, .static = 0, .bound = 128 }, .{ .regs = 64, .static = 0, .bound = 128 } } },
+diff --git a/zig/src/families/flashnext/cuda_batch_kernels.zig b/zig/src/families/flashnext/cuda_batch_kernels.zig
+index bebde3742..388bd095a 100644
+--- a/zig/src/families/flashnext/cuda_batch_kernels.zig
++++ b/zig/src/families/flashnext/cuda_batch_kernels.zig
+@@ -21,10 +21,13 @@ pub const Gdn = struct {
+     norm: cuda.Function,
+     /// fused's chain with each value head's state rows over several blocks (fn_gdn_front and fn_gdn_norm around it).
+     split: cuda.Function,
++    /// A rollback replay's fronts and chains over every DeltaNet layer, one launch each (TF_FLASHNEXT_ROLL_BATCH).
++    replay_front: cuda.Function,
++    replay_chain: cuda.Function,
+ 
+     /// The entry point of `field` for the full heads (suffix "") or a twin set (suffix "_h8").
+     pub fn symbol(comptime field: []const u8, comptime suffix: [:0]const u8) [:0]const u8 {
+-        const names = .{ .front = "fn_gdn_front", .chain = "fn_gdn_rows", .chain_to = "fn_gdn_rows_to", .chain_tpr = "fn_gdn_chain_tpr", .fused = "fn_gdn_fused", .norm = "fn_gdn_norm", .split = "fn_gdn_chain_split" };
++        const names = .{ .front = "fn_gdn_front", .chain = "fn_gdn_rows", .chain_to = "fn_gdn_rows_to", .chain_tpr = "fn_gdn_chain_tpr", .fused = "fn_gdn_fused", .norm = "fn_gdn_norm", .split = "fn_gdn_chain_split", .replay_front = "fn_replay_front", .replay_chain = "fn_replay_chain" };
+         return @field(names, field) ++ suffix;
+     }
+ 
+@@ -108,6 +111,8 @@ pub const Kernels = struct {
+     /// Each sparse row's top blocks (attention._select / _select_tiles), native.
+     select: cuda.Function,
+     select_lanes: cuda.Function,
++    /// The batched rollback replay's q, k, v, gates and discarded outputs per layer (allocated at its first use).
++    replay_space: ?cuda.DeviceBuffer,
+ 
+     pub fn load(d: *const cuda.Driver) !Kernels {
+         if (!cuda.kernels.available) return error.BuiltWithoutKernels;
+@@ -115,6 +120,7 @@ pub const Kernels = struct {
+         var k: Kernels = undefined;
+         k.forms = Forms.resolve();
+         k.expert_tile = null;
++        k.replay_space = null;
+         k.qmm = try cuda.Module.load(d, cuda.kernels.qmm);
+         errdefer k.qmm.unload();
+         k.experts = try cuda.Module.load(d, cuda.kernels.experts);
+@@ -189,6 +195,7 @@ pub const Kernels = struct {
+     }
+ 
+     pub fn deinit(k: *Kernels) void {
++        if (k.replay_space) |*b| b.free();
+         if (k.expert_tile) |*tile| tile.unload();
+         k.fp8.unload();
+         k.nvfp4.unload();
+@@ -202,7 +209,7 @@ pub const Kernels = struct {
+ };
+ 
+ test "a split layer's DeltaNet launches, the rollback replay's front and chain too, take the _h8 twins; a whole one today's" {
+-    const want = [_][:0]const u8{ "fn_gdn_front_h8", "fn_gdn_rows_h8", "fn_gdn_rows_to_h8", "fn_gdn_chain_tpr_h8", "fn_gdn_fused_h8", "fn_gdn_norm_h8", "fn_gdn_chain_split_h8" };
++    const want = [_][:0]const u8{ "fn_gdn_front_h8", "fn_gdn_rows_h8", "fn_gdn_rows_to_h8", "fn_gdn_chain_tpr_h8", "fn_gdn_fused_h8", "fn_gdn_norm_h8", "fn_gdn_chain_split_h8", "fn_replay_front_h8", "fn_replay_chain_h8" };
+     const names = @typeInfo(Gdn).@"struct".field_names;
+     inline for (names, want) |field, name| {
+         try std.testing.expectEqualStrings(name, Gdn.symbol(field, "_h8"));
+diff --git a/zig/src/families/flashnext/cuda_collective.zig b/zig/src/families/flashnext/cuda_collective.zig
+index 52951682e..6e5a3f3f2 100644
+--- a/zig/src/families/flashnext/cuda_collective.zig
++++ b/zig/src/families/flashnext/cuda_collective.zig
+@@ -112,6 +112,7 @@ pub const Collective = struct {
+     /// Until NCCL has taken the queued work and `point` (null, a stream or an event) is done.
+     fn wait(c: *Collective, point: anytype, until: u64) !void {
+         errdefer c.abort();
++        const spin = spinWait();
+         while (true) {
+             try c.link.checkPeer();
+             if (wire.now() >= until) return error.RankTimeout;
+@@ -122,10 +123,16 @@ pub const Collective = struct {
+                 if (@TypeOf(point) == @TypeOf(null)) return;
+                 if (try point.done()) return;
+             }
+-            wire.pause();
++            if (!spin) wire.pause();
+         }
+     }
+ 
++    /// TF_FLASHNEXT_SPIN_WAIT=1: a host wait polls without its 50 us sleeps (each wakes up to ~110 us late).
++    fn spinWait() bool {
++        // the startup check refused every malformed value already, so a plain default stands here
++        return @import("sys").environment.read(bool, "TF_FLASHNEXT_SPIN_WAIT", false) catch false;
++    }
++
+     /// Wait at a host-visible boundary while retaining peer, asynchronous-error and timeout checks.
+     pub fn finish(c: *Collective, stream: cuda.Stream) !void {
+         if (c.failed or c.comm == null) return error.RankDisconnected;
+diff --git a/zig/src/families/flashnext/cuda_mtp_roll.zig b/zig/src/families/flashnext/cuda_mtp_roll.zig
+index cc067be96..8ede1324d 100644
+--- a/zig/src/families/flashnext/cuda_mtp_roll.zig
++++ b/zig/src/families/flashnext/cuda_mtp_roll.zig
+@@ -42,6 +42,7 @@ const Replay = struct {
+     keep: usize,
+ 
+     pub fn run(r: @This()) !void {
++        if (batch() and try batchedRun(r)) return;
+         const k = &r.e.batch_k;
+         const rs = r.s;
+         try copyAsync(r.st, r.seq.tail.ptr, r.d.saved.ptr + r.d.layout.tail_at, wt.ple_tail_n * wt.wide * 2);
+@@ -67,6 +68,73 @@ const Replay = struct {
+     }
+ };
+ 
++/// TF_FLASHNEXT_ROLL_BATCH=1: a replay's ~146 launches as 3 (every layer's front, every chain, every window shift).
++pub fn batch() bool {
++    // the startup check refused every malformed value already, so a plain default stands here
++    return @import("sys").environment.read(bool, "TF_FLASHNEXT_ROLL_BATCH", false) catch false;
++}
++
++/// fn_replay::Layer and Layers, by value: a DeltaNet layer's kept rows, window, weights and state.
++const ReplayLayer = extern struct { proj: u64 = 0, hist: u64 = 0, cw: u64 = 0, a_log: u64 = 0, dt: u64 = 0, state: u64 = 0 };
++const ReplayLayers = extern struct { l: [parts.roll_jobs_max]ReplayLayer = @splat(.{}), n: c_int = 0 };
++
++comptime {
++    std.debug.assert(@sizeOf(ReplayLayer) == 48 and @sizeOf(ReplayLayers) == 1928);
++}
++
++/// One layer's slice of the batched replay's space at `rows` rows: q, k, v, gates, outputs (fp32, whole heads).
++const replay_row_bytes = (2 * gdn.nk * gdn.dk + 2 * gdn.value_dim + gdn.nv * 2) * 4;
++
++/// Replay's programs over every DeltaNet layer, a launch a step (fronts read the saved windows); false: run the loop.
++fn batchedRun(r: Replay) !bool {
++    const k = &r.e.batch_k;
++    var t: ReplayLayers = .{};
++    var w: parts.RollJobs = .{};
++    var n: usize = 0;
++    var heads: ?@import("cuda_heads.zig").Heads = null;
++    for (r.e.own(), r.e.span.first..) |*lw, layer| {
++        if (!lw.linear) continue;
++        if (heads) |h| if (!h.eql(lw.heads)) return false;
++        heads = lw.heads;
++        if (n + 1 >= parts.roll_jobs_max) return false;
++        const li = wt.linearIndex(layer);
++        const lk = r.d.keep.layers[layer];
++        t.l[n] = .{ .proj = lk.proj, .hist = lk.hist, .cw = lw.cw.ptr, .a_log = lw.a_log.ptr, .dt = lw.dt.ptr, .state = r.seq.state[li].ptr };
++        w.j[n] = .{ .win = r.seq.conv[li].ptr, .hist = lk.hist, .rows = lk.proj, .stride = @intCast(lw.heads.projWidth()), .taps = @intCast(gdn.taps - 1), .c = @intCast(lw.heads.convDim()) };
++        n += 1;
++    }
++    const h = heads orelse return false;
++    w.j[n] = .{ .win = r.seq.tail.ptr, .hist = r.d.saved.ptr + r.d.layout.tail_at, .rows = r.d.saved.ptr + r.d.layout.nrow_at, .stride = @intCast(wt.wide), .taps = @intCast(wt.ple_tail_n), .c = @intCast(wt.wide) };
++    t.n = @intCast(n);
++    w.n = @intCast(n + 1);
++    const need = (parts.roll_jobs_max - 1) * @import("cuda_mtp.zig").max_rows * replay_row_bytes;
++    if (r.keep > @import("cuda_mtp.zig").max_rows) return false;
++    if (k.replay_space == null) k.replay_space = try cuda.DeviceBuffer.alloc(r.e.driver, need);
++    const rows = n * r.keep;
++    const q = k.replay_space.?.ptr;
++    const kk = q + rows * gdn.nk * gdn.dk * 4;
++    const v = kk + rows * gdn.nk * gdn.dk * 4;
++    const gb = v + rows * gdn.value_dim * 4;
++    const ys = gb + rows * gdn.nv * 2 * 4;
++    const g = try k.gdnSet(h);
++    var f: cuda.Args = .{};
++    f.add(t);
++    f.add(cint(r.keep));
++    for ([_]u64{ q, kk, v, gb }) |p| f.add(p);
++    try cuda.launch.launch(g.replay_front, .{ .grid = .{ .x = @intCast(r.keep), .y = h.nk + h.nv, .z = @intCast(n) }, .block = .{ .x = 256 } }, r.st, &f);
++    var c: cuda.Args = .{};
++    c.add(t);
++    c.add(cint(r.keep));
++    for ([_]u64{ q, kk, v, gb, ys }) |p| c.add(p);
++    try cuda.launch.launch(g.replay_chain, .{ .grid = .{ .x = h.nv, .y = gdn.dv / 16, .z = @intCast(n) }, .block = .{ .x = 128 } }, r.st, &c);
++    var a: cuda.Args = .{};
++    a.add(w);
++    a.add(cint(r.keep));
++    const widest = @max(h.convDim(), wt.wide);
++    try cuda.launch.launch(k.late_roll, .{ .grid = .{ .x = @intCast((widest + 255) / 256), .y = @intCast(n + 1) }, .block = .{ .x = 256 } }, r.st, &a);
++    return true;
++}
++
+ /// The replay of `keep` kept rows; its ~146 launches as one graph on each rank, keyed by every buffer they touch.
+ pub fn replay(e: *prompt.Engine, s: *parts.Scratch, seq: *prompt.Seq, d: *Draft, keep: usize) !void {
+     return graphed(e, s, seq, d, keep, Replay{ .e = e, .st = e.stream.*, .s = s, .seq = seq, .d = d, .keep = keep });
+diff --git a/zig/src/platform/environment.zig b/zig/src/platform/environment.zig
+index efc0b327c..dc5921809 100644
+--- a/zig/src/platform/environment.zig
++++ b/zig/src/platform/environment.zig
+@@ -236,6 +236,8 @@ pub const rules = [_]Rule{
+     .{ .name = "TF_FLASHNEXT_WINDOW_ROWS", .scope = .flashnext, .kind = .size, .forms = "a whole row count from 0 to the native size maximum (default the shared round's rows; capped by them)" },
+     .{ .name = "TF_FLASHNEXT_WINDOW_PAD", .scope = .flashnext, .kind = .size, .forms = "a whole row count from 0 to the native size maximum (default 0: off; a lone drafted window narrower than this runs padded to it on the rank link)" },
+     .{ .name = "TF_FLASHNEXT_PP_WINDOW_GRAPH", .scope = .flashnext, .kind = .flag, .forms = "0 or 1 (default 0; 1: at --pp 2 the stage windows run as graphs); give every rank the same" },
++    .{ .name = "TF_FLASHNEXT_ROLL_BATCH", .scope = .flashnext, .kind = .flag, .forms = "0 or 1 (default 0; 1: a rollback replays every DeltaNet layer in one launch a step)" },
++    .{ .name = "TF_FLASHNEXT_SPIN_WAIT", .scope = .flashnext, .kind = .flag, .forms = "0 or 1 (default 0; 1: a rank's host waits poll without sleeping)" },
+     .{ .name = "TF_FLASHNEXT_PP_SPEC", .scope = .flashnext, .kind = .flag, .forms = "0 or 1 (default 0; 1: at --pp 2 rank 0 runs its stage on a guess at the next window during rank 1's); give every rank the same" },
+     .{ .name = "TF_FLASHNEXT_PP_SPEC_LOG", .scope = .flashnext, .kind = .flag, .forms = "0 or 1 (default 0)" },
+     .{ .name = "TF_FLASHNEXT_TP_WINDOW_GRAPH", .scope = .flashnext, .kind = .flag, .forms = "0 or 1 (default 0; 1: at --tp 2 the verify windows run as graphs on both ranks); give every rank the same" },
+diff --git a/zig/src/platform/environment_flashnext_test.zig b/zig/src/platform/environment_flashnext_test.zig
+index 7287687a4..11a438701 100644
+--- a/zig/src/platform/environment_flashnext_test.zig
++++ b/zig/src/platform/environment_flashnext_test.zig
+@@ -33,13 +33,13 @@ fn check(name: []const u8, raw: []const u8, valid: bool) !void {
+     try t.expect(std.mem.endsWith(u8, why.?, e.rule(name).forms));
+ }
+ 
+-test "Flash Next strict env: the table holds all 50 settings: 33 switches, 12 integers, 2 reals, 3 structured" {
++test "Flash Next strict env: the table holds all 52 settings: 35 switches, 12 integers, 2 reals, 3 structured" {
+     var counts: [4]usize = @splat(0);
+     for (e.rules) |r| if (r.scope == .flashnext) {
+         try t.expect(std.mem.startsWith(u8, r.name, "TF_FLASHNEXT_"));
+         counts[@backingInt(group(r))] += 1;
+     };
+-    try t.expectEqual([4]usize{ 33, 12, 2, 3 }, counts);
++    try t.expectEqual([4]usize{ 35, 12, 2, 3 }, counts);
+ }
+ 
+ test "Flash Next strict env: unset and blank settings both read as the caller's default" {
+-- 
+2.56.0
+

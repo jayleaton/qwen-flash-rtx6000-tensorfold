@@ -1,0 +1,637 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jay Leaton <58495321+jayleaton@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 22:14:03 +0700
+Subject: [PATCH 55/76] flashnext cuda: an engine over a pipeline stage's
+ layers, its rows in and out through a hop
+
+---
+ zig/build/cuda.zig                            |   6 +
+ zig/src/families/flashnext/cuda_batch.zig     |  14 +-
+ zig/src/families/flashnext/cuda_batch_hop.zig |  39 +++++
+ .../families/flashnext/cuda_batch_state.zig   |   2 +
+ .../families/flashnext/cuda_batch_train.zig   |   1 +
+ zig/src/families/flashnext/cuda_launch.zig    |   2 +
+ zig/src/families/flashnext/cuda_mtp_ops.zig   |   7 +-
+ zig/src/families/flashnext/cuda_mtp_roll.zig  |   9 +-
+ zig/src/families/flashnext/cuda_prompt.zig    |  46 +++--
+ .../flashnext/cuda_prompt_windows.zig         |   4 +-
+ zig/src/families/flashnext/cuda_rows.zig      |   3 +-
+ zig/src/families/flashnext/cuda_span.zig      |  60 +++++++
+ zig/src/families/flashnext/cuda_span_main.zig | 163 ++++++++++++++++++
+ 13 files changed, 318 insertions(+), 38 deletions(-)
+ create mode 100644 zig/src/families/flashnext/cuda_batch_hop.zig
+ create mode 100644 zig/src/families/flashnext/cuda_span.zig
+ create mode 100644 zig/src/families/flashnext/cuda_span_main.zig
+
+diff --git a/zig/build/cuda.zig b/zig/build/cuda.zig
+index 96a9a4a69..bae7aba4f 100644
+--- a/zig/build/cuda.zig
++++ b/zig/build/cuda.zig
+@@ -478,6 +478,12 @@ fn flashnextChecks(b: *std.Build, target: std.Build.ResolvedTarget, optimize: st
+     const prompt_count = opts.flashnext_count;
+     if (embed_model != null and embed_kernels != null and prompt_ids != null) prompt_run.addArgs(&.{ embed_model.?, embed_kernels.?, prompt_ids.?, prompt_count });
+     b.step("flashnext-prompt", "Run one Flash Next prompt on the captured CUDA kernels").dependOn(&prompt_run.step);
++    // two pipeline stages on one GPU against one engine, installed for a GPU host to run
++    const span_check = b.createModule(.{ .root_source_file = b.path("zig/src/families/flashnext/cuda_span_main.zig"), .target = target, .optimize = optimize, .link_libc = true });
++    span_check.addImport("cuda", cuda);
++    span_check.addImport("flashnext", flashnext);
++    const span_exe = b.addExecutable(.{ .name = "flashnext-span", .root_module = span_check });
++    b.step("flashnext-span", "Two Flash Next pipeline stages on one GPU against one engine: tokens and scores").dependOn(&b.addInstallArtifact(span_exe, .{}).step);
+     // not installed: our own glue against a captured set on one loaded engine (scores of every prompt row, replies)
+     const compare_check = b.createModule(.{ .root_source_file = b.path("zig/src/families/flashnext/cuda_compare_main.zig"), .target = target, .optimize = optimize, .link_libc = true });
+     compare_check.addImport("cuda", cuda);
+diff --git a/zig/src/families/flashnext/cuda_batch.zig b/zig/src/families/flashnext/cuda_batch.zig
+index 08a13bbf3..9b72344c9 100644
+--- a/zig/src/families/flashnext/cuda_batch.zig
++++ b/zig/src/families/flashnext/cuda_batch.zig
+@@ -19,6 +19,7 @@ const moe_native = @import("cuda_moe_native.zig");
+ const zs = @import("cuda_zero_slice.zig");
+ const ops = @import("cuda_batch_ops.zig");
+ const split_lane = @import("cuda_split_lane.zig");
++const stage_hop = @import("cuda_batch_hop.zig");
+ 
+ const layers_n = wt.layers_n;
+ const linear_n = wt.linear_n;
+@@ -509,16 +510,11 @@ pub fn Pass(comptime Tri: type) type {
+             const emb = s.hostEmb(n);
+             const xs = s.hostXs(n);
+             var gather: Gather = .{ .ngram = self.m.ngram, .history = self.seq.history[0..], .ids = ids, .emb = emb, .xs = xs, .io = self.io, .lanes = self.lanes };
+-            var thread: ?std.Thread = if (self.prepared or self.staged) null else try std.Thread.spawn(.{}, Gather.main, .{&gather});
++            var thread: ?std.Thread = if (self.prepared or self.staged or stage_hop.first(self.m) > 0) null else try std.Thread.spawn(.{}, Gather.main, .{&gather});
+             defer if (thread) |th| th.join();
+             if (!self.staged) try self.stage(ids);
+-            if (self.m.table_dense) {
+-                try self.tri.embedDense(s.ids, self.m.table_w, s.h, dims, streams, n);
+-            } else {
+-                try self.tri.embed(s.ids, self.m.table_w, self.m.table_s, self.m.table_b, s.h, dims, streams, n);
+-            }
+-            try @import("cuda_media.zig").inject(self.seq.media, self.lanes, self.stream, s.h, self.pos0, n);
+-            for (self.m.layers, 0..) |*lw, layer| {
++            try stage_hop.enter(self, n);
++            for (self.m.layers, stage_hop.first(self.m)..) |*lw, layer| {
+                 const keep: LayerKeep = if (self.hooks.keep) |kp| kp.layers[layer] else .{};
+                 if (layer == ple_layer) {
+                     if (thread) |th| th.join();
+@@ -560,7 +556,7 @@ pub fn Pass(comptime Tri: type) type {
+                 try self.moeAdds(layer, keep);
+                 self.pending = layer;
+             }
+-            try self.head(logits_host);
++            try stage_hop.leave(self, logits_host);
+         }
+ 
+         pub fn complete(self: *Self) !void {
+diff --git a/zig/src/families/flashnext/cuda_batch_hop.zig b/zig/src/families/flashnext/cuda_batch_hop.zig
+new file mode 100644
+index 000000000..461cca0b4
+--- /dev/null
++++ b/zig/src/families/flashnext/cuda_batch_hop.zig
+@@ -0,0 +1,39 @@
++//! A pipeline stage's pass ends: the boundary rows in where it doesn't embed, out where it doesn't run the head.
++const wt = @import("cuda_prompt_wt.zig");
++
++/// The boundary rows `h` [rows, wt.wide] bf16 on the device: taken from the stage before, given to the next.
++pub const Hop = struct {
++    ctx: *anyopaque,
++    take: *const fn (ctx: *anyopaque, h: u64, rows: usize) anyerror!void,
++    give: *const fn (ctx: *anyopaque, h: u64, rows: usize) anyerror!void,
++};
++
++/// A stage's layers from `first` (an absolute index); its rows cross through `hop`.
++pub const Stage = struct { first: usize, hop: Hop };
++
++/// The absolute index of a pass's first layer.
++pub fn first(m: anytype) usize {
++    return if (m.stage) |st| st.first else 0;
++}
++
++/// The pass's first rows: the stage's boundary rows, or the embedding and any media rows on the embedding stage.
++pub fn enter(pass: anytype, n: usize) !void {
++    const s = pass.s;
++    if (pass.m.stage) |st| if (st.first > 0) return st.hop.take(st.hop.ctx, s.h, n);
++    if (pass.m.table_dense) {
++        try pass.tri.embedDense(s.ids, pass.m.table_w, s.h, wt.dims, wt.streams, n);
++    } else {
++        try pass.tri.embed(s.ids, pass.m.table_w, pass.m.table_s, pass.m.table_b, s.h, wt.dims, wt.streams, n);
++    }
++    try @import("cuda_media.zig").inject(pass.seq.media, pass.lanes, pass.stream, s.h, pass.pos0, n);
++}
++
++/// The pass's last step: the head, or the written-back rows on to the next stage (rank 0: back again, then its head).
++pub fn leave(pass: anytype, logits_host: ?[]u8) !void {
++    const st = pass.m.stage orelse return pass.head(logits_host);
++    try pass.writeback(0, pass.rows);
++    try st.hop.give(st.hop.ctx, pass.s.h, pass.rows);
++    if (st.first > 0) return;
++    try st.hop.take(st.hop.ctx, pass.s.h, pass.rows);
++    try pass.head(logits_host);
++}
+diff --git a/zig/src/families/flashnext/cuda_batch_state.zig b/zig/src/families/flashnext/cuda_batch_state.zig
+index d10d09ade..18d2d0c12 100644
+--- a/zig/src/families/flashnext/cuda_batch_state.zig
++++ b/zig/src/families/flashnext/cuda_batch_state.zig
+@@ -555,6 +555,8 @@ pub const Model = struct {
+     ngram: *const ple.Ngram,
+     /// The engine's own adds to the MoE outputs: a taught folder's pockets (null: none).
+     pocket: ?MoeAdd = null,
++    /// A pipeline stage's first layer and boundary rows (null: every layer, from the embedding to the head).
++    stage: ?@import("cuda_batch_hop.zig").Stage = null,
+ };
+ 
+ /// The rows' n-gram embeddings, gathered on a host thread while the GPU embeds and runs layer 0.
+diff --git a/zig/src/families/flashnext/cuda_batch_train.zig b/zig/src/families/flashnext/cuda_batch_train.zig
+index 5e6daf45b..06936afc6 100644
+--- a/zig/src/families/flashnext/cuda_batch_train.zig
++++ b/zig/src/families/flashnext/cuda_batch_train.zig
+@@ -24,6 +24,7 @@ pub fn spans(comptime Tri: type, p: *batch.Pass(Tri), ids: []const u32, list: []
+     const base = p.s;
+     const n = ids.len;
+     if (n == 0 or n > base.cap) return error.UnexpectedTensor;
++    if (p.m.stage != null) return error.LearningOnAStage;
+     for (list) |sp| if (sp.at % 2 != 0 or sp.rows == 0 or sp.at + sp.rows > n or sp.rows > nch * 512 or sp.rows > p.seq.cap) return error.UnexpectedTensor;
+     defer p.s = base;
+     p.rows = n;
+diff --git a/zig/src/families/flashnext/cuda_launch.zig b/zig/src/families/flashnext/cuda_launch.zig
+index f33cea6e9..0218a2432 100644
+--- a/zig/src/families/flashnext/cuda_launch.zig
++++ b/zig/src/families/flashnext/cuda_launch.zig
+@@ -46,6 +46,8 @@ pub const kv_host = @import("cuda_kv_host.zig");
+ /// A stream's cache sizes and the window's fixed geometry, for the K/V host pages' device test.
+ pub const seq_bytes = @import("cuda_seq_bytes.zig");
+ pub const wt = @import("cuda_prompt_wt.zig");
++/// A pipeline stage's layers of the model
++pub const span = @import("cuda_span.zig");
+ /// The row-by-row reference path, for flashnext-prompt
+ pub const row_path = @import("cuda_rows.zig");
+ /// The MTP head's drafts: its forward, the chain, the verify window's rows and their rollback
+diff --git a/zig/src/families/flashnext/cuda_mtp_ops.zig b/zig/src/families/flashnext/cuda_mtp_ops.zig
+index 5ca063993..6f02c1c5f 100644
+--- a/zig/src/families/flashnext/cuda_mtp_ops.zig
++++ b/zig/src/families/flashnext/cuda_mtp_ops.zig
+@@ -346,10 +346,9 @@ pub fn Ops(comptime Tri: type) type {
+             if (d.open) return error.CannotRewind;
+             const st = o.stream();
+             try o.lateCtl(d);
+-            var li: usize = 0;
+-            for (o.e.layers[0..o.e.n_layers], 0..) |*lw, layer| {
++            for (o.e.own(), o.e.span.first..) |*lw, layer| {
+                 if (!lw.linear) continue;
+-                defer li += 1;
++                const li = wt.linearIndex(layer);
+                 const lk = d.keep.layers[layer];
+                 var a: cuda.Args = .{};
+                 a.add(@as(u64, 0));
+@@ -383,7 +382,7 @@ pub fn Ops(comptime Tri: type) type {
+             const k = &e.batch_k;
+             // refused before any change: kernels for every layer's heads, saved rows at the sequence's
+             if (!d.layout.heads.eql(seq.heads)) return error.DraftHeads;
+-            for (e.layers[0..e.n_layers]) |*lw| if (lw.linear) {
++            for (e.own()) |*lw| if (lw.linear) {
+                 _ = try k.gdnSet(lw.heads);
+                 if (!lw.heads.eql(seq.heads)) return error.DraftHeads;
+             };
+diff --git a/zig/src/families/flashnext/cuda_mtp_roll.zig b/zig/src/families/flashnext/cuda_mtp_roll.zig
+index 964ff6365..cc067be96 100644
+--- a/zig/src/families/flashnext/cuda_mtp_roll.zig
++++ b/zig/src/families/flashnext/cuda_mtp_roll.zig
+@@ -16,10 +16,10 @@ fn cint(v: usize) c_int {
+ pub fn lateRoll(o: anytype, seq: *prompt.Seq, d: *Draft, keep: usize) !void {
+     var t: parts.RollJobs = .{};
+     var n: usize = 0;
+-    for (o.e.layers[0..o.e.n_layers], 0..) |*lw, layer| {
++    for (o.e.own(), o.e.span.first..) |*lw, layer| {
+         if (!lw.linear) continue;
+         const lk = d.keep.layers[layer];
+-        t.j[n] = .{ .win = seq.conv[n].ptr, .hist = lk.hist, .rows = lk.proj, .stride = @intCast(gdn.proj_width), .taps = @intCast(gdn.taps - 1), .c = @intCast(gdn.conv_dim) };
++        t.j[n] = .{ .win = seq.conv[wt.linearIndex(layer)].ptr, .hist = lk.hist, .rows = lk.proj, .stride = @intCast(gdn.proj_width), .taps = @intCast(gdn.taps - 1), .c = @intCast(gdn.conv_dim) };
+         n += 1;
+     }
+     t.j[n] = .{ .win = seq.tail.ptr, .hist = d.saved.ptr + d.layout.tail_at, .rows = d.saved.ptr + d.layout.nrow_at, .stride = @intCast(wt.wide), .taps = @intCast(wt.ple_tail_n), .c = @intCast(wt.wide) };
+@@ -46,10 +46,9 @@ const Replay = struct {
+         const rs = r.s;
+         try copyAsync(r.st, r.seq.tail.ptr, r.d.saved.ptr + r.d.layout.tail_at, wt.ple_tail_n * wt.wide * 2);
+         try shift(k, r.st, r.seq.tail.ptr, r.d.saved.ptr + r.d.layout.nrow_at, wt.wide, r.keep, wt.ple_tail_n, wt.wide);
+-        var li: usize = 0;
+-        for (r.e.layers[0..r.e.n_layers], 0..) |*lw, layer| {
++        for (r.e.own(), r.e.span.first..) |*lw, layer| {
+             if (!lw.linear) continue;
+-            defer li += 1;
++            const li = wt.linearIndex(layer);
+             // the sequence's state is still the window's start (the pass wrote its end state to the spare)
+             const lk = r.d.keep.layers[layer];
+             const h = lw.heads;
+diff --git a/zig/src/families/flashnext/cuda_prompt.zig b/zig/src/families/flashnext/cuda_prompt.zig
+index 13cecfac0..a3e39e8b7 100644
+--- a/zig/src/families/flashnext/cuda_prompt.zig
++++ b/zig/src/families/flashnext/cuda_prompt.zig
+@@ -98,6 +98,7 @@ pub const pooledBytes = sizes.pooledBytes;
+ const Heads = @import("cuda_heads.zig").Heads;
+ const round_graph = @import("cuda_round_graph.zig");
+ const pages = @import("cuda_pages.zig");
++const Span = @import("cuda_span.zig").Span;
+ /// One loaded checkpoint: the embedding table, every layer, the mixer and head, and the batched pass's scratch.
+ pub const Engine = struct {
+     gpa: std.mem.Allocator,
+@@ -111,7 +112,11 @@ pub const Engine = struct {
+     head_q: Q4,
+     eos: i64,
+     layers: [layers_n]Layer,
++    /// Layers loaded from `span.first`: a pipeline stage holds its span's alone.
+     n_layers: usize,
++    span: Span = .whole,
++    /// A stage's boundary rows to and from its neighbours (null: one engine, or before the ring is up).
++    hop: ?@import("cuda_batch_hop.zig").Hop = null,
+     batch_k: batch.Kernels,
+     /// The n-gram table, open for the engine's life (the batched pass gathers its rows from it).
+     ngram: ple.Ngram,
+@@ -139,8 +144,18 @@ pub const Engine = struct {
+         return initRank(gpa, io, driver, stream, model_dir, 1, 0);
+     }
+     pub fn initRank(gpa: std.mem.Allocator, io: std.Io, driver: *cuda.Driver, stream: *cuda.Stream, model_dir: []const u8, world: usize, rank: usize) !*Engine {
++        return initAt(gpa, io, driver, stream, model_dir, world, rank, .whole);
++    }
++
++    /// One GPU's engine over a pipeline stage's layers, each loaded whole.
++    pub fn initSpan(gpa: std.mem.Allocator, io: std.Io, driver: *cuda.Driver, stream: *cuda.Stream, model_dir: []const u8, span: Span) !*Engine {
++        return initAt(gpa, io, driver, stream, model_dir, 1, 0, span);
++    }
++
++    fn initAt(gpa: std.mem.Allocator, io: std.Io, driver: *cuda.Driver, stream: *cuda.Stream, model_dir: []const u8, world: usize, rank: usize, span: Span) !*Engine {
+         if (!cuda.kernels.available) return error.BuiltWithoutKernels;
+         if ((world != 1 and world != 2) or rank >= world) return error.BadRank;
++        if (world != 1 and !span.isWhole()) return error.BadPipelineSplit;
+         // refused before anything loads: a bad TF_FLASHNEXT_CHUNK leaves no module or buffer behind
+         const busy = try chunkRows();
+         const chunk = try chunks.soloRows(busy, false);
+@@ -151,11 +166,13 @@ pub const Engine = struct {
+         e.driver = driver;
+         e.stream = stream;
+         e.n_layers = 0;
++        e.span = span;
++        e.hop = null;
+         e.collective = null;
+         e.image_factory = null;
+         e.round_graph = .{};
+         e.graphs = .{};
+-        errdefer for (e.layers[0..e.n_layers]) |*l| l.free(gpa);
++        errdefer for (e.own()) |*l| l.free(gpa);
+         e.model_dir = try gpa.dupe(u8, model_dir);
+         errdefer gpa.free(e.model_dir);
+         e.store = try Store.open(gpa, io, e.model_dir);
+@@ -196,7 +213,7 @@ pub const Engine = struct {
+         const rows = try gpa.alloc(f32, 3 * fb.max_pocket * dims);
+         defer gpa.free(rows);
+         var learned: usize = 0;
+-        for (0..layers_n) |i| {
++        for (span.first..span.end) |i| {
+             const cap = fb.max_pocket * dims;
+             var pk: load.Pocket = .{ .gate = rows[0..cap], .up = rows[cap..][0..cap], .down = rows[2 * cap ..][0..cap] };
+             e.layers[i] = try load.loadLayerRank(gpa, driver, stream, &e.store, pack_fn, i, world, rank, &pk);
+@@ -207,8 +224,8 @@ pub const Engine = struct {
+             try e.pockets.set(driver, stream, i, pk.gate[0 .. pk.n * dims], pk.up[0 .. pk.n * dims], pk.down[0 .. pk.n * dims], used);
+             learned += used;
+         }
+-        e.heads = e.layers[0].heads;
+-        for (e.layers[0..e.n_layers]) |*l| if (!l.heads.eql(e.heads)) return error.UnexpectedTensor;
++        e.heads = e.layers[span.first].heads;
++        for (e.own()) |*l| if (!l.heads.eql(e.heads)) return error.UnexpectedTensor;
+         if (learned > 0) std.log.info("flashnext: the folder's Living Weights pockets hold {d} learned neurons beside the shared experts", .{learned});
+         e.store.loaded(); // every layer is on the device: no pinned staging, borrowed plane or open shard while serving
+         e.ngram = try ple.Ngram.init(gpa, io, e.model_dir);
+@@ -236,7 +253,7 @@ pub const Engine = struct {
+         if (e.scores) |*b| b.free();
+         e.batch_k.deinit();
+         e.ngram.deinit();
+-        for (e.layers[0..e.n_layers]) |*l| l.free(e.gpa);
++        for (e.own()) |*l| l.free(e.gpa);
+         e.head_q.free();
+         e.mixer.free();
+         e.table.deinit();
+@@ -245,6 +262,11 @@ pub const Engine = struct {
+         e.gpa.destroy(e);
+     }
+ 
++    /// The layers this engine holds: every layer, or a pipeline stage's span.
++    pub fn own(e: *Engine) []Layer {
++        return e.layers[e.span.first..][0..e.n_layers];
++    }
++
+     /// Layer `layer`'s pocket for every pass: gate rows, up rows and outputs fp32 [n, dims], the first `used` live.
+     pub fn setPocket(e: *Engine, layer: usize, gate: []const f32, up: []const f32, down: []const f32, used: usize) !void {
+         try e.pockets.set(e.driver, e.stream, layer, gate, up, down, used);
+@@ -276,7 +298,7 @@ pub const Engine = struct {
+     /// The resident weights a pass reads, with the taught layers' pockets.
+     pub fn model(e: *Engine) batch.Model {
+         const m = e.pockets.mask();
+-        return .{ .table_w = e.table.w.ptr, .table_s = e.table.s.ptr, .table_b = e.table.b.ptr, .table_dense = e.table.dense, .collective = e.collective, .layers = e.layers[0..e.n_layers], .mixer = e.mixer, .head = e.head_q, .ngram = &e.ngram, .pocket = if (m != 0) .{ .ctx = e, .add = servePocket, .layers = m } else null };
++        return .{ .table_w = e.table.w.ptr, .table_s = e.table.s.ptr, .table_b = e.table.b.ptr, .table_dense = e.table.dense, .collective = e.collective, .layers = e.own(), .stage = if (e.hop) |h| .{ .first = e.span.first, .hop = h } else null, .mixer = e.mixer, .head = e.head_q, .ngram = &e.ngram, .pocket = if (m != 0) .{ .ctx = e, .add = servePocket, .layers = m } else null };
+     }
+ 
+     /// The weights a pass of streams that read the model as shipped reads (untaught): the pockets left out.
+@@ -540,17 +562,6 @@ fn freeBufs(bs: []cuda.DeviceBuffer) void {
+     for (bs) |*b| b.free();
+ }
+ 
+-test "linear layers skip every fourth index and attention starts at 3" {
+-    try std.testing.expect(linearLayer(0));
+-    try std.testing.expect(!linearLayer(3));
+-    try std.testing.expect(!linearLayer(47));
+-    try std.testing.expectEqual(@as(usize, 0), linearIndex(0));
+-    try std.testing.expectEqual(@as(usize, 2), linearIndex(2));
+-    try std.testing.expectEqual(@as(usize, 35), linearIndex(46));
+-    try std.testing.expectEqual(@as(usize, 0), attnIndex(3));
+-    try std.testing.expectEqual(@as(usize, 11), attnIndex(47));
+-}
+-
+ test "a failed fill frees the buffer it was filling and every one before it" {
+     const Fake = struct {
+         live: *usize,
+@@ -589,6 +600,7 @@ pub const chunkRows = chunks.chunkRows;
+ 
+ test {
+     _ = @import("cuda_sequence_completion_test.zig");
++    _ = @import("cuda_span.zig");
+     _ = chunks;
+     _ = sizes;
+ }
+diff --git a/zig/src/families/flashnext/cuda_prompt_windows.zig b/zig/src/families/flashnext/cuda_prompt_windows.zig
+index 601bfbd45..8a719f075 100644
+--- a/zig/src/families/flashnext/cuda_prompt_windows.zig
++++ b/zig/src/families/flashnext/cuda_prompt_windows.zig
+@@ -12,7 +12,7 @@ const Seq = prompt.Seq;
+ /// A drafted window on one GPU as a graph (one chunk, scores left on the device, no media or adds); true once run.
+ pub fn forwardGraph(e: *Engine, comptime Tri: type, p: *batch.Pass(Tri), seq: *Seq, ids: []const u32, hooks: batch.Hooks) !bool {
+     if (!window_graph.enabled() or hooks.logits != .all or hooks.host_logits or hooks.moe_add != null) return false;
+-    if (ids.len > @import("cuda_mtp.zig").max_rows or ids.len > p.s.cap or e.collective != null or seq.media != null or p.m.pocket != null) return false;
++    if (ids.len > @import("cuda_mtp.zig").max_rows or ids.len > p.s.cap or e.collective != null or e.hop != null or seq.media != null or p.m.pocket != null) return false;
+     const key = window_graph.Key.init(seq, seq.fed, ids.len, p.s, p.seq.scores, @intFromPtr(p.m.layers.ptr), hooks);
+     try window_graph.stageWindow(p, ids, seq.fed);
+     try e.graphs.window.run(e.gpa, e.stream.*, key, window_graph.Chunk(batch.Pass(Tri)){ .p = p, .ids = ids, .pos0 = seq.fed });
+@@ -70,7 +70,7 @@ pub fn windows(e: *Engine, comptime Tri: type, tri: Tri, wins: []const Window, o
+     const media = for (wins) |w| {
+         if (w.seq.media != null) break true;
+     } else false;
+-    if (window_graph.enabled() and reads == .none and p.m.pocket == null and e.collective == null and !media) {
++    if (window_graph.enabled() and reads == .none and p.m.pocket == null and e.collective == null and e.hop == null and !media) {
+         // on one GPU: staged, then the pass as a graph keyed by every lane's buffers
+         const attn = @import("cuda_batch_lanes.zig").useAttn(&p, ids.len);
+         const key = window_graph.SharedKey.init(lanes, s, scores, @intFromPtr(p.m.layers.ptr), out, attn);
+diff --git a/zig/src/families/flashnext/cuda_rows.zig b/zig/src/families/flashnext/cuda_rows.zig
+index 47e7b478a..8ecbf45ee 100644
+--- a/zig/src/families/flashnext/cuda_rows.zig
++++ b/zig/src/families/flashnext/cuda_rows.zig
+@@ -71,6 +71,7 @@ pub const Rows = struct {
+     /// Every row of `ids` from seq.fed one fused decode step; the last row's scores land in seq.logits.
+     pub fn predict(r: *Rows, e: *prompt.Engine, comptime Tri: type, tri: Tri, seq: *prompt.Seq, ids: []const u32) !void {
+         if (e.table.dense or e.head_q.native != null) return error.UnsupportedQuantization;
++        if (!e.span.isWhole()) return error.StageNotOnRowPath;
+         if (ids.len == 0 or seq.fed + ids.len > seq.cap) return error.UnexpectedTensor;
+         // dense attention only: the reference stops where the indexer would start choosing
+         if (seq.fed + ids.len > weights.dense_nch * 512) return error.UnexpectedTensor;
+@@ -78,7 +79,7 @@ pub const Rows = struct {
+         var pass = Pass{ .gpa = e.gpa, .io = e.io, .driver = e.driver, .stream = e.stream, .model_dir = e.model_dir, .s = &r.scratch, .table = e.table, .mode = r.mode, .history = &seq.history, .conv = seq.conv, .state = seq.state, .kc = seq.kc, .vc = seq.vc, .ikc = seq.ikc, .pg = seq.pg(), .tail = seq.tail, .mixer = e.mixer, .head_q = e.head_q, .logits = seq.logits, .plan_fn = r.plan_fn, .up_fn = r.up_fn, .down_fn = r.down_fn };
+         @memset(pass.mode, 0);
+         for (ids, 0..) |token, t| try embedRow(Tri, &pass, tri, token, pass.s.h.ptr + @as(u64, t) * wide * 2);
+-        for (e.layers[0..e.n_layers], 0..) |*lw, layer| try runLayer(Tri, &pass, tri, lw, layer, ids, seq.fed);
++        for (e.own(), 0..) |*lw, layer| try runLayer(Tri, &pass, tri, lw, layer, ids, seq.fed);
+         try head(Tri, &pass, tri, ids.len - 1);
+         seq.fed += ids.len;
+     }
+diff --git a/zig/src/families/flashnext/cuda_span.zig b/zig/src/families/flashnext/cuda_span.zig
+new file mode 100644
+index 000000000..33c164bfb
+--- /dev/null
++++ b/zig/src/families/flashnext/cuda_span.zig
+@@ -0,0 +1,60 @@
++//! A pipeline stage's layers [first, end) of the model; the stage holding layer 0 also embeds and runs the head.
++const std = @import("std");
++const wt = @import("cuda_prompt_wt.zig");
++
++pub const Span = struct {
++    first: usize = 0,
++    end: usize = wt.layers_n,
++
++    pub const whole: Span = .{};
++
++    /// The two stages of a split at `split` (rank 1's first layer); layer 1's n-gram block stays on rank 0.
++    pub fn ofRank(split: usize, rank: usize) !Span {
++        if (split <= wt.ple_layer or split >= wt.layers_n) return error.BadPipelineSplit;
++        return switch (rank) {
++            0 => .{ .end = split },
++            1 => .{ .first = split },
++            else => error.BadRank,
++        };
++    }
++
++    pub fn isWhole(s: Span) bool {
++        return s.first == 0 and s.end == wt.layers_n;
++    }
++
++    /// The embedding, the n-gram rows, the head and the draft head: the ring's rank 0.
++    pub fn ends(s: Span) bool {
++        return s.first == 0;
++    }
++
++    pub fn count(s: Span) usize {
++        return s.end - s.first;
++    }
++
++    pub fn owns(s: Span, layer: usize) bool {
++        return layer >= s.first and layer < s.end;
++    }
++};
++
++test "a split puts layer 1's n-gram block on rank 0 and refuses an empty stage" {
++    const a = try Span.ofRank(24, 0);
++    const b = try Span.ofRank(24, 1);
++    try std.testing.expect(a.ends() and !b.ends() and !a.isWhole() and Span.whole.isWhole());
++    try std.testing.expectEqual(@as(usize, 24), a.count() + b.count() - 24);
++    try std.testing.expect(a.owns(23) and !a.owns(24) and b.owns(24) and b.owns(47));
++    for ([_]usize{ 0, 1, 48, 49 }) |bad| try std.testing.expectError(error.BadPipelineSplit, Span.ofRank(bad, 0));
++    try std.testing.expectError(error.BadRank, Span.ofRank(24, 2));
++    try std.testing.expectEqual(Span{ .end = 2 }, try Span.ofRank(2, 0));
++    try std.testing.expectEqual(Span{ .first = 47 }, try Span.ofRank(47, 1));
++}
++
++test "linear layers skip every fourth index and attention starts at 3" {
++    try std.testing.expect(wt.linearLayer(0));
++    try std.testing.expect(!wt.linearLayer(3));
++    try std.testing.expect(!wt.linearLayer(47));
++    try std.testing.expectEqual(@as(usize, 0), wt.linearIndex(0));
++    try std.testing.expectEqual(@as(usize, 2), wt.linearIndex(2));
++    try std.testing.expectEqual(@as(usize, 35), wt.linearIndex(46));
++    try std.testing.expectEqual(@as(usize, 0), wt.attnIndex(3));
++    try std.testing.expectEqual(@as(usize, 11), wt.attnIndex(47));
++}
+diff --git a/zig/src/families/flashnext/cuda_span_main.zig b/zig/src/families/flashnext/cuda_span_main.zig
+new file mode 100644
+index 000000000..94535484c
+--- /dev/null
++++ b/zig/src/families/flashnext/cuda_span_main.zig
+@@ -0,0 +1,163 @@
++//! Two pipeline stages on one GPU against one engine: greedy tokens and every step's scores, byte for byte.
++const std = @import("std");
++const cuda = @import("cuda");
++const flash = @import("flashnext");
++
++const prompt = flash.prompt;
++const Span = flash.span.Span;
++const wide = 4 * 2560;
++const vocab = prompt.vocabulary;
++
++pub fn main(init: std.process.Init) !u8 {
++    try flash.env_validate.startup();
++    const gpa = init.gpa;
++    const io = init.io;
++    const args = try init.minimal.args.toSlice(init.arena.allocator());
++    if (args.len < 5) {
++        std.debug.print("usage: flashnext-span <model-dir> <ids-file> <count> <split>\n", .{});
++        return 2;
++    }
++    const count = try std.fmt.parseInt(usize, args[3], 10);
++    const split = try std.fmt.parseInt(usize, args[4], 10);
++    const text = try std.Io.Dir.cwd().readFileAlloc(io, args[2], gpa, .limited(1 << 24));
++    defer gpa.free(text);
++    var ids: std.ArrayList(u32) = .empty;
++    defer ids.deinit(gpa);
++    var it = std.mem.tokenizeAny(u8, text, ", \t\r\n");
++    while (it.next()) |part| try ids.append(gpa, try std.fmt.parseInt(u32, part, 10));
++    if (ids.items.len == 0 or count == 0) return 2;
++
++    var driver = try cuda.Driver.open();
++    defer driver.close();
++    var ctx = try cuda.Context.init(&driver, 0);
++    defer ctx.deinit();
++    var glue = try flash.Glue.load(&driver);
++    defer glue.deinit();
++    var stream = try cuda.Stream.init(&driver, true);
++    defer stream.deinit();
++    const tri: flash.Tri = .{ .own = &glue, .s = stream };
++    var run: Run = .{ .gpa = gpa, .io = io, .driver = &driver, .stream = &stream, .tri = tri, .dir = args[1], .ids = ids.items, .count = count };
++
++    const tokens = try gpa.alloc(u32, 2 * count);
++    defer gpa.free(tokens);
++    const scores = try gpa.alloc(u8, 2 * count * vocab * 2);
++    defer gpa.free(scores);
++    const whole = Out{ .tokens = tokens[0..count], .scores = scores[0 .. count * vocab * 2] };
++    const staged = Out{ .tokens = tokens[count..], .scores = scores[count * vocab * 2 ..] };
++    try run.whole(whole);
++    try run.stages(split, staged);
++    for (0..count) |i| {
++        const a = whole.scores[i * vocab * 2 ..][0 .. vocab * 2];
++        const b = staged.scores[i * vocab * 2 ..][0 .. vocab * 2];
++        if (whole.tokens[i] != staged.tokens[i] or !std.mem.eql(u8, a, b)) {
++            std.debug.print("split {d}: step {d} differs: token {d} against {d}, scores {s}\n", .{ split, i, whole.tokens[i], staged.tokens[i], if (std.mem.eql(u8, a, b)) "equal" else "differ" });
++            return 1;
++        }
++    }
++    std.debug.print("split {d}: {d} prompt rows and {d} greedy steps, tokens and scores equal to one engine\n", .{ split, ids.items.len, count });
++    return 0;
++}
++
++/// Each step's greedy token and its scores row.
++const Out = struct { tokens: []u32, scores: []u8 };
++
++const Run = struct {
++    gpa: std.mem.Allocator,
++    io: std.Io,
++    driver: *cuda.Driver,
++    stream: *cuda.Stream,
++    tri: flash.Tri,
++    dir: []const u8,
++    ids: []const u32,
++    count: usize,
++
++    fn cap(r: *const Run) usize {
++        return r.ids.len + r.count;
++    }
++
++    fn whole(r: *Run, out: Out) !void {
++        const e = try prompt.Engine.init(r.gpa, r.io, r.driver, r.stream, r.dir);
++        defer e.deinit();
++        var seq = try e.newSeq(r.cap());
++        defer seq.deinit(r.gpa);
++        try greedy(r, out, &seq, Feed{ .e = e });
++    }
++
++    fn stages(r: *Run, split: usize, out: Out) !void {
++        const a = try prompt.Engine.initSpan(r.gpa, r.io, r.driver, r.stream, r.dir, try Span.ofRank(split, 0));
++        defer a.deinit();
++        const b = try prompt.Engine.initSpan(r.gpa, r.io, r.driver, r.stream, r.dir, try Span.ofRank(split, 1));
++        defer b.deinit();
++        var seq_a = try a.newSeq(r.cap());
++        defer seq_a.deinit(r.gpa);
++        var seq_b = try b.newSeq(r.cap());
++        defer seq_b.deinit(r.gpa);
++        var rows = try cuda.DeviceBuffer.alloc(r.driver, @min(r.ids.len, a.chunk) * wide * 2);
++        defer rows.free();
++        var ring: Ring = .{ .run = r, .b = b, .seq = &seq_b, .rows = rows.ptr };
++        a.hop = .{ .ctx = &ring, .take = Ring.back, .give = Ring.on };
++        b.hop = .{ .ctx = &ring, .take = Ring.in, .give = Ring.out };
++        try greedy(r, out, &seq_a, Feed{ .e = a, .ring = &ring });
++    }
++};
++
++/// Rank 0's forward, with the ring's rows for this call when the engine is a stage.
++const Feed = struct {
++    e: *prompt.Engine,
++    ring: ?*Ring = null,
++
++    fn forward(f: Feed, r: *Run, seq: *prompt.Seq, ids: []const u32) !void {
++        if (f.ring) |g| {
++            g.ids = ids;
++            g.at = 0;
++        }
++        try f.e.forward(flash.Tri, r.tri, seq, ids, .{});
++    }
++};
++
++fn greedy(r: *Run, out: Out, seq: *prompt.Seq, f: Feed) !void {
++    try f.forward(r, seq, r.ids);
++    for (0..r.count) |i| {
++        @memcpy(out.scores[i * vocab * 2 ..][0 .. vocab * 2], seq.logits[0 .. vocab * 2]);
++        out.tokens[i] = prompt.argmax(seq.logits);
++        if (i + 1 < r.count) try f.forward(r, seq, (&out.tokens[i])[0..1]);
++    }
++}
++
++/// Both stages on one stream: rank 0's rows on to rank 1's pass over the same ids, then back, through `rows`.
++const Ring = struct {
++    run: *Run,
++    b: *prompt.Engine,
++    seq: *prompt.Seq,
++    rows: u64,
++    ids: []const u32 = &.{},
++    at: usize = 0,
++
++    fn copy(g: *Ring, dst: u64, src: u64, rows: usize) !void {
++        const d = g.run.driver;
++        try d.check(d.api.cuMemcpyDtoDAsync_v2(dst, src, rows * wide * 2, g.run.stream.handle), "cuMemcpyDtoDAsync");
++    }
++
++    /// Rank 0 gives its chunk's rows: rank 1's layers run on them before rank 0 takes them back.
++    fn on(ctx: *anyopaque, h: u64, rows: usize) anyerror!void {
++        const g: *Ring = @ptrCast(@alignCast(ctx));
++        try g.copy(g.rows, h, rows);
++        try g.b.forward(flash.Tri, g.run.tri, g.seq, g.ids[g.at..][0..rows], .{ .logits = .none });
++        g.at += rows;
++    }
++
++    fn back(ctx: *anyopaque, h: u64, rows: usize) anyerror!void {
++        const g: *Ring = @ptrCast(@alignCast(ctx));
++        try g.copy(h, g.rows, rows);
++    }
++
++    fn in(ctx: *anyopaque, h: u64, rows: usize) anyerror!void {
++        const g: *Ring = @ptrCast(@alignCast(ctx));
++        try g.copy(h, g.rows, rows);
++    }
++
++    fn out(ctx: *anyopaque, h: u64, rows: usize) anyerror!void {
++        const g: *Ring = @ptrCast(@alignCast(ctx));
++        try g.copy(g.rows, h, rows);
++    }
++};
+-- 
+2.56.0
+

@@ -1,0 +1,83 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jay Leaton <58495321+jayleaton@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 05:55:58 +0700
+Subject: [PATCH 48/76] flashnext cuda: owner-order slot sum's nvcc 13.0
+ records and serving pins
+
+kernel-contract-limits on sm_80/86/89/120/121 fatbins for fn_hc_writeback_moe, fn_hc_writeback_norm_moe
+and fn_moe_sum; the seven changed serving files re-pinned with a note.
+---
+ zig/src/core/contract/flashnext_cuda_records.zig | 2 +-
+ zig/src/core/contract/flashnext_tile_records.zig | 2 +-
+ zig/src/core/contract/gradient_pending.zig       | 2 +-
+ zig/src/core/contract/measurements/main_130.zig  | 2 +-
+ zig/src/core/contract/registry_learning.zig      | 2 +-
+ 5 files changed, 5 insertions(+), 5 deletions(-)
+
+diff --git a/zig/src/core/contract/flashnext_cuda_records.zig b/zig/src/core/contract/flashnext_cuda_records.zig
+index a44a6ebce..eb5aaad07 100644
+--- a/zig/src/core/contract/flashnext_cuda_records.zig
++++ b/zig/src/core/contract/flashnext_cuda_records.zig
+@@ -22,7 +22,7 @@ pub const cuda = [_]CudaRecord{
+     .{ .launch = .{ .name = "flashnext_hc fn_hc_reduce_act", .symbol = "fn_hc_reduce_act", .image = "flashnext_hc", .threads = 352 }, .usage = .{ .{ .regs = 32, .static = 4096, .bound = 1024 }, .{ .regs = 63, .static = 4096, .bound = 1024 }, .{ .regs = 63, .static = 4096, .bound = 1024 }, .{ .regs = 58, .static = 4096, .bound = 1024 }, .{ .regs = 58, .static = 4096, .bound = 1024 } } },
+     .{ .launch = .{ .name = "flashnext_hc fn_hc_upmix", .symbol = "fn_hc_upmix", .image = "flashnext_hc", .threads = 256, .dynamic = 18688 }, .usage = .{ .{ .regs = 69, .static = 2048, .bound = 256 }, .{ .regs = 64, .static = 2048, .bound = 256 }, .{ .regs = 64, .static = 2048, .bound = 256 }, .{ .regs = 78, .static = 2048, .bound = 256 }, .{ .regs = 78, .static = 2048, .bound = 256 } } },
+     .{ .launch = .{ .name = "flashnext_hc fn_hc_writeback0", .symbol = "fn_hc_writeback0", .image = "flashnext_hc", .threads = 256 }, .usage = .{ .{ .regs = 30, .static = 256, .bound = 256 }, .{ .regs = 30, .static = 256, .bound = 256 }, .{ .regs = 30, .static = 256, .bound = 256 }, .{ .regs = 33, .static = 256, .bound = 256 }, .{ .regs = 37, .static = 256, .bound = 256 } } },
+-    .{ .launch = .{ .name = "flashnext_hc fn_hc_writeback_moe", .symbol = "fn_hc_writeback_moe", .image = "flashnext_hc", .threads = 256 }, .usage = .{ .{ .regs = 32, .static = 256, .bound = 256 }, .{ .regs = 40, .static = 256, .bound = 256 }, .{ .regs = 40, .static = 256, .bound = 256 }, .{ .regs = 40, .static = 256, .bound = 256 }, .{ .regs = 40, .static = 256, .bound = 256 } } },
++    .{ .launch = .{ .name = "flashnext_hc fn_hc_writeback_moe", .symbol = "fn_hc_writeback_moe", .image = "flashnext_hc", .threads = 256 }, .usage = .{ .{ .regs = 32, .static = 256, .bound = 256 }, .{ .regs = 33, .static = 256, .bound = 256 }, .{ .regs = 33, .static = 256, .bound = 256 }, .{ .regs = 40, .static = 256, .bound = 256 }, .{ .regs = 40, .static = 256, .bound = 256 } } },
+     .{ .launch = .{ .name = "flashnext_hc fn_hc_writeback_slices", .symbol = "fn_hc_writeback_slices", .image = "flashnext_hc", .threads = 256 }, .usage = .{ .{ .regs = 32, .static = 256, .bound = 256 }, .{ .regs = 38, .static = 256, .bound = 256 }, .{ .regs = 38, .static = 256, .bound = 256 }, .{ .regs = 40, .static = 256, .bound = 256 }, .{ .regs = 40, .static = 256, .bound = 256 } } },
+     .{ .launch = .{ .name = "flashnext_hc fn_ple_conv", .symbol = "fn_ple_conv", .image = "flashnext_hc", .threads = 512 }, .usage = .{ .{ .regs = 23, .static = 0, .bound = 512 }, .{ .regs = 35, .static = 0, .bound = 512 }, .{ .regs = 35, .static = 0, .bound = 512 }, .{ .regs = 35, .static = 0, .bound = 512 }, .{ .regs = 35, .static = 0, .bound = 512 } } },
+     .{ .launch = .{ .name = "flashnext_hc fn_ple_gate", .symbol = "fn_ple_gate", .image = "flashnext_hc", .threads = 512 }, .usage = .{ .{ .regs = 32, .static = 128, .bound = 512 }, .{ .regs = 34, .static = 128, .bound = 512 }, .{ .regs = 34, .static = 128, .bound = 512 }, .{ .regs = 35, .static = 128, .bound = 512 }, .{ .regs = 35, .static = 128, .bound = 512 } } },
+diff --git a/zig/src/core/contract/flashnext_tile_records.zig b/zig/src/core/contract/flashnext_tile_records.zig
+index 326fc0f67..7cd5a97e7 100644
+--- a/zig/src/core/contract/flashnext_tile_records.zig
++++ b/zig/src/core/contract/flashnext_tile_records.zig
+@@ -25,7 +25,7 @@ pub const cuda = [_]CudaRecord{
+     .{ .launch = .{ .name = "flashnext_batch fn_gdn_lanes_chain", .symbol = "fn_gdn_lanes_chain", .image = "flashnext_batch", .threads = 128 }, .usage = .{ .{ .regs = 64, .static = 0, .bound = 128 }, .{ .regs = 64, .static = 0, .bound = 128 }, .{ .regs = 64, .static = 0, .bound = 128 }, .{ .regs = 64, .static = 0, .bound = 128 }, .{ .regs = 64, .static = 0, .bound = 128 } } },
+     .{ .launch = .{ .name = "flashnext_batch fn_gdn_lanes_shift", .symbol = "fn_gdn_lanes_shift", .image = "flashnext_batch", .threads = 256 }, .usage = .{ .{ .regs = 26, .static = 0, .bound = 0 }, .{ .regs = 28, .static = 0, .bound = 0 }, .{ .regs = 28, .static = 0, .bound = 0 }, .{ .regs = 24, .static = 0, .bound = 0 }, .{ .regs = 24, .static = 0, .bound = 0 } } },
+     .{ .launch = .{ .name = "flashnext_hc fn_hc_writeback_norm0", .symbol = "fn_hc_writeback_norm0", .image = "flashnext_hc", .threads = 256 }, .usage = .{ .{ .regs = 59, .static = 1296, .bound = 256 }, .{ .regs = 60, .static = 1296, .bound = 256 }, .{ .regs = 60, .static = 1296, .bound = 256 }, .{ .regs = 62, .static = 1296, .bound = 256 }, .{ .regs = 62, .static = 1296, .bound = 256 } } },
+-    .{ .launch = .{ .name = "flashnext_hc fn_hc_writeback_norm_moe", .symbol = "fn_hc_writeback_norm_moe", .image = "flashnext_hc", .threads = 256 }, .usage = .{ .{ .regs = 64, .static = 1296, .bound = 256 }, .{ .regs = 62, .static = 1296, .bound = 256 }, .{ .regs = 62, .static = 1296, .bound = 256 }, .{ .regs = 62, .static = 1296, .bound = 256 }, .{ .regs = 62, .static = 1296, .bound = 256 } } },
++    .{ .launch = .{ .name = "flashnext_hc fn_hc_writeback_norm_moe", .symbol = "fn_hc_writeback_norm_moe", .image = "flashnext_hc", .threads = 256 }, .usage = .{ .{ .regs = 64, .static = 1296, .bound = 256 }, .{ .regs = 64, .static = 1296, .bound = 256 }, .{ .regs = 64, .static = 1296, .bound = 256 }, .{ .regs = 64, .static = 1296, .bound = 256 }, .{ .regs = 64, .static = 1296, .bound = 256 } } },
+     .{ .launch = .{ .name = "flashnext_hc fn_hc_writeback_norm_slices", .symbol = "fn_hc_writeback_norm_slices", .image = "flashnext_hc", .threads = 256 }, .usage = .{ .{ .regs = 64, .static = 1296, .bound = 256 }, .{ .regs = 64, .static = 1296, .bound = 256 }, .{ .regs = 64, .static = 1296, .bound = 256 }, .{ .regs = 64, .static = 1296, .bound = 256 }, .{ .regs = 64, .static = 1296, .bound = 256 } } },
+     .{ .launch = .{ .name = "prompt16 tf_prompt_bf16", .symbol = "tf_prompt_bf16", .image = "prompt16", .threads = 256, .dynamic = 98304, .opt_in = true }, .usage = .{ .{ .regs = 255, .static = 0, .bound = 256 }, .{ .regs = 255, .static = 0, .bound = 256 }, .{ .regs = 255, .static = 0, .bound = 256 }, .{ .regs = 255, .static = 0, .bound = 256 }, .{ .regs = 255, .static = 0, .bound = 256 } } },
+     .{ .launch = .{ .name = "prompt16 tf_prompt_bf16_f32", .symbol = "tf_prompt_bf16_f32", .image = "prompt16", .threads = 256, .dynamic = 98304, .opt_in = true }, .usage = .{ .{ .regs = 255, .static = 0, .bound = 256 }, .{ .regs = 255, .static = 0, .bound = 256 }, .{ .regs = 255, .static = 0, .bound = 256 }, .{ .regs = 255, .static = 0, .bound = 256 }, .{ .regs = 255, .static = 0, .bound = 256 } } },
+diff --git a/zig/src/core/contract/gradient_pending.zig b/zig/src/core/contract/gradient_pending.zig
+index ce46dad65..93d1683a1 100644
+--- a/zig/src/core/contract/gradient_pending.zig
++++ b/zig/src/core/contract/gradient_pending.zig
+@@ -94,6 +94,6 @@ pub const records = [_]registry.CudaRecord{
+     .{ .launch = .{ .name = "flashnext_train tf_fn_pocket_out_rows threads 128", .image = "flashnext_train", .symbol = "tf_fn_pocket_out_rows", .threads = 128 }, .usage = .{ .{ .regs = 72, .static = 2048, .bound = 128 }, .{ .regs = 72, .static = 2048, .bound = 128 }, .{ .regs = 72, .static = 2048, .bound = 128 }, .{ .regs = 64, .static = 2048, .bound = 128 }, .{ .regs = 64, .static = 2048, .bound = 128 } } },
+     .{ .launch = .{ .name = "flashnext_train tf_fn_pocket_back threads 256", .image = "flashnext_train", .symbol = "tf_fn_pocket_back", .threads = 256 }, .usage = .{ .{ .regs = 42, .static = 1536, .bound = 256 }, .{ .regs = 40, .static = 1536, .bound = 256 }, .{ .regs = 40, .static = 1536, .bound = 256 }, .{ .regs = 40, .static = 1536, .bound = 256 }, .{ .regs = 40, .static = 1536, .bound = 256 } } },
+     .{ .launch = .{ .name = "flashnext_train tf_fn_pocket_grad threads 256", .image = "flashnext_train", .symbol = "tf_fn_pocket_grad", .threads = 256 }, .usage = .{ .{ .regs = 32, .static = 128, .bound = 256 }, .{ .regs = 40, .static = 128, .bound = 256 }, .{ .regs = 40, .static = 128, .bound = 256 }, .{ .regs = 39, .static = 128, .bound = 256 }, .{ .regs = 39, .static = 128, .bound = 256 } } },
+-    .{ .launch = .{ .name = "flashnext_batch fn_moe_sum threads 256", .image = "flashnext_batch", .symbol = "fn_moe_sum", .threads = 256 }, .usage = .{ .{ .regs = 32, .static = 0, .bound = 0 }, .{ .regs = 40, .static = 0, .bound = 0 }, .{ .regs = 40, .static = 0, .bound = 0 }, .{ .regs = 38, .static = 0, .bound = 0 }, .{ .regs = 38, .static = 0, .bound = 0 } } },
++    .{ .launch = .{ .name = "flashnext_batch fn_moe_sum threads 256", .image = "flashnext_batch", .symbol = "fn_moe_sum", .threads = 256 }, .usage = .{ .{ .regs = 32, .static = 0, .bound = 0 }, .{ .regs = 39, .static = 0, .bound = 0 }, .{ .regs = 39, .static = 0, .bound = 0 }, .{ .regs = 40, .static = 0, .bound = 0 }, .{ .regs = 40, .static = 0, .bound = 0 } } },
+     .{ .launch = .{ .name = "flashnext_hc fn_hc_upmix_up threads 256", .image = "flashnext_hc", .symbol = "fn_hc_upmix_up", .threads = 256 }, .usage = .{ .{ .regs = 69, .static = 2048, .bound = 256 }, .{ .regs = 64, .static = 2048, .bound = 256 }, .{ .regs = 64, .static = 2048, .bound = 256 }, .{ .regs = 78, .static = 2048, .bound = 256 }, .{ .regs = 78, .static = 2048, .bound = 256 } } },
+ };
+diff --git a/zig/src/core/contract/measurements/main_130.zig b/zig/src/core/contract/measurements/main_130.zig
+index f8ef3d375..da3483c04 100644
+--- a/zig/src/core/contract/measurements/main_130.zig
++++ b/zig/src/core/contract/measurements/main_130.zig
+@@ -12,7 +12,7 @@ pub const records = [_]r.Override{
+     .{ .name = "flashnext_batch fn_gdn_fused", .usage = .{ .{ .regs = 168, .static = 0, .bound = 384 }, .{ .regs = 168, .static = 0, .bound = 384 }, .{ .regs = 168, .static = 0, .bound = 384 }, .{ .regs = 168, .static = 0, .bound = 384 }, .{ .regs = 168, .static = 0, .bound = 384 } } },
+     .{ .name = "flashnext_batch fn_qsa_select", .usage = .{ .{ .regs = 32, .static = 1168, .bound = 1024 }, .{ .regs = 52, .static = 1168, .bound = 1024 }, .{ .regs = 52, .static = 1168, .bound = 1024 }, .{ .regs = 55, .static = 1168, .bound = 1024 }, .{ .regs = 64, .static = 1168, .bound = 1024 } } },
+     .{ .name = "flashnext_batch fn_qsa_select_lanes", .usage = .{ .{ .regs = 48, .static = 1168, .bound = 1024 }, .{ .regs = 52, .static = 1168, .bound = 1024 }, .{ .regs = 52, .static = 1168, .bound = 1024 }, .{ .regs = 55, .static = 1168, .bound = 1024 }, .{ .regs = 64, .static = 1168, .bound = 1024 } } },
+-    .{ .name = "flashnext_hc fn_hc_writeback_norm_moe", .usage = .{ .{ .regs = 64, .static = 1296, .bound = 256 }, .{ .regs = 62, .static = 1296, .bound = 256 }, .{ .regs = 62, .static = 1296, .bound = 256 }, .{ .regs = 70, .static = 1296, .bound = 256 }, .{ .regs = 70, .static = 1296, .bound = 256 } } },
++    .{ .name = "flashnext_hc fn_hc_writeback_norm_moe", .usage = .{ .{ .regs = 64, .static = 1296, .bound = 256 }, .{ .regs = 64, .static = 1296, .bound = 256 }, .{ .regs = 64, .static = 1296, .bound = 256 }, .{ .regs = 64, .static = 1296, .bound = 256 }, .{ .regs = 64, .static = 1296, .bound = 256 } } },
+     .{ .name = "nvfp4_experts_tile tf_nvfp4_tile_down_f32", .usage = .{ .{ .regs = 123, .static = 0, .bound = 128 }, .{ .regs = 123, .static = 0, .bound = 128 }, .{ .regs = 128, .static = 0, .bound = 128 }, .{ .regs = 128, .static = 0, .bound = 128 }, .{ .regs = 128, .static = 0, .bound = 128 } } },
+     .{ .name = "nvfp4_experts_tile tf_nvfp4_tile_swiglu", .usage = .{ .{ .regs = 255, .static = 0, .bound = 128 }, .{ .regs = 255, .static = 0, .bound = 128 }, .{ .regs = 255, .static = 0, .bound = 128 }, .{ .regs = 255, .static = 0, .bound = 128 }, .{ .regs = 255, .static = 0, .bound = 128 } } },
+     .{ .name = "qwen35 tf_q35_attn_partial", .usage = .{ .{ .regs = 203, .static = 11648, .bound = 128 }, .{ .regs = 203, .static = 11648, .bound = 128 }, .{ .regs = 203, .static = 11648, .bound = 128 }, .{ .regs = 168, .static = 11648, .bound = 128 }, .{ .regs = 168, .static = 11648, .bound = 128 } } },
+diff --git a/zig/src/core/contract/registry_learning.zig b/zig/src/core/contract/registry_learning.zig
+index 7eb3b2ce2..b85ac7f35 100644
+--- a/zig/src/core/contract/registry_learning.zig
++++ b/zig/src/core/contract/registry_learning.zig
+@@ -31,7 +31,7 @@ pub const cuda_132 = [_]registry.Override{
+     .{ .name = "flashnext_train tf_fn_pocket_out threads 128", .usage = .{ .{ .regs = 48, .static = 512, .bound = 128 }, .{ .regs = 48, .static = 512, .bound = 128 }, .{ .regs = 48, .static = 512, .bound = 128 }, .{ .regs = 64, .static = 512, .bound = 128 }, .{ .regs = 64, .static = 512, .bound = 128 } } },
+     .{ .name = "flashnext_train tf_fn_pocket_out_rows threads 128", .usage = .{ .{ .regs = 72, .static = 2048, .bound = 128 }, .{ .regs = 72, .static = 2048, .bound = 128 }, .{ .regs = 72, .static = 2048, .bound = 128 }, .{ .regs = 72, .static = 2048, .bound = 128 }, .{ .regs = 72, .static = 2048, .bound = 128 } } },
+     .{ .name = "flashnext_train tf_fn_pocket_grad threads 256", .usage = .{ .{ .regs = 32, .static = 128, .bound = 256 }, .{ .regs = 40, .static = 128, .bound = 256 }, .{ .regs = 40, .static = 128, .bound = 256 }, .{ .regs = 37, .static = 128, .bound = 256 }, .{ .regs = 37, .static = 128, .bound = 256 } } },
+-    .{ .name = "flashnext_batch fn_moe_sum threads 256", .usage = .{ .{ .regs = 32, .static = 0, .bound = 0 }, .{ .regs = 40, .static = 0, .bound = 0 }, .{ .regs = 40, .static = 0, .bound = 0 }, .{ .regs = 40, .static = 0, .bound = 0 }, .{ .regs = 40, .static = 0, .bound = 0 } } },
++    .{ .name = "flashnext_batch fn_moe_sum threads 256", .usage = .{ .{ .regs = 32, .static = 0, .bound = 0 }, .{ .regs = 39, .static = 0, .bound = 0 }, .{ .regs = 39, .static = 0, .bound = 0 }, .{ .regs = 40, .static = 0, .bound = 0 }, .{ .regs = 40, .static = 0, .bound = 0 } } },
+     .{ .name = "flashnext_hc fn_hc_upmix_up threads 256", .usage = .{ .{ .regs = 69, .static = 2048, .bound = 256 }, .{ .regs = 64, .static = 2048, .bound = 256 }, .{ .regs = 64, .static = 2048, .bound = 256 }, .{ .regs = 62, .static = 2048, .bound = 256 }, .{ .regs = 62, .static = 2048, .bound = 256 } } },
+     .{ .name = "27B tf_q27_gemm_q4w", .usage = .{ .{ .regs = 128, .static = 37888, .bound = 256 }, .{ .regs = 128, .static = 37888, .bound = 256 }, .{ .regs = 128, .static = 37888, .bound = 256 }, .{ .regs = 126, .static = 37888, .bound = 256 }, .{ .regs = 126, .static = 37888, .bound = 256 } } },
+     .{ .name = "27B tf_q27_zero_rows", .usage = .{ .{ .regs = 14, .static = 0, .bound = 0 }, .{ .regs = 13, .static = 0, .bound = 0 }, .{ .regs = 13, .static = 0, .bound = 0 }, .{ .regs = 12, .static = 0, .bound = 0 }, .{ .regs = 12, .static = 0, .bound = 0 } } },
+-- 
+2.56.0
+

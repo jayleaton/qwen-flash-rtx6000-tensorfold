@@ -1,0 +1,471 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jay Leaton <58495321+jayleaton@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 23:43:04 +0700
+Subject: [PATCH 57/76] flashnext cuda: --pp 2 overlaps prompt chunks across
+ the stages
+
+A prompt chunk's rows return to rank 0 only when something there reads them:
+its scores, the MTP head's streams or a keep; a bit in the forward frame tells
+rank 1. Rank 0 posts the previous chunk's receive after its next front and
+before its send, into a landing of its own, and the MTP head absorbs those
+rows after the send. So rank 0's front of chunk c runs while rank 1 runs the
+tail of chunk c - 1, with no grouped calls and the pass's rows untouched.
+
+Rank 1's ack for such a chunk is read a chunk late; any other command first
+takes the late rows and the ack. A lane released with rows still due drops
+their absorb, not their receive. Kernels, chunk cuts and their order on each
+rank are unchanged.
+---
+ zig/src/families/flashnext/cuda_batch_hop.zig | 119 +++++++++++++++++-
+ .../families/flashnext/cuda_batch_state.zig   |   2 +
+ zig/src/families/flashnext/cuda_lanes.zig     |  12 +-
+ .../families/flashnext/cuda_lanes_load.zig    |   4 +-
+ zig/src/families/flashnext/cuda_launch.zig    |   1 +
+ zig/src/families/flashnext/cuda_mtp_draft.zig |   2 +
+ zig/src/families/flashnext/cuda_mtp_ops.zig   |  14 ++-
+ zig/src/families/flashnext/cuda_prompt.zig    |   1 +
+ .../families/flashnext/cuda_rank_engine.zig   |  37 +++++-
+ zig/src/families/flashnext/cuda_rank_hop.zig  |  21 +++-
+ zig/src/families/flashnext/cuda_span_main.zig |   8 +-
+ 11 files changed, 200 insertions(+), 21 deletions(-)
+
+diff --git a/zig/src/families/flashnext/cuda_batch_hop.zig b/zig/src/families/flashnext/cuda_batch_hop.zig
+index 6b01069ab..06daf05d8 100644
+--- a/zig/src/families/flashnext/cuda_batch_hop.zig
++++ b/zig/src/families/flashnext/cuda_batch_hop.zig
+@@ -8,8 +8,52 @@ pub const Hop = struct {
+     give: *const fn (ctx: *anyopaque, h: u64, rows: usize) anyerror!void,
+     /// A host wait for the stream's work, hops included, that ends when the other stage is lost.
+     finish: *const fn (ctx: *anyopaque) anyerror!void,
++    late: *Late,
+ };
+ 
++/// Rank 0's rows of a prompt chunk still to come back: received into `landing` before the next send, then absorbed.
++pub const Late = struct {
++    landing: u64 = 0,
++    /// The landing's bytes (0: no landing, rows always return in the pass).
++    cap: usize = 0,
++    rows: usize = 0,
++    absorb: ?Absorb = null,
++};
++
++/// What reads a late chunk's rows where they land (the MTP head), run once their receive and the next send are posted.
++pub const Absorb = struct {
++    ctx: *anyopaque,
++    arg: *anyopaque,
++    run: *const fn (ctx: *anyopaque, arg: *anyopaque, rows: u64) anyerror!void,
++};
++
++/// A pass's rows at a stage: `late` lets rank 0's rows come back during the next pass; `back` tells rank 1 they return.
++pub const Rows = struct { late: ?Absorb = null, back: bool = false };
++
++/// Whether every chunk's rows return to the head's stage: the MTP head's streams, a keep, a late absorb.
++pub fn always(h: anytype) bool {
++    return h.streams != 0 or h.keep != null or h.stage.late != null;
++}
++
++/// Whether this chunk's rows return: its scores too, or rank 0's word that they do (`Rows.back`, on rank 1).
++pub fn back(h: anytype) bool {
++    return h.logits != .none or always(h) or h.stage.back;
++}
++
++/// The late rows' receive and their absorb (rank 0), before anything else crosses the hop.
++pub fn settle(hop: Hop) !void {
++    const l = hop.late.*;
++    if (l.rows == 0) return;
++    hop.late.* = .{ .landing = l.landing, .cap = l.cap };
++    try hop.take(hop.ctx, l.landing, l.rows);
++    if (l.absorb) |a| try a.run(a.ctx, a.arg, l.landing);
++}
++
++/// The late rows still come, but nothing reads them: their reader is going away.
++pub fn forget(hop: Hop) void {
++    hop.late.absorb = null;
++}
++
+ /// A stage's layers from `first` (an absolute index); its rows cross through `hop`.
+ pub const Stage = struct { first: usize, hop: Hop };
+ 
+@@ -30,12 +74,83 @@ pub fn enter(pass: anytype, n: usize) !void {
+     try @import("cuda_media.zig").inject(pass.seq.media, pass.lanes, pass.stream, s.h, pass.pos0, n);
+ }
+ 
+-/// The pass's last step: the head, or the written-back rows on to the next stage (rank 0: back again, then its head).
++/// The pass's last step: the head, or its rows on to the next stage (rank 0: the late receive first, its absorb after).
+ pub fn leave(pass: anytype, logits_host: ?[]u8) !void {
+     const st = pass.m.stage orelse return pass.head(logits_host);
+     try pass.writeback(0, pass.rows);
++    const returns = back(pass.hooks);
++    if (st.first > 0) {
++        if (returns) try st.hop.give(st.hop.ctx, pass.s.h, pass.rows);
++        return;
++    }
++    const prior = st.hop.late.*;
++    st.hop.late.* = .{ .landing = prior.landing, .cap = prior.cap };
++    if (prior.rows > 0) try st.hop.take(st.hop.ctx, prior.landing, prior.rows);
+     try st.hop.give(st.hop.ctx, pass.s.h, pass.rows);
+-    if (st.first > 0) return;
++    if (prior.rows > 0) if (prior.absorb) |a| try a.run(a.ctx, a.arg, prior.landing);
++    if (!returns) return;
++    if (pass.hooks.stage.late) |a| {
++        if (pass.rows * wt.wide * 2 > st.hop.late.cap) return error.UnexpectedTensor;
++        st.hop.late.rows = pass.rows;
++        st.hop.late.absorb = a;
++        return;
++    }
+     try st.hop.take(st.hop.ctx, pass.s.h, pass.rows);
+     try pass.head(logits_host);
+ }
++
++test "rank 0 posts a late chunk's receive before the next send and absorbs it after; rank 1 returns only read rows" {
++    const std = @import("std");
++    const Log = struct {
++        ops: [16]u8 = undefined,
++        n: usize = 0,
++        fn add(l: *@This(), op: u8) void {
++            l.ops[l.n] = op;
++            l.n += 1;
++        }
++        fn of(ctx: *anyopaque) *@This() {
++            return @ptrCast(@alignCast(ctx));
++        }
++        fn take(ctx: *anyopaque, h: u64, _: usize) anyerror!void {
++            of(ctx).add(if (h == 7) 'L' else 'T');
++        }
++        fn give(ctx: *anyopaque, _: u64, _: usize) anyerror!void {
++            of(ctx).add('G');
++        }
++        fn finish(_: *anyopaque) anyerror!void {}
++        fn absorb(ctx: *anyopaque, _: *anyopaque, rows: u64) anyerror!void {
++            of(ctx).add(if (rows == 7) 'A' else '?');
++        }
++    };
++    const Hooks = @import("cuda_batch_state.zig").Hooks;
++    const Scratch = struct { h: u64 = 1 };
++    const Fake = struct {
++        m: struct { stage: ?Stage },
++        s: *const Scratch,
++        rows: usize = 4,
++        hooks: Hooks,
++        log: *Log,
++        fn writeback(_: *@This(), _: usize, _: usize) !void {}
++        fn head(f: *@This(), _: ?[]u8) !void {
++            f.log.add('H');
++        }
++    };
++    var log: Log = .{};
++    var late: Late = .{ .landing = 7, .cap = 4 * wt.wide * 2 };
++    const hop: Hop = .{ .ctx = &log, .take = Log.take, .give = Log.give, .finish = Log.finish, .late = &late };
++    const absorb: Absorb = .{ .ctx = &log, .arg = &log, .run = Log.absorb };
++    const h: Scratch = .{};
++    var zero: Fake = .{ .m = .{ .stage = .{ .first = 0, .hop = hop } }, .s = &h, .hooks = .{ .logits = .none }, .log = &log };
++    try leave(&zero, null); // nothing reads it: sent only
++    zero.hooks = .{ .logits = .none, .streams = 9, .stage = .{ .late = absorb } };
++    try leave(&zero, null); // late: sent, returns next pass
++    zero.hooks = .{ .logits = .last, .streams = 9 };
++    try leave(&zero, null); // the late receive, this send, its absorb, then this chunk back and the head
++    try std.testing.expectEqualStrings("GGLGATH", log.ops[0..log.n]);
++    log.n = 0;
++    var one: Fake = .{ .m = .{ .stage = .{ .first = 24, .hop = hop } }, .s = &h, .hooks = .{ .logits = .none }, .log = &log };
++    try leave(&one, null);
++    one.hooks = .{ .logits = .none, .stage = .{ .back = true } };
++    try leave(&one, null);
++    try std.testing.expectEqualStrings("G", log.ops[0..log.n]);
++}
+diff --git a/zig/src/families/flashnext/cuda_batch_state.zig b/zig/src/families/flashnext/cuda_batch_state.zig
+index 18d2d0c12..a3bd72310 100644
+--- a/zig/src/families/flashnext/cuda_batch_state.zig
++++ b/zig/src/families/flashnext/cuda_batch_state.zig
+@@ -153,6 +153,8 @@ pub const Hooks = struct {
+     host_logits: bool = true,
+     /// Prompt cache marks inside this pass (TF_FLASHNEXT_KEEP_INPASS): each one's states go to its kept state's buffer.
+     marks: [max_marks]Mark = .{ .{}, .{} },
++    /// A pipeline stage's rows of this pass: late to rank 0, or back from rank 1 (cuda_batch_hop.zig).
++    stage: @import("cuda_batch_hop.zig").Rows = .{},
+ };
+ 
+ /// Rows a layer's pending-row log holds, and the pending count past which a chain stores its state in place.
+diff --git a/zig/src/families/flashnext/cuda_lanes.zig b/zig/src/families/flashnext/cuda_lanes.zig
+index 2d67d0f59..ed8d63a6c 100644
+--- a/zig/src/families/flashnext/cuda_lanes.zig
++++ b/zig/src/families/flashnext/cuda_lanes.zig
+@@ -348,7 +348,7 @@ pub fn Namespace(comptime Tri: type) type {
+                 const last = cut.stop == ids.len;
+                 self.engine.ngram.warmAhead(ids, cut.stop, @min(ids.len, cut.stop + rows));
+                 if (l.draft) |*d| {
+-                    try self.ops().prefillChunk(&l.seq, d, ids, at, cut.stop, marks);
++                    try self.ops().prefillChunk(&l.seq, d, ids, at, cut.stop, marks, if (self.engine.hop != null) .{ .ctx = self, .arg = s, .run = absorbLate } else null);
+                 } else if (self.ranks) |r| {
+                     try r.forward(Tri, self.tri(), &l.seq, ids[at..cut.stop], .{ .logits = if (last) .last else .none, .prompt = true });
+                 } else try self.engine.forward(Tri, self.tri(), &l.seq, ids[at..cut.stop], .{ .logits = if (last) .last else .none, .prompt = true, .marks = marks });
+@@ -395,6 +395,7 @@ pub fn Namespace(comptime Tri: type) type {
+         fn dropLane(self: *Cuda, l: *Lane) void {
+             cuda.completion.drain(self.engine.driver, self.stream, "flashnext: a failed or closed lane did not drain");
+             snaps.dropPrepared(self, l);
++            if (l.draft != null and l.draft.?.late_ids.len != 0) @import("cuda_batch_hop.zig").forget(self.engine.hop.?);
+             if (l.draft) |*d| d.deinit();
+             if (self.ranks) |r| r.drop(&l.seq) else if (!self.kv.close(l.from, &l.seq)) l.seq.deinit(self.gpa);
+             // the blocks after both: a state / spare swap may have left views of each in the other
+@@ -408,6 +409,15 @@ pub fn Namespace(comptime Tri: type) type {
+             return @ptrCast(@alignCast(ptr));
+         }
+ 
++        /// A late prompt chunk's rows into the MTP head of stream `arg`'s lane, as they land at `rows`.
++        fn absorbLate(ctx: *anyopaque, arg: *anyopaque, rows: u64) anyerror!void {
++            const self = of(ctx);
++            const d = &((self.lanes.getPtr(@ptrCast(@alignCast(arg))) orelse return error.UnknownLane).draft orelse return error.UnknownLane);
++            const next = d.late_ids;
++            d.late_ids = &.{};
++            try self.ops().forwardHead(d, next, rows, false);
++        }
++
+         fn prefillFn(ptr: *anyopaque, s: *lanes.Stream) anyerror!void {
+             const self = of(ptr);
+             const l = try self.open(s);
+diff --git a/zig/src/families/flashnext/cuda_lanes_load.zig b/zig/src/families/flashnext/cuda_lanes_load.zig
+index 3e7d2e26b..c43cb409a 100644
+--- a/zig/src/families/flashnext/cuda_lanes_load.zig
++++ b/zig/src/families/flashnext/cuda_lanes_load.zig
+@@ -81,8 +81,8 @@ pub fn open(comptime F: type, gpa: std.mem.Allocator, io: std.Io, ctx: *const cu
+     if (own.ranks) |r| {
+         r.engine = own.engine;
+         if (o.pp != 1) {
+-            r.rows = .{ .c = &r.collective, .stream = own.stream };
+-            own.engine.hop = r.rows.hop();
++            r.rows = try .init(&r.collective, own.stream, o.rank, chunk);
++            own.engine.hop = r.rows.?.hop();
+         } else {
+             own.engine.collective = &r.collective;
+             const peer = @import("cuda_peer_slots.zig");
+diff --git a/zig/src/families/flashnext/cuda_launch.zig b/zig/src/families/flashnext/cuda_launch.zig
+index 0218a2432..e600eb3fb 100644
+--- a/zig/src/families/flashnext/cuda_launch.zig
++++ b/zig/src/families/flashnext/cuda_launch.zig
+@@ -48,6 +48,7 @@ pub const seq_bytes = @import("cuda_seq_bytes.zig");
+ pub const wt = @import("cuda_prompt_wt.zig");
+ /// A pipeline stage's layers of the model
+ pub const span = @import("cuda_span.zig");
++pub const hop = @import("cuda_batch_hop.zig");
+ /// The row-by-row reference path, for flashnext-prompt
+ pub const row_path = @import("cuda_rows.zig");
+ /// The MTP head's drafts: its forward, the chain, the verify window's rows and their rollback
+diff --git a/zig/src/families/flashnext/cuda_mtp_draft.zig b/zig/src/families/flashnext/cuda_mtp_draft.zig
+index c5b032705..3367b74d2 100644
+--- a/zig/src/families/flashnext/cuda_mtp_draft.zig
++++ b/zig/src/families/flashnext/cuda_mtp_draft.zig
+@@ -66,6 +66,8 @@ pub const Draft = struct {
+     rows_cap: usize,
+     /// The prompt's last row of streams in `streams`, which the first draft reads with the first token.
+     prompt_last: u64 = 0,
++    /// The next tokens of a prompt chunk whose rows come back late (rank 0 at --pp 2): absorbed as they land.
++    late_ids: []const u32 = &.{},
+     /// The head's last output row (its streams after the MoE write-back): the next chained draft's input.
+     out: cuda.DeviceBuffer,
+     /// A window's scores [max_rows, vocab], the draft head's [ids], best values [max_rows, 4].
+diff --git a/zig/src/families/flashnext/cuda_mtp_ops.zig b/zig/src/families/flashnext/cuda_mtp_ops.zig
+index 6f02c1c5f..f1750adb4 100644
+--- a/zig/src/families/flashnext/cuda_mtp_ops.zig
++++ b/zig/src/families/flashnext/cuda_mtp_ops.zig
+@@ -100,15 +100,17 @@ pub fn Ops(comptime Tri: type) type {
+             return o.e.stream.*;
+         }
+ 
+-        /// Prompt rows [at, stop): the pass (keeping `marks` on its way) and its streams, then the head over the rows.
+-        pub fn prefillChunk(o: Self, seq: *prompt.Seq, d: *Draft, ids: []const u32, at: usize, stop: usize, marks: [parts.max_marks]parts.Mark) !void {
++        /// Prompt rows [at, stop): the pass (keeping `marks`) and streams, then the head over them (`late`: a pass on).
++        pub fn prefillChunk(o: Self, seq: *prompt.Seq, d: *Draft, ids: []const u32, at: usize, stop: usize, marks: [parts.max_marks]parts.Mark, late: ?@import("cuda_batch_hop.zig").Absorb) !void {
+             if (stop > d.cap or stop <= at or stop - at > d.rows_cap) return error.PromptTooLong;
+-            if (seq.fed != at or d.len != at or d.drafted != 0 or d.pending != 0) return error.PositionMismatch;
++            if (seq.fed != at or d.len + d.late_ids.len != at or d.drafted != 0 or d.pending != 0) return error.PositionMismatch;
+             d.media = if (seq.media) |*m| m.view() else null;
+             const last = stop == ids.len;
+-            try o.forwardMain(seq, ids[at..stop], .{ .logits = if (last) .last else .none, .streams = d.streams.ptr, .prompt = true, .marks = marks });
+             const head_to = @min(stop, ids.len - 1);
+-            if (head_to > at) try o.forwardHead(d, ids[at + 1 .. head_to + 1], d.streams.ptr, false);
++            const deferred = late != null and !last;
++            if (deferred) d.late_ids = ids[at + 1 .. head_to + 1];
++            try o.forwardMain(seq, ids[at..stop], .{ .logits = if (last) .last else .none, .streams = d.streams.ptr, .prompt = true, .marks = marks, .stage = .{ .late = if (deferred) late else null } });
++            if (!deferred and head_to > at) try o.forwardHead(d, ids[at + 1 .. head_to + 1], d.streams.ptr, false);
+             if (last) d.prompt_last = d.streams.ptr + (stop - 1 - at) * wide * 2;
+         }
+ 
+@@ -118,7 +120,7 @@ pub fn Ops(comptime Tri: type) type {
+             var at: usize = 0;
+             while (at < ids.len) {
+                 const stop = @min(ids.len, at + @min(o.e.chunk, d.rows_cap));
+-                try o.prefillChunk(seq, d, ids, at, stop, .{ .{}, .{} });
++                try o.prefillChunk(seq, d, ids, at, stop, .{ .{}, .{} }, null);
+                 at = stop;
+             }
+         }
+diff --git a/zig/src/families/flashnext/cuda_prompt.zig b/zig/src/families/flashnext/cuda_prompt.zig
+index 686d05587..81a59bef8 100644
+--- a/zig/src/families/flashnext/cuda_prompt.zig
++++ b/zig/src/families/flashnext/cuda_prompt.zig
+@@ -602,6 +602,7 @@ pub const chunkRows = chunks.chunkRows;
+ test {
+     _ = @import("cuda_sequence_completion_test.zig");
+     _ = @import("cuda_span.zig");
++    _ = @import("cuda_batch_hop.zig");
+     _ = chunks;
+     _ = sizes;
+ }
+diff --git a/zig/src/families/flashnext/cuda_rank_engine.zig b/zig/src/families/flashnext/cuda_rank_engine.zig
+index 247a24009..5122393a4 100644
+--- a/zig/src/families/flashnext/cuda_rank_engine.zig
++++ b/zig/src/families/flashnext/cuda_rank_engine.zig
+@@ -78,7 +78,9 @@ pub const Session = struct {
+     stopped: bool = false,
+     available: std.atomic.Value(bool) = .init(true),
+     /// A pipeline rank's boundary rows over `collective` (--pp 2).
+-    rows: @import("cuda_rank_hop.zig").Rows = undefined,
++    rows: ?@import("cuda_rank_hop.zig").Rows = null,
++    /// A late prompt chunk's ack, read once the next chunk is issued (rank 0 at --pp 2).
++    late: ?wire.Header = null,
+ 
+     /// `wait_ms` bounds the link and the hello: the peer may still be reading every byte for its digest (`linkWait`).
+     pub fn init(a: std.mem.Allocator, io: std.Io, host: []const u8, port: u16, rank: usize, mine: Identity, wait_ms: u64) !*Session {
+@@ -133,6 +135,7 @@ pub const Session = struct {
+         while (wi.next()) |d| d.deinit();
+         s.windows.deinit(s.gpa);
+         if (s.benchmark_group) |b| s.gpa.free(b);
++        if (s.rows) |*r| r.deinit();
+         s.collective.deinit();
+         var qi = s.seqs.valueIterator();
+         while (qi.next()) |q| {
+@@ -171,6 +174,22 @@ pub const Session = struct {
+     }
+ 
+     pub fn command(s: *Session, input: wire.Header, payload: []const u8) !wire.Header {
++        try s.drain();
++        return s.post(input, payload);
++    }
++
++    /// The late chunk's rows and ack before any other command (rank 0 at --pp 2).
++    fn drain(s: *Session) !void {
++        if (s.rank != 0) return;
++        errdefer s.poison();
++        if (s.rows) |*r| try @import("cuda_batch_hop.zig").settle(r.hop());
++        if (s.late) |h| {
++            s.late = null;
++            try s.ack(h);
++        }
++    }
++
++    fn post(s: *Session, input: wire.Header, payload: []const u8) !wire.Header {
+         if (s.rank != 0 or s.stopped or s.collective.failed) return error.RankDisconnected;
+         if (payload.len > wire.max_payload or input.bytes != payload.len) return error.BadRankFrame;
+         errdefer s.poison();
+@@ -220,10 +239,17 @@ pub const Session = struct {
+     pub fn forward(s: *Session, comptime Tri: type, tri: Tri, q: *prompt.Seq, ids: []const u32, hooks: prompt.batch.Hooks) !void {
+         if (ids.len == 0 or ids.len > wire.max_payload / 4 or q.fed + ids.len > q.cap or hooks.keep != null or hooks.logits == .all) return error.UnsupportedRankOperation;
+         try tokenIds(ids);
+-        const h = try s.command(.{ .kind = .forward, .object = q.rank_id, .bytes = @intCast(ids.len * 4), .flags = @backingInt(hooks.logits) }, std.mem.sliceAsBytes(ids));
++        // a pipeline's rows return on every chunk when rank 0 reads them; a late chunk's ack waits
++        const always = s.rows != null and @import("cuda_batch_hop.zig").always(hooks);
++        const flags = @backingInt(hooks.logits) | @as(u32, @intFromBool(always)) << 8;
++        const h = try s.post(.{ .kind = .forward, .object = q.rank_id, .bytes = @intCast(ids.len * 4), .flags = flags }, std.mem.sliceAsBytes(ids));
+         errdefer s.poison();
+         try s.engine.forward(Tri, tri, q, ids, hooks);
+-        try s.ack(h);
++        if (s.late) |prior| {
++            s.late = null;
++            try s.ack(prior);
++        }
++        if (hooks.stage.late != null) s.late = h else try s.ack(h);
+     }
+ 
+     pub fn round(s: *Session, comptime Tri: type, tri: Tri, seqs: []const *prompt.Seq, ids: []const u32, out: u64) !void {
+@@ -369,7 +395,7 @@ pub const Session = struct {
+                 defer s.gpa.free(ids);
+                 for (ids, 0..) |*v, i| v.* = std.mem.readInt(u32, payload[i * 4 ..][0..4], .little);
+                 try tokenIds(ids);
+-                try s.engine.forward(Tri, tri, q, ids, .{ .logits = @fromBackingInt(@intCast(h.flags)) });
++                try s.engine.forward(Tri, tri, q, ids, .{ .logits = @fromBackingInt(@intCast(h.flags & 0xff)), .stage = .{ .back = h.flags & 0x100 != 0 } });
+             },
+             .round => {
+                 var seqs: [32]*prompt.Seq = undefined;
+@@ -468,7 +494,7 @@ pub fn shape(h: wire.Header) !void {
+     switch (h.kind) {
+         .create => if (h.object == 0 or h.arg == 0 or h.arg > prompt.max_tokens or h.bytes != 0 or h.flags != 0) return error.BadRankFrame,
+         .media => if (h.object == 0 or h.arg == 0 or h.arg > prompt.max_tokens or h.flags != 0 or h.bytes == 0 or h.bytes % 12 != 0 or h.bytes / 12 > 64) return error.BadRankFrame,
+-        .forward => if (h.object == 0 or h.arg != 0 or h.bytes == 0 or h.bytes % 4 != 0 or (h.flags != @backingInt(prompt.batch.Logits.last) and h.flags != @backingInt(prompt.batch.Logits.none))) return error.BadRankFrame,
++        .forward => if (h.object == 0 or h.arg != 0 or h.bytes == 0 or h.bytes % 4 != 0 or (h.flags & ~@as(u32, 0x100) != @backingInt(prompt.batch.Logits.last) and h.flags & ~@as(u32, 0x100) != @backingInt(prompt.batch.Logits.none))) return error.BadRankFrame,
+         .verify => if (h.object == 0 or h.arg != 0 or h.flags != 0 or h.bytes == 0 or h.bytes % 4 != 0 or h.bytes / 4 > mtp.max_rows) return error.BadRankFrame,
+         .keep => if (h.object == 0 or h.arg == 0 or h.arg > mtp.max_rows or h.bytes != 0 or h.flags != 0) return error.BadRankFrame,
+         .verify_many => if (h.object != 0 or h.flags != 0 or h.arg == 0 or h.arg > verify_rows.max_windows or h.bytes < 16 * h.arg or h.bytes > verify_rows.max_bytes) return error.BadRankFrame,
+@@ -515,6 +541,7 @@ test "rank identity binds checkpoint, config, index, program and execution setti
+ test "rank operations refuse invalid geometry and unsupported hooks before execution" {
+     try shape(.{ .kind = .create, .object = 1, .arg = 4096 });
+     try shape(.{ .kind = .forward, .object = 1, .bytes = 4 });
++    try shape(.{ .kind = .forward, .object = 1, .bytes = 4, .flags = 0x100 | @as(u32, @backingInt(prompt.batch.Logits.none)) });
+     try shape(.{ .kind = .round, .bytes = 24 });
+     try shape(.{ .kind = .verify, .object = 1, .bytes = mtp.max_rows * 4 });
+     try shape(.{ .kind = .keep, .object = 1, .arg = mtp.max_rows });
+diff --git a/zig/src/families/flashnext/cuda_rank_hop.zig b/zig/src/families/flashnext/cuda_rank_hop.zig
+index 26c5f91b4..2658296ec 100644
+--- a/zig/src/families/flashnext/cuda_rank_hop.zig
++++ b/zig/src/families/flashnext/cuda_rank_hop.zig
+@@ -2,14 +2,31 @@
+ const cuda = @import("cuda");
+ const wt = @import("cuda_prompt_wt.zig");
+ const Collective = @import("cuda_collective.zig").Collective;
+-const Hop = @import("cuda_batch_hop.zig").Hop;
++const hops = @import("cuda_batch_hop.zig");
++const Hop = hops.Hop;
+ 
+ pub const Rows = struct {
+     c: *Collective,
+     stream: cuda.Stream,
++    late: hops.Late = .{},
++    landing: ?cuda.DeviceBuffer = null,
++
++    /// Rank 0 lands a late chunk of up to `rows` rows apart from the pass's own rows.
++    pub fn init(c: *Collective, stream: cuda.Stream, rank: usize, rows: usize) !Rows {
++        var r: Rows = .{ .c = c, .stream = stream };
++        if (rank != 0) return r;
++        const b = try cuda.DeviceBuffer.alloc(stream.d, rows * wt.wide * 2);
++        r.landing = b;
++        r.late = .{ .landing = b.ptr, .cap = rows * wt.wide * 2 };
++        return r;
++    }
++
++    pub fn deinit(r: *Rows) void {
++        if (r.landing) |*b| b.free();
++    }
+ 
+     pub fn hop(r: *Rows) Hop {
+-        return .{ .ctx = r, .take = take, .give = give, .finish = finish };
++        return .{ .ctx = r, .take = take, .give = give, .finish = finish, .late = &r.late };
+     }
+ 
+     fn of(ctx: *anyopaque) *Rows {
+diff --git a/zig/src/families/flashnext/cuda_span_main.zig b/zig/src/families/flashnext/cuda_span_main.zig
+index 8cfe92a86..feacd7781 100644
+--- a/zig/src/families/flashnext/cuda_span_main.zig
++++ b/zig/src/families/flashnext/cuda_span_main.zig
+@@ -95,8 +95,10 @@ const Run = struct {
+         var rows = try cuda.DeviceBuffer.alloc(r.driver, @min(r.ids.len, a.chunk) * wide * 2);
+         defer rows.free();
+         var ring: Ring = .{ .run = r, .b = b, .seq = &seq_b, .rows = rows.ptr };
+-        a.hop = .{ .ctx = &ring, .take = Ring.back, .give = Ring.on, .finish = Ring.finish };
+-        b.hop = .{ .ctx = &ring, .take = Ring.in, .give = Ring.out, .finish = Ring.finish };
++        var late_a: flash.hop.Late = .{};
++        var late_b: flash.hop.Late = .{};
++        a.hop = .{ .ctx = &ring, .take = Ring.back, .give = Ring.on, .finish = Ring.finish, .late = &late_a };
++        b.hop = .{ .ctx = &ring, .take = Ring.in, .give = Ring.out, .finish = Ring.finish, .late = &late_b };
+         try greedy(r, out, &seq_a, Feed{ .e = a, .ring = &ring });
+     }
+ };
+@@ -142,7 +144,7 @@ const Ring = struct {
+     fn on(ctx: *anyopaque, h: u64, rows: usize) anyerror!void {
+         const g: *Ring = @ptrCast(@alignCast(ctx));
+         try g.copy(g.rows, h, rows);
+-        try g.b.forward(flash.Tri, g.run.tri, g.seq, g.ids[g.at..][0..rows], .{ .logits = .none });
++        try g.b.forward(flash.Tri, g.run.tri, g.seq, g.ids[g.at..][0..rows], .{ .logits = .none, .stage = .{ .back = true } });
+         g.at += rows;
+     }
+ 
+-- 
+2.56.0
+

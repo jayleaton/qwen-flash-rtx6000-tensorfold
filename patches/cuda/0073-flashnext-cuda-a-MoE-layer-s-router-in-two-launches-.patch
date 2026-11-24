@@ -1,0 +1,673 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jay Leaton <58495321+jayleaton@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 15:58:27 +0700
+Subject: [PATCH 73/76] flashnext cuda: a MoE layer's router in two launches
+ for passes of up to 16 rows behind TF_FLASHNEXT_ROUTE_FUSED
+
+tf_route_logits_spread runs tf_route_logits_few's tiles and mma chains over 8 experts a one-warp block (65 blocks
+instead of 17, each logit the same sums), and tf_route_topk_plan runs tf_route_topk's rows in eight groups side by
+side, fn_ep_picks and experts.cu's one-block plan in one block: logits, top-k, own picks and plan in two launches
+instead of four, with the same bytes. Off by default; route-rows checks both against the launches they replace.
+---
+ docs/environment.md                           |   1 +
+ zig/kernels/cuda/route_rows.cu                | 166 ++++++++++++++++++
+ zig/src/core/contract/registry.zig            |   2 +
+ zig/src/cuda/route_rows.zig                   |  44 ++++-
+ zig/src/families/flashnext/cuda_batch.zig     |  13 +-
+ .../families/flashnext/cuda_lanes_load.zig    |   2 +
+ .../families/flashnext/cuda_moe_native.zig    |  33 +++-
+ .../families/flashnext/cuda_route_fused.zig   |  43 +++++
+ zig/src/platform/environment.zig              |   1 +
+ .../platform/environment_flashnext_test.zig   |   4 +-
+ zig/tests/cuda/contract_route_rows.zig        |   4 +-
+ zig/tests/cuda/contract_tests.zig             |   2 +-
+ zig/tests/cuda/route_rows_tests.zig           |  54 +++++-
+ zig/tests/fixtures/gradient-serving.tsv       |   6 +-
+ 14 files changed, 356 insertions(+), 19 deletions(-)
+ create mode 100644 zig/src/families/flashnext/cuda_route_fused.zig
+
+diff --git a/docs/environment.md b/docs/environment.md
+index d177452de..4e1bd8fad 100644
+--- a/docs/environment.md
++++ b/docs/environment.md
+@@ -144,6 +144,7 @@ stops the start with the variable, the supplied text and the accepted forms.
+ | `TF_FLASHNEXT_GDN_SPLIT` | Exactly `0` or `1`; default off. `1` runs a fused prompt pass's DeltaNet chain over two blocks a value head when the device has an SM for each block, with the same bits |
+ | `TF_FLASHNEXT_OWNER_SLOTS` | Exactly `0` or `1`; default off. `1`: a `--tp 2` prompt pass over 64 rows outside a capture sends each rank only the half rows of the slots it owns, with the same bits; both ranks must agree |
+ | `TF_FLASHNEXT_HIDDEN_SUM` | Exactly `0` or `1`; default off. `1` sums the MoE slots in owner order on every CUDA path, which changes tokens once against `0`, and at `--tp 2` with the shared expert split exchanges one hidden-size row a layer (TP2 keeps TP1's bits); read at load, both ranks must agree, and it keys the kept prompt states |
++| `TF_FLASHNEXT_ROUTE_FUSED` | Exactly `0` or `1`; default off. `1`: a MoE layer's pass of up to 16 rows on our glue runs its router in two launches instead of four: the logits over 8 experts a block (the same tiles and sums), then top-k, the rank's own picks and the expert plan in one block, with the same bits; read at load, the ranks need not agree |
+ | `TF_FLASHNEXT_GDN_LANES` | Exactly `0` or `1`; default on |
+ | `TF_FLASHNEXT_BATCH_HEADS` | Exactly `0` or `1`; default on |
+ | `TF_FLASHNEXT_SAMPLED_HEADS` | Exactly `0` or `1`; default on |
+diff --git a/zig/kernels/cuda/route_rows.cu b/zig/kernels/cuda/route_rows.cu
+index 8190cf709..522174b7a 100644
+--- a/zig/kernels/cuda/route_rows.cu
++++ b/zig/kernels/cuda/route_rows.cu
+@@ -42,6 +42,84 @@ __device__ __forceinline__ void block_best(float& v, int& i, float (*sv)[NT / 32
+         }
+ }
+ 
++// block_best over one group of NT threads (named barrier `bar`): the same tree, so groups can take rows side by side.
++__device__ __forceinline__ void group_best(float& v, int& i, float (*sv)[NT / 32], int (*si)[NT / 32], int parity, int bar) {
++    for (int off = 16; off > 0; off >>= 1) {
++        const float ov = __shfl_xor_sync(0xffffffffu, v, off);
++        const int oi = __shfl_xor_sync(0xffffffffu, i, off);
++        if (ov > v || (ov == v && oi < i)) {
++            v = ov;
++            i = oi;
++        }
++    }
++    const int warp = (threadIdx.x % NT) >> 5;
++    if ((threadIdx.x & 31) == 0) {
++        sv[parity][warp] = v;
++        si[parity][warp] = i;
++    }
++    asm volatile("bar.sync %0, %1;" ::"r"(bar), "r"(NT) : "memory");
++    v = sv[parity][0];
++    i = si[parity][0];
++    for (int w = 1; w < NT / 32; ++w)
++        if (sv[parity][w] > v || (sv[parity][w] == v && si[parity][w] < i)) {
++            v = sv[parity][w];
++            i = si[parity][w];
++        }
++}
++
++constexpr int PLAN_NT = 1024, GROUPS = PLAN_NT / NT, PLAN_E = 1024, PLAN_P = 1024;  // experts.cu's one-block plan
++
++// experts.cu's place_items: expert tid's count c into items of at most T pairs; returns its first member slot.
++__device__ __forceinline__ int place_items(int c, int E, int T, int* __restrict__ items, int* __restrict__ counts) {
++    __shared__ int wsum[3][32];
++    const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
++    const int tiles = (c + T - 1) / T;
++    int a = c, b = tiles, u = c > 0;
++#pragma unroll
++    for (int o = 1; o < 32; o <<= 1) {
++        const int ua = __shfl_up_sync(0xffffffffu, a, o), ub = __shfl_up_sync(0xffffffffu, b, o);
++        const int uu = __shfl_up_sync(0xffffffffu, u, o);
++        if (lane >= o) {
++            a += ua;
++            b += ub;
++            u += uu;
++        }
++    }
++    if (lane == 31) {
++        wsum[0][warp] = a;
++        wsum[1][warp] = b;
++        wsum[2][warp] = u;
++    }
++    __syncthreads();
++    if (warp == 0) {
++#pragma unroll
++        for (int s = 0; s < 3; ++s) {
++            int v = wsum[s][lane];
++#pragma unroll
++            for (int o = 1; o < 32; o <<= 1) {
++                const int w = __shfl_up_sync(0xffffffffu, v, o);
++                if (lane >= o) v += w;
++            }
++            wsum[s][lane] = v;
++        }
++    }
++    __syncthreads();
++    const int off = (warp ? wsum[0][warp - 1] : 0) + a - c;
++    const int ioff = (warp ? wsum[1][warp - 1] : 0) + b - tiles;
++    if (tid == 0) {
++        counts[0] = wsum[1][31];
++        counts[1] = wsum[2][31];
++    }
++    if (tid < E)
++        for (int j = 0; j < tiles; ++j) {
++            int* it = items + 3 * (ioff + j);
++            it[0] = tid;
++            it[1] = off + T * j;
++            it[2] = min(T, c - T * j);
++        }
++    return off;
++}
++
+ }  // namespace tf_route
+ 
+ using namespace tf_route;
+@@ -67,6 +145,13 @@ extern "C" __global__ void __launch_bounds__(128) tf_route_logits_few(const __nv
+     tf_router_mma::logits<4, 3, 256>(X, x_ld, W, OUT, M, D, E);
+ }
+ 
++// tf_route_logits_few's sums over 8 experts a one-warp block: each logit the same tile and mma chain, 4x the blocks.
++extern "C" __global__ void __launch_bounds__(32) tf_route_logits_spread(const __nv_bfloat16* __restrict__ X, int x_ld,
++                                                                       const __nv_bfloat16* __restrict__ W, float* __restrict__ OUT,
++                                                                       int M, int D, int E) {
++    tf_router_mma::logits<1, 6, 256>(X, x_ld, W, OUT, M, D, E);
++}
++
+ // A row's TOPK largest of NE logits (lower id on ties), bf16(e^(l_k - l_0) / sum); `shared`: slot TOPK gated by NE.
+ extern "C" __global__ void __launch_bounds__(NT) tf_route_topk(const float* __restrict__ L, int NL, int NE, int TOPK,
+                                                                int* __restrict__ PICK, float* __restrict__ WTS, int SLOTS,
+@@ -115,3 +200,84 @@ extern "C" __global__ void __launch_bounds__(NT) tf_route_topk(const float* __re
+         WTS[static_cast<long long>(r) * SLOTS + TOPK] = rbf(tf_sigmoid(rbf(row[NE])));
+     }
+ }
++
++// tf_route_topk's R rows (8 groups side by side), fn_ep_picks into OWN (local >= 0), then experts.cu's plan_kernel.
++extern "C" __global__ void __launch_bounds__(PLAN_NT) tf_route_topk_plan(const float* __restrict__ L, int NL, int NE, int TOPK,
++                                                                         int* __restrict__ PICK, float* __restrict__ WTS, int SLOTS,
++                                                                         int shared, int R, int first, int local,
++                                                                         int* __restrict__ OWN, int E, int T,
++                                                                         int* __restrict__ members, int* __restrict__ items,
++                                                                         int* __restrict__ counts) {
++    __shared__ float sv[GROUPS][2][NT / 32];
++    __shared__ int si[GROUPS][2][NT / 32];
++    __shared__ int pk[PLAN_P];
++    __shared__ int cnt[PLAN_E];
++    __shared__ int off[PLAN_E];
++    const int grp = threadIdx.x / NT, lt = threadIdx.x % NT;
++    for (int e = threadIdx.x; e < PLAN_E; e += PLAN_NT) cnt[e] = 0;
++    for (int r = grp; r < R; r += GROUPS) {
++        const float* row = L + static_cast<long long>(r) * NL;
++        float v[MOST];
++#pragma unroll
++        for (int j = 0; j < MOST; ++j) {
++            const int i = lt + j * NT;
++            v[j] = i < NE ? row[i] : -INFINITY;
++        }
++        float top = 0.0f, total = 0.0f, mine = 0.0f;
++        int pick = 0;
++        for (int k = 0; k < TOPK; ++k) {
++            float bv = -INFINITY;
++            int bi = 0x7fffffff;
++#pragma unroll
++            for (int j = 0; j < MOST; ++j) {
++                const int i = lt + j * NT;
++                if (v[j] > bv || (v[j] == bv && i < bi)) {
++                    bv = v[j];
++                    bi = i;
++                }
++            }
++            group_best(bv, bi, sv[grp], si[grp], k & 1, 1 + grp);
++            if (k == 0) top = bv;
++#pragma unroll
++            for (int j = 0; j < MOST; ++j)
++                if (lt + j * NT == bi) v[j] = -INFINITY;
++            const float ex = tf_exp(__fsub_rn(bv, top));
++            total = __fadd_rn(total, ex);
++            if (lt == k) {
++                mine = ex;
++                pick = bi;
++            }
++        }
++        if (lt < TOPK) {
++            PICK[static_cast<long long>(r) * SLOTS + lt] = pick;
++            WTS[static_cast<long long>(r) * SLOTS + lt] = rbf(__fdiv_rn(mine, total));
++            pk[r * SLOTS + lt] = pick;
++        }
++        if (shared && lt == 0) {
++            PICK[static_cast<long long>(r) * SLOTS + TOPK] = NE;
++            WTS[static_cast<long long>(r) * SLOTS + TOPK] = rbf(tf_sigmoid(rbf(row[NE])));
++            pk[r * SLOTS + TOPK] = NE;
++        }
++    }
++    __syncthreads();
++    const int P = R * SLOTS;
++    for (int p = threadIdx.x; p < P; p += PLAN_NT) {
++        int e = pk[p];
++        if (local >= 0) {
++            e = e >= first && e < first + local ? e - first : local;
++            OWN[p] = e;
++            pk[p] = e;
++        }
++        atomicAdd(&cnt[e], 1);
++    }
++    __syncthreads();
++    const int o = place_items(threadIdx.x < E ? cnt[threadIdx.x] : 0, E, T, items, counts);
++    if (threadIdx.x < E) off[threadIdx.x] = o;
++    __syncthreads();
++    for (int p = threadIdx.x; p < P; p += PLAN_NT) {
++        const int e = pk[p];
++        int rank = 0;
++        for (int q = 0; q < p; ++q) rank += pk[q] == e;
++        members[off[e] + rank] = p;
++    }
++}
+diff --git a/zig/src/core/contract/registry.zig b/zig/src/core/contract/registry.zig
+index 69de9f49c..fb4c9d85f 100644
+--- a/zig/src/core/contract/registry.zig
++++ b/zig/src/core/contract/registry.zig
+@@ -32,6 +32,8 @@ pub const cuda = @import("flashnext_cuda_records.zig").cuda ++ [_]CudaRecord{
+     .{ .launch = .{ .name = "route_rows tf_route_logits", .symbol = "tf_route_logits", .image = "route_rows", .threads = 128, .dynamic = 26112 }, .usage = .{ .{ .regs = 32, .static = 0, .bound = 128 }, .{ .regs = 39, .static = 0, .bound = 128 }, .{ .regs = 39, .static = 0, .bound = 128 }, .{ .regs = 35, .static = 0, .bound = 128 }, .{ .regs = 34, .static = 0, .bound = 128 } } },
+     .{ .launch = .{ .name = "route_rows tf_route_logits_few", .symbol = "tf_route_logits_few", .image = "route_rows", .threads = 128, .dynamic = 76032, .opt_in = true }, .usage = .{ .{ .regs = 31, .static = 0, .bound = 128 }, .{ .regs = 40, .static = 0, .bound = 128 }, .{ .regs = 40, .static = 0, .bound = 128 }, .{ .regs = 35, .static = 0, .bound = 128 }, .{ .regs = 37, .static = 0, .bound = 128 } } },
+     .{ .launch = .{ .name = "route_rows tf_route_topk", .symbol = "tf_route_topk", .image = "route_rows", .threads = 128 }, .usage = .{ .{ .regs = 39, .static = 64, .bound = 128 }, .{ .regs = 39, .static = 64, .bound = 128 }, .{ .regs = 39, .static = 64, .bound = 128 }, .{ .regs = 36, .static = 64, .bound = 128 }, .{ .regs = 36, .static = 64, .bound = 128 } } },
++    .{ .launch = .{ .name = "route_rows tf_route_logits_spread", .symbol = "tf_route_logits_spread", .image = "route_rows", .threads = 32, .dynamic = 76032, .opt_in = true }, .usage = .{ .{ .regs = 44, .static = 0, .bound = 32 }, .{ .regs = 50, .static = 0, .bound = 32 }, .{ .regs = 46, .static = 0, .bound = 32 }, .{ .regs = 40, .static = 0, .bound = 32 }, .{ .regs = 40, .static = 0, .bound = 32 } } },
++    .{ .launch = .{ .name = "route_rows tf_route_topk_plan", .symbol = "tf_route_topk_plan", .image = "route_rows", .threads = 1024 }, .usage = .{ .{ .regs = 36, .static = 13184, .bound = 1024 }, .{ .regs = 36, .static = 13184, .bound = 1024 }, .{ .regs = 36, .static = 13184, .bound = 1024 }, .{ .regs = 50, .static = 13184, .bound = 1024 }, .{ .regs = 50, .static = 13184, .bound = 1024 } } },
+     .{ .launch = .{ .name = "norms tf_rms_rows_bf16", .symbol = "tf_rms_rows_bf16", .image = "norms", .threads = 256 }, .usage = .{ .{ .regs = 79, .static = 32, .bound = 256 }, .{ .regs = 79, .static = 32, .bound = 256 }, .{ .regs = 79, .static = 32, .bound = 256 }, .{ .regs = 80, .static = 32, .bound = 256 }, .{ .regs = 80, .static = 32, .bound = 256 } } },
+     .{ .launch = .{ .name = "norms tf_rms_rows", .symbol = "tf_rms_rows", .image = "norms", .threads = 1024 }, .usage = .{ .{ .regs = 32, .static = 132, .bound = 1024 }, .{ .regs = 46, .static = 132, .bound = 1024 }, .{ .regs = 46, .static = 132, .bound = 1024 }, .{ .regs = 45, .static = 132, .bound = 1024 }, .{ .regs = 45, .static = 132, .bound = 1024 } } },
+     .{ .launch = .{ .name = "router tf_nemo_router", .symbol = "tf_nemo_router", .image = "nemotron_route", .threads = 256, .dynamic = 28800 }, .usage = .{ .{ .regs = 32, .static = 0, .bound = 256 }, .{ .regs = 40, .static = 0, .bound = 256 }, .{ .regs = 40, .static = 0, .bound = 256 }, .{ .regs = 40, .static = 0, .bound = 256 }, .{ .regs = 40, .static = 0, .bound = 256 } } },
+diff --git a/zig/src/cuda/route_rows.zig b/zig/src/cuda/route_rows.zig
+index 43cacaeb3..e150e7d4e 100644
+--- a/zig/src/cuda/route_rows.zig
++++ b/zig/src/cuda/route_rows.zig
+@@ -4,6 +4,7 @@ const kernels = @import("kernels.zig");
+ const module = @import("module.zig");
+ const launch_ = @import("launch.zig");
+ const stream_ = @import("stream.zig");
++const grouped = @import("grouped.zig");
+ 
+ const Driver = @import("driver.zig").Driver;
+ const Module = module.Module;
+@@ -17,6 +18,8 @@ pub const most_picks = 128;
+ /// tf_route_logits' staged rows (16 inputs and 32 experts, padded by 8): two stages of 128, or three of 256.
+ pub const many_shared: u32 = 2 * 48 * (128 + 8) * 2;
+ pub const few_shared: u32 = 3 * 48 * (256 + 8) * 2;
++/// tf_route_logits_spread's: 16 inputs and 8 experts, padded by 8, six stages of 256 (few's bytes).
++pub const spread_shared: u32 = 6 * 24 * (256 + 8) * 2;
+ /// tf_route_logits_wide's: 128 inputs and 64 experts, two stages of 64.
+ pub const wide_shared: u32 = 2 * 192 * (64 + 8) * 2;
+ 
+@@ -26,13 +29,16 @@ pub const RouteRows = struct {
+     few_fn: Function,
+     wide_fn: Function,
+     topk_fn: Function,
++    spread_fn: Function,
++    topk_plan_fn: Function,
+ 
+     pub fn load(d: *const Driver) !RouteRows {
+         if (!kernels.available) return error.BuiltWithoutKernels;
+         var mod = try Module.load(d, kernels.route_rows);
+         errdefer mod.unload();
+-        const r: RouteRows = .{ .mod = mod, .logits_fn = try mod.function("tf_route_logits"), .few_fn = try mod.function("tf_route_logits_few"), .wide_fn = try mod.function("tf_route_logits_wide"), .topk_fn = try mod.function("tf_route_topk") };
++        const r: RouteRows = .{ .mod = mod, .logits_fn = try mod.function("tf_route_logits"), .few_fn = try mod.function("tf_route_logits_few"), .wide_fn = try mod.function("tf_route_logits_wide"), .topk_fn = try mod.function("tf_route_topk"), .spread_fn = try mod.function("tf_route_logits_spread"), .topk_plan_fn = try mod.function("tf_route_topk_plan") };
+         try r.few_fn.allowDynamicShared(few_shared);
++        try r.spread_fn.allowDynamicShared(spread_shared);
+         try r.wide_fn.allowDynamicShared(wide_shared);
+         return r;
+     }
+@@ -61,6 +67,42 @@ pub const RouteRows = struct {
+         try launch_.launch(if (few) g.few_fn else g.logits_fn, .{ .grid = .{ .x = @intCast((rows + 15) / 16), .y = @intCast((e + 31) / 32), .z = 1 }, .block = .{ .x = 128 }, .shared = if (few) few_shared else many_shared }, s, &a);
+     }
+ 
++    /// logits for up to 16 rows over 8 experts a one-warp block: few's tiles and mma chains, each logit's bits.
++    pub fn logitsSpread(g: *const RouteRows, s: Stream, x: u64, x_ld: usize, w: u64, out: u64, rows: usize, d: usize, e: usize) !void {
++        if (d % 16 != 0 or x_ld % 8 != 0 or x % 16 != 0 or w % 16 != 0 or rows > 16) return error.RowShape;
++        if (rows == 0 or e == 0) return;
++        var a: launch_.Args = .{};
++        a.add(x);
++        a.add(@as(i32, @intCast(x_ld)));
++        a.add(w);
++        a.add(out);
++        for ([_]usize{ rows, d, e }) |v| a.add(@as(i32, @intCast(v)));
++        try launch_.launch(g.spread_fn, .{ .grid = .{ .x = 1, .y = @intCast((e + 7) / 8), .z = 1 }, .block = .{ .x = 32 }, .shared = spread_shared }, s, &a);
++    }
++
++    /// topkPlan's plan: picks as a rank's ids into `own` (`local` from `first`; null: as picked), `tile`-pair items.
++    pub const Planned = struct { first: usize = 0, local: ?usize, own: u64 = 0, experts: usize, tile: usize, plan: grouped.Plan };
++
++    /// topk, then the picks' plan (fn_ep_picks and experts.route's one block when `local` is set), in one launch.
++    pub fn topkPlan(g: *const RouteRows, s: Stream, l: u64, ld: usize, experts: usize, top_k: usize, picks: u64, wts: u64, slots: usize, rows: usize, shared: bool, p: Planned) !void {
++        const need = experts + @intFromBool(shared);
++        if (experts > most_experts or top_k == 0 or top_k > most_picks or top_k > experts or slots != top_k + @intFromBool(shared) or ld < need) return error.RowShape;
++        if (rows * slots > grouped.small or p.experts == 0 or p.experts > grouped.max_experts or p.tile == 0 or (p.local != null and p.own == 0)) return error.RowShape;
++        if (rows == 0) return;
++        var a: launch_.Args = .{};
++        a.add(l);
++        for ([_]usize{ ld, experts, top_k }) |v| a.add(@as(i32, @intCast(v)));
++        a.add(picks);
++        a.add(wts);
++        for ([_]usize{ slots, @intFromBool(shared), rows, p.first }) |v| a.add(@as(i32, @intCast(v)));
++        a.add(if (p.local) |n| @as(i32, @intCast(n)) else -1);
++        a.add(p.own);
++        a.add(@as(i32, @intCast(p.experts)));
++        a.add(@as(i32, @intCast(p.tile)));
++        for ([_]u64{ p.plan.members, p.plan.items, p.plan.counts }) |v| a.add(v);
++        try launch_.launch(g.topk_plan_fn, .{ .grid = .{ .x = 1, .y = 1, .z = 1 }, .block = .{ .x = 1024 } }, s, &a);
++    }
++
+     /// Each row's top_k of its first `experts` logits into picks and weights [rows, slots]; `shared`: slot top_k too.
+     pub fn topk(g: *const RouteRows, s: Stream, l: u64, ld: usize, experts: usize, top_k: usize, picks: u64, wts: u64, slots: usize, rows: usize, shared: bool) !void {
+         const need = experts + @intFromBool(shared);
+diff --git a/zig/src/families/flashnext/cuda_batch.zig b/zig/src/families/flashnext/cuda_batch.zig
+index a0407fb44..d8bef3fe3 100644
+--- a/zig/src/families/flashnext/cuda_batch.zig
++++ b/zig/src/families/flashnext/cuda_batch.zig
+@@ -16,6 +16,7 @@ const batch_lanes = @import("cuda_batch_lanes.zig");
+ const tiles = @import("cuda_tiles.zig");
+ const tk = @import("cuda_tile_kernels.zig");
+ const moe_native = @import("cuda_moe_native.zig");
++const route_fused = @import("cuda_route_fused.zig");
+ const zs = @import("cuda_zero_slice.zig");
+ const ops = @import("cuda_batch_ops.zig");
+ const split_lane = @import("cuda_split_lane.zig");
+@@ -444,13 +445,17 @@ pub fn Pass(comptime Tri: type) type {
+             const n = self.rows;
+             const pairs = n * slots;
+             try self.copy(keep.moe_x, s.mixed, n * dims * 2);
+-            try self.tri.routerMany(s.mixed, lw.router.ptr, s.router_l, dims, n);
+-            try self.tri.topkMany(s.router_l, s.picks, s.wts, n);
++            const plan: cuda.grouped.Plan = .{ .members = s.members, .items = s.items, .counts = s.counts, .rank = s.rank, .hist = s.hist };
++            // TF_FLASHNEXT_ROUTE_FUSED: the same logits, picks, weights, own picks and plan in two launches
++            const routed = if (lw.native_experts) |*native| try route_fused.run(self, native, n, lw.router.ptr, plan) else false;
++            if (!routed) {
++                try self.tri.routerMany(s.mixed, lw.router.ptr, s.router_l, dims, n);
++                try self.tri.topkMany(s.router_l, s.picks, s.wts, n);
++            }
+             try self.copy(keep.moe_ids, s.picks, pairs * 4);
+             try self.copy(keep.moe_wts, s.wts, pairs * 4);
+             const e = experts_n + 1;
+-            const plan: cuda.grouped.Plan = .{ .members = s.members, .items = s.items, .counts = s.counts, .rank = s.rank, .hist = s.hist };
+-            if (lw.native_experts) |*native| return moe_native.run(self, native, n, pairs, plan);
++            if (lw.native_experts) |*native| return moe_native.run(self, native, n, pairs, plan, routed);
+             if (n >= 64) {
+                 // prompt rows on 64-pair factored tiles, expert_rows' bits
+                 try self.k.router.route(self.stream, s.picks, pairs, e, tk.fexp_tile, plan);
+diff --git a/zig/src/families/flashnext/cuda_lanes_load.zig b/zig/src/families/flashnext/cuda_lanes_load.zig
+index 17f37622e..046229d1a 100644
+--- a/zig/src/families/flashnext/cuda_lanes_load.zig
++++ b/zig/src/families/flashnext/cuda_lanes_load.zig
+@@ -43,6 +43,8 @@ pub fn open(comptime F: type, gpa: std.mem.Allocator, io: std.Io, ctx: *const cu
+     const late_fits = world == 1;
+     if (Draft.lateWanted() == true and !late_fits) return error.FlashNextKeepLateUnsupported;
+     Draft.late_on = (Draft.lateWanted() orelse true) and late_fits;
++    // the fused router keeps every bit, so the ranks need not agree on it
++    @import("cuda_route_fused.zig").on = try @import("cuda_route_fused.zig").enabled();
+     // both ranks of --tp 2 must agree on these: the rank identity carries them
+     @import("cuda_moe_hidden_sum.zig").on = try @import("cuda_moe_hidden_sum.zig").enabled();
+     @import("cuda_owner_slots.zig").on = try @import("cuda_owner_slots.zig").enabled();
+diff --git a/zig/src/families/flashnext/cuda_moe_native.zig b/zig/src/families/flashnext/cuda_moe_native.zig
+index 5a13450bd..ab27ba73a 100644
+--- a/zig/src/families/flashnext/cuda_moe_native.zig
++++ b/zig/src/families/flashnext/cuda_moe_native.zig
+@@ -14,13 +14,14 @@ const dims = wt.dims;
+ const slots = wt.slots;
+ 
+ /// moeBlockKeep's native layer: each routed pair's fp32 row into y [pairs, dims], the shared slot's on rank 0.
+-pub fn run(self: anytype, native: *const mixed.Owned, n: usize, pairs: usize, plan: cuda.grouped.Plan) !void {
++pub fn run(self: anytype, native: *const mixed.Owned, n: usize, pairs: usize, plan: cuda.grouped.Plan, routed: bool) !void {
++    // routed: tf_route_topk_plan wrote the own picks and the plan already (cuda_route_fused.zig)
+     const s = self.s;
+     const owned = &native.experts;
+     // the rank's experts and one skip id past them (the shared slot at world 1; every other rank's pick at --tp)
+     const e = owned.count + 1;
+     const skip: i32 = @intCast(owned.count);
+-    const picks = if (native.world == 1) s.picks else try ownPicks(self, s.picks, s.picks_ep, pairs, owned.first, owned.count);
++    const picks = if (native.world == 1) s.picks else if (routed) s.picks_ep else try ownPicks(self, s.picks, s.picks_ep, pairs, owned.first, owned.count);
+     const y_bytes = exchange.clearedRows(native.world, n) * slots * dims * 4;
+     // the hidden-size exchange reads only the slots this rank writes, so it needs no cleared y
+     const hidden = hidden_sum.applies(native.world, native.split_shared);
+@@ -33,12 +34,12 @@ pub fn run(self: anytype, native: *const mixed.Owned, n: usize, pairs: usize, pl
+     switch (owned.format) {
+         .nvfp4 => {
+             const pt = nvfp4_tile.size(self.k, n);
+-            try self.k.router.route(self.stream, picks, pairs, e, pt, plan);
++            if (!routed) try self.k.router.route(self.stream, picks, pairs, e, pt, plan);
+             const items = cuda.grouped.maxItems(pairs, e, pt);
+             try nvfp4_tile.run(self.k, pt, self.stream, .up, .{ .x = s.mixed, .stride = dims, .slots = slots }, owned.view(), plan, s.moe_act, items, skip);
+             try nvfp4_tile.run(self.k, pt, self.stream, .down_f32, .{ .x = s.moe_act, .stride = owned.width }, owned.view(), plan, s.y, items, skip);
+         },
+-        .fp8g => try fp8(self.k, self.stream, picks, s.mixed, owned.view(), plan, pairs, n, s.y, s.moe_act),
++        .fp8g => if (routed) try fp8Planned(self.k, self.stream, s.mixed, owned.view(), plan, pairs, n, s.y, s.moe_act) else try fp8(self.k, self.stream, picks, s.mixed, owned.view(), plan, pairs, n, s.y, s.moe_act),
+         else => return error.UnsupportedQuantization,
+     }
+     if (side != null) try shared.join(self, side, native, n) else try @import("cuda_shared_split.zig").run(self, native, n);
+@@ -69,12 +70,32 @@ fn ownPicks(self: anytype, picks: u64, out: u64, pairs: usize, first: usize, cou
+ 
+ /// Block-FP8 pairs (W8A16) at NVFP4's decode/prompt tile: `act` bf16, `out` fp32; a pick of `layer.experts` is skipped.
+ pub fn fp8(k: *const Kernels, stream: cuda.Stream, picks: u64, x: u64, layer: cuda.experts.Layer, plan: cuda.grouped.Plan, pairs: usize, n: usize, out: u64, act: u64) !void {
++    if (layer.format != .fp8g) return error.UnsupportedQuantization;
++    try k.router.route(stream, picks, pairs, layer.experts + 1, fp8Tile(k, n), plan);
++    return fp8Planned(k, stream, x, layer, plan, pairs, n, out, act);
++}
++
++/// The pairs a block-FP8 item holds at most: the prompt tile from the fact rows, else 16.
++fn fp8Tile(k: *const Kernels, n: usize) usize {
++    return if (nvfp4_tile.size(k, n) != 16) cuda.experts.promptTile(.fp8g) else 16;
++}
++
++/// The tile a native layer's plan groups `n` rows' pairs by, null for a format run refuses.
++pub fn routeTile(k: *const Kernels, owned: anytype, n: usize) ?usize {
++    return switch (owned.format) {
++        .nvfp4 => nvfp4_tile.size(k, n),
++        .fp8g => fp8Tile(k, n),
++        else => null,
++    };
++}
++
++/// fp8 once its plan is in place.
++pub fn fp8Planned(k: *const Kernels, stream: cuda.Stream, x: u64, layer: cuda.experts.Layer, plan: cuda.grouped.Plan, pairs: usize, n: usize, out: u64, act: u64) !void {
+     if (layer.format != .fp8g) return error.UnsupportedQuantization;
+     const e = layer.experts + 1;
+     const skip: i32 = @intCast(layer.experts);
+     const prompt = nvfp4_tile.size(k, n) != 16;
+-    const tile: usize = if (prompt) cuda.experts.promptTile(.fp8g) else 16;
+-    try k.router.route(stream, picks, pairs, e, tile, plan);
++    const tile = fp8Tile(k, n);
+     const items = cuda.grouped.maxItems(pairs, e, tile);
+     try k.fp8.run(stream, .up, .{ .x = x, .stride = layer.dims, .slots = slots }, layer, plan, prompt, act, items, skip);
+     try k.fp8.run(stream, .down_f32, .{ .x = act, .stride = layer.width }, layer, plan, prompt, out, items, skip);
+diff --git a/zig/src/families/flashnext/cuda_route_fused.zig b/zig/src/families/flashnext/cuda_route_fused.zig
+new file mode 100644
+index 000000000..0bb57af0c
+--- /dev/null
++++ b/zig/src/families/flashnext/cuda_route_fused.zig
+@@ -0,0 +1,43 @@
++//! TF_FLASHNEXT_ROUTE_FUSED: a native layer's router in two launches for passes of up to 16 rows, the same bits.
++const cuda = @import("cuda");
++const wt = @import("cuda_prompt_wt.zig");
++const glue_ = @import("cuda_glue.zig");
++const mixed = @import("cuda_mixed_experts.zig");
++const moe_native = @import("cuda_moe_native.zig");
++
++/// TF_FLASHNEXT_ROUTE_FUSED as read at load; off keeps the logits, top-k, own-picks and plan launches.
++pub var on = false;
++
++pub fn enabled() !bool {
++    return @import("sys").environment.read(bool, "TF_FLASHNEXT_ROUTE_FUSED", false);
++}
++
++/// The rows tf_route_logits_few takes, whose tiles the spread logits keep.
++pub const most_rows = 16;
++
++/// Our glue when it owns both router launches (a captured set's would sum otherwise), else null.
++fn ours(t: anytype) ?*const glue_.Glue {
++    if (!@hasField(@TypeOf(t), "own") or !@hasField(@TypeOf(t), "set")) return null;
++    if (t.set == null) return t.own;
++    const g = t.own orelse return null;
++    const bits = glue_.entryBit("_router") | glue_.entryBit("_topk_rows");
++    return if (g.mixed & bits == bits) g else null;
++}
++
++/// Whether a pass of `n` rows takes the fused router: the switch on, few's rows, our glue and a format run plans.
++pub fn takes(t: anytype, k: anytype, native: *const mixed.Owned, n: usize) ?*const glue_.Glue {
++    if (!on or n == 0 or n > most_rows or moe_native.routeTile(k, &native.experts, n) == null) return null;
++    return ours(t);
++}
++
++/// moeBlockKeep's router, top-k, own picks and plan for a native layer: the spread logits, then tf_route_topk_plan.
++pub fn run(self: anytype, native: *const mixed.Owned, n: usize, router_w: u64, plan: cuda.grouped.Plan) !bool {
++    const g = takes(self.tri, self.k, native, n) orelse return false;
++    const s = self.s;
++    const owned = &native.experts;
++    const st = self.tri.s;
++    try g.route.logitsSpread(st, s.mixed, wt.dims, router_w, s.router_l, n, wt.dims, wt.experts_n + 1);
++    const p: cuda.route_rows.RouteRows.Planned = .{ .first = owned.first, .local = if (native.world == 1) null else owned.count, .own = s.picks_ep, .experts = owned.count + 1, .tile = moe_native.routeTile(self.k, owned, n).?, .plan = plan };
++    try g.route.topkPlan(st, s.router_l, wt.experts_n + 1, wt.experts_n, wt.slots - 1, s.picks, s.wts, wt.slots, n, true, p);
++    return true;
++}
+diff --git a/zig/src/platform/environment.zig b/zig/src/platform/environment.zig
+index 27d0de4fc..ad5927139 100644
+--- a/zig/src/platform/environment.zig
++++ b/zig/src/platform/environment.zig
+@@ -212,6 +212,7 @@ pub const rules = [_]Rule{
+     .{ .name = "TF_FLASHNEXT_GDN_SPLIT", .scope = .flashnext, .kind = .flag, .forms = "0 or 1 (default 0)" },
+     .{ .name = "TF_FLASHNEXT_OWNER_SLOTS", .scope = .flashnext, .kind = .flag, .forms = "0 or 1 (default 0)" },
+     .{ .name = "TF_FLASHNEXT_HIDDEN_SUM", .scope = .flashnext, .kind = .flag, .forms = "0 or 1 (default 0)" },
++    .{ .name = "TF_FLASHNEXT_ROUTE_FUSED", .scope = .flashnext, .kind = .flag, .forms = "0 or 1 (default 0)" },
+     .{ .name = "TF_FLASHNEXT_GDN_LANES", .scope = .flashnext, .kind = .flag, .forms = "0 or 1 (default 1)" },
+     .{ .name = "TF_FLASHNEXT_BATCH_HEADS", .scope = .flashnext, .kind = .flag, .forms = "0 or 1 (default 1)" },
+     .{ .name = "TF_FLASHNEXT_SAMPLED_HEADS", .scope = .flashnext, .kind = .flag, .forms = "0 or 1 (default 1)" },
+diff --git a/zig/src/platform/environment_flashnext_test.zig b/zig/src/platform/environment_flashnext_test.zig
+index 8d2f05dd1..02b8cfec3 100644
+--- a/zig/src/platform/environment_flashnext_test.zig
++++ b/zig/src/platform/environment_flashnext_test.zig
+@@ -33,13 +33,13 @@ fn check(name: []const u8, raw: []const u8, valid: bool) !void {
+     try t.expect(std.mem.endsWith(u8, why.?, e.rule(name).forms));
+ }
+ 
+-test "Flash Next strict env: the table holds all 54 settings: 37 switches, 12 integers, 2 reals, 3 structured" {
++test "Flash Next strict env: the table holds all 55 settings: 38 switches, 12 integers, 2 reals, 3 structured" {
+     var counts: [4]usize = @splat(0);
+     for (e.rules) |r| if (r.scope == .flashnext) {
+         try t.expect(std.mem.startsWith(u8, r.name, "TF_FLASHNEXT_"));
+         counts[@backingInt(group(r))] += 1;
+     };
+-    try t.expectEqual([4]usize{ 37, 12, 2, 3 }, counts);
++    try t.expectEqual([4]usize{ 38, 12, 2, 3 }, counts);
+ }
+ 
+ test "Flash Next strict env: unset and blank settings both read as the caller's default" {
+diff --git a/zig/tests/cuda/contract_route_rows.zig b/zig/tests/cuda/contract_route_rows.zig
+index f2189666f..cc62e11e0 100644
+--- a/zig/tests/cuda/contract_route_rows.zig
++++ b/zig/tests/cuda/contract_route_rows.zig
+@@ -10,7 +10,7 @@ const g = contract.gates;
+ const Dense = contract.dense.Dense;
+ const rr = cuda.route_rows;
+ 
+-pub const Kind = enum { logits, few, wide };
++pub const Kind = enum { logits, few, wide, spread };
+ 
+ /// One fp32 MMA chain over the inputs from zero.
+ fn chain(s: c.Shape) usize {
+@@ -25,6 +25,7 @@ pub fn spec(kind: Kind) c.Spec {
+     return switch (kind) {
+         .logits => .{ .name = "cuda route_rows tf_route_logits", .accum = .f32, .depth = chain, .out = .f32, .tiles = .{ .{ .size = 16 }, .{ .size = 32, .step = 1, .min = 1 }, .{ .size = 128, .step = 16, .min = 16 } }, .served = &.{ .{ .rows = 32, .n = fn_e, .k = fn_d }, .{ .rows = 17, .n = fn_e, .k = fn_d }, .{ .rows = 63, .n = fn_e, .k = fn_d } } },
+         .few => .{ .name = "cuda route_rows tf_route_logits_few", .accum = .f32, .depth = chain, .out = .f32, .replaces = "tf_route_logits", .tiles = .{ .{ .size = 16 }, .{ .size = 32, .step = 1, .min = 1 }, .{ .size = 256, .step = 16, .min = 16 } }, .served = &.{ .{ .rows = 16, .n = fn_e, .k = fn_d }, .{ .rows = 1, .n = fn_e, .k = fn_d } } },
++        .spread => .{ .name = "cuda route_rows tf_route_logits_spread", .accum = .f32, .depth = chain, .out = .f32, .replaces = "tf_route_logits", .tiles = .{ .{ .size = 16 }, .{ .size = 8, .step = 1, .min = 1 }, .{ .size = 256, .step = 16, .min = 16 } }, .served = &.{ .{ .rows = 16, .n = fn_e, .k = fn_d }, .{ .rows = 1, .n = fn_e, .k = fn_d } } },
+         .wide => .{ .name = "cuda route_rows tf_route_logits_wide", .accum = .f32, .depth = chain, .out = .f32, .replaces = "tf_route_logits", .tiles = .{ .{ .size = 128 }, .{ .size = 64, .step = 1, .min = 1 }, .{ .size = 64, .step = 16, .min = 16 } }, .served = &.{ .{ .rows = 64, .n = fn_e, .k = fn_d }, .{ .rows = 300, .n = fn_e, .k = fn_d } } },
+     };
+ }
+@@ -94,6 +95,7 @@ pub const Logits = struct {
+         const r = self.route;
+         switch (kind) {
+             .wide => try cuda.launch.launch(r.wide_fn, .{ .grid = .{ .x = @intCast((sh.n + 63) / 64), .y = @intCast((sh.rows + 127) / 128) }, .block = .{ .x = 256 }, .shared = rr.wide_shared }, self.rig.s, &a),
++            .spread => try cuda.launch.launch(r.spread_fn, .{ .grid = .{ .x = @intCast((sh.rows + 15) / 16), .y = @intCast((sh.n + 7) / 8) }, .block = .{ .x = 32 }, .shared = rr.spread_shared }, self.rig.s, &a),
+             .few => try cuda.launch.launch(r.few_fn, .{ .grid = .{ .x = @intCast((sh.rows + 15) / 16), .y = @intCast((sh.n + 31) / 32) }, .block = .{ .x = 128 }, .shared = rr.few_shared }, self.rig.s, &a),
+             .logits => try cuda.launch.launch(r.logits_fn, .{ .grid = .{ .x = @intCast((sh.rows + 15) / 16), .y = @intCast((sh.n + 31) / 32) }, .block = .{ .x = 128 }, .shared = rr.many_shared }, self.rig.s, &a),
+         }
+diff --git a/zig/tests/cuda/contract_tests.zig b/zig/tests/cuda/contract_tests.zig
+index e9317c47b..e948c6965 100644
+--- a/zig/tests/cuda/contract_tests.zig
++++ b/zig/tests/cuda/contract_tests.zig
+@@ -479,7 +479,7 @@ fn registered(gpu: check.Gpu, only: []const []const u8, t0: *i96) !g.Tally {
+     for (&facts) |*m| try kernels.append(a, m.kernel());
+     var route = try cuda.route_rows.RouteRows.load(gpu.d);
+     defer route.unload();
+-    var routes: [3]route_k.Logits = undefined;
++    var routes: [4]route_k.Logits = undefined;
+     for (std.enums.values(route_k.Kind), &routes) |kind, *r| r.* = .{ .rig = .{ .gpu = gpu, .s = s }, .kind = kind, .route = &route };
+     defer for (&routes) |*r| r.deinit();
+     for (&routes) |*r| try kernels.append(a, r.kernel());
+diff --git a/zig/tests/cuda/route_rows_tests.zig b/zig/tests/cuda/route_rows_tests.zig
+index 5cb1795c8..9a4b0114b 100644
+--- a/zig/tests/cuda/route_rows_tests.zig
++++ b/zig/tests/cuda/route_rows_tests.zig
+@@ -83,6 +83,55 @@ fn logits(r: *Rig, g: *const cuda.route_rows.RouteRows, d: usize, e: usize) !voi
+         }
+     }
+     for (counts[0 .. counts.len - 1], 0..) |m, c| try check.sameBytes("route logits rows", std.mem.sliceAsBytes(try r.back(f32, outs[c], m * e)), std.mem.sliceAsBytes(got[0 .. m * e]));
++    // the spread launch: the few-row launch's bytes at every row count it takes
++    for (counts, 0..) |m, c| if (m <= 16) {
++        const o = try r.out(m * e * 4);
++        try g.logitsSpread(r.s, dx, ld, dw, o, m, d, e);
++        try check.sameBytes("route spread logits", std.mem.sliceAsBytes(try r.back(f32, o, m * e)), std.mem.sliceAsBytes(try r.back(f32, outs[c], m * e)));
++    };
++}
++
++/// topkPlan against topk, the rank's own ids on the host and experts.route's plan of them: every byte.
++fn topkPlan(r: *Rig, g: *const cuda.route_rows.RouteRows, router: cuda.grouped.Router) !void {
++    const experts = 512;
++    const k = 10;
++    const ld = experts + 1;
++    const slots = k + 1;
++    const tile = 16;
++    const l = try r.a.alloc(f32, most * ld);
++    for (l) |*v| v.* = (r.rng.float(f32) * 2 - 1) * 4;
++    for (0..experts) |i| l[i] = @floatFromInt(i % 3);
++    const dl = try r.dev(std.mem.sliceAsBytes(l));
++    const cases = [_]struct { first: usize, local: ?usize }{ .{ .first = 0, .local = null }, .{ .first = 0, .local = 256 }, .{ .first = 256, .local = 256 } };
++    for (counts) |m| for (cases) |cs| {
++        const pairs = m * slots;
++        const e = (cs.local orelse experts) + 1;
++        const items = cuda.grouped.maxItems(pairs, e, tile) * 3;
++        var want: [2]cuda.grouped.Plan = undefined;
++        var picks: [2]u64 = undefined;
++        var wts: [2]u64 = undefined;
++        for (&want, &picks, &wts) |*p, *pk, *w| {
++            p.* = .{ .members = try r.out(pairs * 4), .items = try r.out(items * 4), .counts = try r.out(8), .rank = 0, .hist = 0 };
++            pk.* = try r.out(pairs * 4);
++            w.* = try r.out(pairs * 4);
++        }
++        const own = try r.out(pairs * 4);
++        try g.topk(r.s, dl, ld, experts, k, picks[0], wts[0], slots, m, true);
++        const ids = try r.back(i32, picks[0], pairs);
++        if (cs.local) |n| {
++            const lo: i32 = @intCast(cs.first);
++            const count: i32 = @intCast(n);
++            for (ids) |*v| v.* = if (v.* >= lo and v.* < lo + count) v.* - lo else count;
++        }
++        try router.route(r.s, try r.dev(std.mem.sliceAsBytes(ids)), pairs, e, tile, want[0]);
++        try g.topkPlan(r.s, dl, ld, experts, k, picks[1], wts[1], slots, m, true, .{ .first = cs.first, .local = cs.local, .own = own, .experts = e, .tile = tile, .plan = want[1] });
++        try check.sameBytes("route plan picks", std.mem.sliceAsBytes(try r.back(i32, picks[1], pairs)), std.mem.sliceAsBytes(try r.back(i32, picks[0], pairs)));
++        try check.sameBytes("route plan weights", std.mem.sliceAsBytes(try r.back(f32, wts[1], pairs)), std.mem.sliceAsBytes(try r.back(f32, wts[0], pairs)));
++        if (cs.local != null) try check.sameBytes("route plan own picks", std.mem.sliceAsBytes(try r.back(i32, own, pairs)), std.mem.sliceAsBytes(ids));
++        try check.sameBytes("route plan members", std.mem.sliceAsBytes(try r.back(i32, want[1].members, pairs)), std.mem.sliceAsBytes(try r.back(i32, want[0].members, pairs)));
++        try check.sameBytes("route plan items", std.mem.sliceAsBytes(try r.back(i32, want[1].items, items)), std.mem.sliceAsBytes(try r.back(i32, want[0].items, items)));
++        try check.sameBytes("route plan counts", std.mem.sliceAsBytes(try r.back(i32, want[1].counts, 2)), std.mem.sliceAsBytes(try r.back(i32, want[0].counts, 2)));
++    };
+ }
+ 
+ /// Top-k of each row (a row of ties too): the picks the fp64 rule makes, weights and the shared gate within bf16.
+@@ -136,10 +185,13 @@ pub fn run(gpu: check.Gpu) !void {
+     }
+     var g = try cuda.route_rows.RouteRows.load(gpu.d);
+     defer g.unload();
++    var em = try cuda.Module.load(gpu.d, cuda.kernels.experts);
++    defer em.unload();
+     try logits(&r, &g, 2560, 513); // Flash Next: 512 experts and the shared expert's gate row
+     try logits(&r, &g, 2688, 128);
+     try logits(&r, &g, 1040, 37); // a K tail past the staged 256s, and experts past a block
+     try topk(&r, &g, 512, 10, true);
+     try topk(&r, &g, 128, 8, false);
+-    check.pass("route rows: logits and top-k within float64 tolerance (worst {d:.3}), the fp64 rule's picks, every row count's bits equal", .{r.worst});
++    try topkPlan(&r, &g, try cuda.grouped.Router.resolve(em));
++    check.pass("route rows: logits and top-k within float64 tolerance (worst {d:.3}), the fp64 rule's picks, every row count's bits equal, spread logits and fused plan byte-equal", .{r.worst});
+ }
+diff --git a/zig/tests/fixtures/gradient-serving.tsv b/zig/tests/fixtures/gradient-serving.tsv
+index 8e753cda0..abb6b55a9 100644
+--- a/zig/tests/fixtures/gradient-serving.tsv
++++ b/zig/tests/fixtures/gradient-serving.tsv
+@@ -59,7 +59,7 @@ zig/kernels/cuda/qmm_prefill.cu	e3724114b87cae6f6f761b2f86357f05b1693d84a0233e4d
+ zig/kernels/cuda/qmmf.cu	c602528095b4e193ecb6961f518e71f7c6798cd23190d55f731ed7852f4c6c7c	raw	main ec76abd45 (128-row BF16 prompt tile, bytes unchanged), c3acc3466 (K32 staging, bytes unchanged), e32de56c6 (#2721: tf_qmmf_native_fp4_check and the e2m1 pair decode behind -Dnative-fp-decode; default builds byte-identical); dependent decode launches: weights load before griddepcontrol.wait (TF_QMMF_WFIRST), Lane.pdl
+ zig/kernels/cuda/qwen_vision.cu	eeab10300aae424fd957856e4ddba77a3543e9a86bc61701dd09687d7e3b5ea5	raw
+ zig/kernels/cuda/rank_sum.cu	3781c3a4441cfef903c1d0712240ad4d7ab4aaf2d3fb18b323597bcec3587909	raw
+-zig/kernels/cuda/route_rows.cu	a2bf267f360cb57257aaef9765d4dca93f68523338b0881d710bbfcb01917dad	raw
++zig/kernels/cuda/route_rows.cu	dbf52d191ef985c5d9a8e703bfedee3a851d246f9683a31373df20bb3dcbddef	raw
+ zig/kernels/cuda/sample.cu	77858bb2cbebae601044716c6f1857148b8c10cbd627f8b3e13d9ebcbbed9d99	raw	series patches 02-cuda-rounds.patch; HELD: must be re-qualified by the LW device gates on the 1.1.1 candidate
+ zig/kernels/cuda/scan_rows.cu	d1a379a98cf7504a7ed3b3f2d24c8ab6a39fe5511bcded6449e598ce5c3c79e7	raw
+ zig/kernels/cuda/torch_ops/argmax.cu	c87ab27188397298dce89ae80bb524b55a1d5c4f6aaa54627cba01d926da9ecf	raw
+@@ -106,7 +106,7 @@ zig/src/cuda/qlinear.zig	680c653d110b53e52918bb13f7c54c12ffac4097959319281dc7509
+ zig/src/cuda/qmmf.zig	577b24e8dc1a00e975c75075bf9636af55d2614780d05fcb6ed488cc68d37778	raw	main ec76abd45, c3acc3466, fbf8d960d (BF16 prompt tile, Flash Next only), 6a1feb26e (TF_QMMF_HALF_BELOW refused by name); dependent decode launches: weights load before griddepcontrol.wait (TF_QMMF_WFIRST), Lane.pdl
+ zig/src/cuda/rank_scatter.zig	303fd707713af732dd1d31c6a940dd4eeed44e9b26fe202919da5925654fc212	raw
+ zig/src/cuda/root.zig	5dbca351bbf6a42cd83d7b615d4e4624809444d7d2e714b1d71d8eec53c6e606	raw	main 42735f94f0 (#2335: cuda.mla exported)
+-zig/src/cuda/route_rows.zig	e23257dea1f244ebba4399d7bc0730953f75eebbd7789819d5785e88a8907206	raw
++zig/src/cuda/route_rows.zig	1d8f45e9cf363dc87e616ef065519210c4ea89d7c698b55a7715a3874a27ec3b	raw
+ zig/src/cuda/sample.zig	9e3a31bd0480284ff069148b2d3c92f1e2ba24f16c18362dae9de48ec7fc65fe	raw	series patches 02-cuda-rounds.patch; HELD: must be re-qualified by the LW device gates on the 1.1.1 candidate; main 37b0776ce (#2680: adds ruleFor and rule, which reach the same core rule, byte-equal over a 25,480-setting grid; existing code unchanged), #3124
+ zig/src/cuda/segments.zig	8d029a27a7b2a77916c91c9e650cee07c25aec317efacfdb3f8f8967744899a9	raw
+ zig/src/cuda/stream.zig	02c1879e72a35927466ab462d6b2a461691d1f5196da770decd1125db2199fa6	raw	commits e9bf05ffd, ef23b5934; series patches 14-runtime-foundation.patch; HELD: must be re-qualified by the LW device gates on the 1.1.1 candidate
+@@ -131,7 +131,7 @@ zig/src/families/flashnext/cuda_images.zig	5bd8a6c06cb69440522f4392794d9ef52b376
+ zig/src/families/flashnext/cuda_images_test.zig	49d5d97e26b5214ffe3edb12a381c84118a8bf3da255c64be8f711c7da546cc4	raw
+ zig/src/families/flashnext/cuda_lanes.zig	fa002a6c1a43e07bf96d26fd230f4dd2763999e4942402778d00e75d00a1200a	raw	main 4f6017ced (marks inside the pass), fbca90714 (shared solo-chunk rule, #2391), 80e0fd72c (#2753: non-finite draft rows refused by name; finite rows unchanged), dfd9ac5ef4 (#2585: TF_FLASHNEXT_* read through platform/environment.zig, malformed text refused at startup; valid values keep their meaning), #1953: the ladder's values through snap_intermediate, #3308 (loader host test updates the named startup-refusal expectations; no runtime edit to this pinned file); #3135 (kept_disk renamed kept_view for the shared kept image; no served change), this change (the page pool opens with the load's device and io, for its arena mapped as pages are used; a new paged stream's first prompt step waits while the arena's thread maps its pieces; paging off: unchanged); F6: block-FP8 routed experts (Qwen's FP8 release) load a rank's whole experts and are admitted at --tp 2; the NVFP4 and affine paths keep their bytes; opt-in TF_FLASHNEXT_WINDOW_PAD pads a rank-link window; the first copy window keeps 16 rows
+ zig/src/families/flashnext/cuda_lanes_admission_test.zig	0c04ca112ad39d045b320d4c190c4589523fad255ecc2bd0d0cde141ff6dc23f	raw
+-zig/src/families/flashnext/cuda_lanes_load.zig	d93630334feb77b60fba2584b060205a3927918194f9127d985b557552792f4d	raw	main dfd9ac5ef4 (#2585: TF_FLASHNEXT_* read through platform/environment.zig, malformed text refused at startup; valid values keep their meaning), #3467: after load a shard drops its page cache except the n-gram ranges, and the sweep reaches nested shards; tensors and replies are unchanged, this change (the load's device and io handed to the page pool's arena; paging off: unchanged); opt-in TF_FLASHNEXT_DECODE_GRAPH no longer refused with the dense split; default serving unchanged; #2972: the first collective waits up to 10 minutes for the peer's load, and a peer that leaves ends the wait within seconds; F6: block-FP8 routed experts (Qwen's FP8 release) load a rank's whole experts and are admitted at --tp 2; the NVFP4 and affine paths keep their bytes; opt-in TF_FLASHNEXT_TP_WINDOW_GRAPH: --tp 2 verify windows as graphs, the peer epoch on the device; default serving unchanged
++zig/src/families/flashnext/cuda_lanes_load.zig	23fe06051cf81d61d6265d895ce4d162405a8e5407375c1f43d7a498230c621e	raw	main dfd9ac5ef4 (#2585: TF_FLASHNEXT_* read through platform/environment.zig, malformed text refused at startup; valid values keep their meaning), #3467: after load a shard drops its page cache except the n-gram ranges, and the sweep reaches nested shards; tensors and replies are unchanged, this change (the load's device and io handed to the page pool's arena; paging off: unchanged); opt-in TF_FLASHNEXT_DECODE_GRAPH no longer refused with the dense split; default serving unchanged; #2972: the first collective waits up to 10 minutes for the peer's load, and a peer that leaves ends the wait within seconds; F6: block-FP8 routed experts (Qwen's FP8 release) load a rank's whole experts and are admitted at --tp 2; the NVFP4 and affine paths keep their bytes; opt-in TF_FLASHNEXT_TP_WINDOW_GRAPH: --tp 2 verify windows as graphs, the peer epoch on the device; default serving unchanged
+ zig/src/families/flashnext/cuda_lanes_restore_test.zig	5d0ef1cac8d8704676505e50a7e46cc82a71803aadf7018d3da2136fdc71759c	raw	its rig names the collective's parent communicator; test only
+ zig/src/families/flashnext/cuda_launch.zig	12b9ba75f979f431d2e306e9e3cd636893760a6b69da7f6e379c4764cf681ce9	raw	exports cuda_moe_exchange.zig for its device test; no served change; #2837 (Flash Next TP=2 graph replay); its test block reaches cuda_collective.zig's host tests, no served change; #3413 exports cuda_tiles.zig and readout_fused.zig for their tests
+ zig/src/families/flashnext/cuda_media.zig	394601e8a807f5516f501efcaefa6fb3308f392ee322db7296b11c90814f8eea	raw
+-- 
+2.56.0
+

@@ -1,0 +1,212 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jay Leaton <58495321+jayleaton@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 01:10:17 +0700
+Subject: [PATCH 58/76] flashnext cuda: a pipeline stage's sequences hold only
+ its own layers' state
+
+A stage's sequence allocated every layer's DeltaNet state and attention
+caches, so --pp 2 needed a whole model's stream bytes on each rank and
+refused --parallel 16 at a 139,264-token window. Each entry for another
+stage's layer is now empty, keeping the arrays' indexing, and the budget
+counts a stage's stream bytes from its own layers.
+---
+ zig/src/families/flashnext/cuda_kv_host.zig   |  4 +-
+ .../families/flashnext/cuda_lanes_load.zig    |  2 +-
+ zig/src/families/flashnext/cuda_prompt.zig    | 11 ++--
+ zig/src/families/flashnext/cuda_seq_bytes.zig |  8 +++
+ .../cuda_sequence_completion_test.zig         |  3 ++
+ zig/src/families/flashnext/cuda_span.zig      | 51 +++++++++++++++++++
+ 6 files changed, 70 insertions(+), 9 deletions(-)
+
+diff --git a/zig/src/families/flashnext/cuda_kv_host.zig b/zig/src/families/flashnext/cuda_kv_host.zig
+index d62436ea2..b70f976a8 100644
+--- a/zig/src/families/flashnext/cuda_kv_host.zig
++++ b/zig/src/families/flashnext/cuda_kv_host.zig
+@@ -57,8 +57,8 @@ pub fn placeKv(e: *prompt.Engine, seq: *prompt.Seq) !void {
+         seq.kv_host = host;
+         return;
+     }
+-    seq.kc = try prompt.zeros(e.gpa, e.driver, e.stream.*, wt.attn_n, sizes.kvBytes(seq.cap, e.heads));
+-    seq.vc = try prompt.zeros(e.gpa, e.driver, e.stream.*, wt.attn_n, sizes.kvBytes(seq.cap, e.heads));
++    seq.kc = try e.span.zeros(e.gpa, e.driver, e.stream.*, .attn, sizes.kvBytes(seq.cap, e.heads));
++    seq.vc = try e.span.zeros(e.gpa, e.driver, e.stream.*, .attn, sizes.kvBytes(seq.cap, e.heads));
+     if (mode == .overflow) spent += kvBytes(seq.cap, e.heads);
+ }
+ 
+diff --git a/zig/src/families/flashnext/cuda_lanes_load.zig b/zig/src/families/flashnext/cuda_lanes_load.zig
+index c43cb409a..2e912cae7 100644
+--- a/zig/src/families/flashnext/cuda_lanes_load.zig
++++ b/zig/src/families/flashnext/cuda_lanes_load.zig
+@@ -125,7 +125,7 @@ pub fn open(comptime F: type, gpa: std.mem.Allocator, io: std.Io, ctx: *const cu
+     own.lanes = .empty;
+     own.next = 0;
+     if (o.slide) own.lay = try @import("cuda_slide.zig").layoutOf(gpa, io, dir);
+-    const own_seq_bytes = try prompt.seqBytesPaged(window, try @import("cuda_pages.zig").pageTest(), own.engine.heads);
++    const own_seq_bytes = if (o.pp != 1) @import("cuda_seq_bytes.zig").stageBytes(window, own.engine.heads, span) else try prompt.seqBytesPaged(window, try @import("cuda_pages.zig").pageTest(), own.engine.heads);
+     var stream_bytes = own_seq_bytes;
+     if (own.head) |h| {
+         stream_bytes += mtp.Draft.bytes(window, h.ids.len, own.engine.chunk, own.engine.heads);
+diff --git a/zig/src/families/flashnext/cuda_prompt.zig b/zig/src/families/flashnext/cuda_prompt.zig
+index 81a59bef8..157d67339 100644
+--- a/zig/src/families/flashnext/cuda_prompt.zig
++++ b/zig/src/families/flashnext/cuda_prompt.zig
+@@ -10,8 +10,6 @@ const fb = @import("cuda_fn_back.zig");
+ const pocket = @import("cuda_pocket.zig");
+ const chunks = @import("cuda_chunk.zig");
+ const layers_n = weights.layers_n;
+-const linear_n = weights.linear_n;
+-const attn_n = weights.attn_n;
+ const dims = weights.dims;
+ const streams = weights.streams;
+ const wide = weights.wide;
+@@ -344,11 +342,12 @@ pub const Engine = struct {
+         // One rollback owns every published array, and drains before releasing any destination.
+         errdefer seq.deinit(e.gpa);
+         seq.logits = try e.gpa.alloc(u8, vocab * 2);
+-        seq.conv = try zeros(e.gpa, e.driver, e.stream.*, linear_n, sizes.convBytes(e.heads));
+-        seq.state = try zeros(e.gpa, e.driver, e.stream.*, linear_n, sizes.stateBytes(e.heads));
++        const sp = e.span;
++        seq.conv = try sp.zeros(e.gpa, e.driver, e.stream.*, .linear, sizes.convBytes(e.heads));
++        seq.state = try sp.zeros(e.gpa, e.driver, e.stream.*, .linear, sizes.stateBytes(e.heads));
+         try @import("cuda_kv_host.zig").placeKv(e, &seq);
+-        seq.ikc = if (seq.paged) |*p| try p.views(e.gpa, e.driver, .index) else try zeros(e.gpa, e.driver, e.stream.*, attn_n, sizes.indexBytes(cap));
+-        seq.pooled = if (seq.paged) |*p| try p.views(e.gpa, e.driver, .pooled) else try zeros(e.gpa, e.driver, e.stream.*, attn_n, pooledBytes(cap));
++        seq.ikc = if (seq.paged) |*p| try p.views(e.gpa, e.driver, .index) else try sp.zeros(e.gpa, e.driver, e.stream.*, .attn, sizes.indexBytes(cap));
++        seq.pooled = if (seq.paged) |*p| try p.views(e.gpa, e.driver, .pooled) else try sp.zeros(e.gpa, e.driver, e.stream.*, .attn, pooledBytes(cap));
+         seq.tail = try cuda.DeviceBuffer.alloc(e.driver, ple_tail_n * wide * 2);
+         try seq.tail.fill8(0, e.stream.handle);
+         return seq;
+diff --git a/zig/src/families/flashnext/cuda_seq_bytes.zig b/zig/src/families/flashnext/cuda_seq_bytes.zig
+index 323cb3bed..c086a0ad2 100644
+--- a/zig/src/families/flashnext/cuda_seq_bytes.zig
++++ b/zig/src/families/flashnext/cuda_seq_bytes.zig
+@@ -4,6 +4,7 @@ const wt = @import("cuda_prompt_wt.zig");
+ const gdn = @import("cuda_gdn.zig");
+ const pages = @import("cuda_pages.zig");
+ const Heads = @import("cuda_heads.zig").Heads;
++const Span = @import("cuda_span.zig").Span;
+ 
+ const linear_n = wt.linear_n;
+ const attn_n = wt.attn_n;
+@@ -46,6 +47,13 @@ pub fn seqBytes(cap: usize, h: Heads) usize {
+     return linear + attnBytes(cap, h) + wt.ple_tail_n * wt.wide * 2;
+ }
+ 
++/// Device bytes a pipeline stage's `newSeq(cap)` allocates: its own layers' states and caches, the n-gram tail.
++pub fn stageBytes(cap: usize, h: Heads, span: Span) usize {
++    const linear = span.held(.linear) * (convBytes(h) + stateBytes(h));
++    const attn = span.held(.attn) * (2 * kvBytes(cap, h) + indexBytes(cap) + pooledBytes(cap));
++    return linear + attn + wt.ple_tail_n * wt.wide * 2;
++}
++
+ /// Contiguous storage or the page diagnostic's rounded arena and table, with every live allocation priced.
+ pub fn seqBytesPaged(cap: usize, tokens: usize, h: Heads) !usize {
+     if (cap == 0 or cap > max_tokens) return error.BadFlashNextPageTest;
+diff --git a/zig/src/families/flashnext/cuda_sequence_completion_test.zig b/zig/src/families/flashnext/cuda_sequence_completion_test.zig
+index 90d1a1bcf..4a3bc87c5 100644
+--- a/zig/src/families/flashnext/cuda_sequence_completion_test.zig
++++ b/zig/src/families/flashnext/cuda_sequence_completion_test.zig
+@@ -99,6 +99,7 @@ test "Flash Next completion: allocation refusals drain fills before every constr
+         e.eos = 1;
+         e.round_graph = .{};
+         e.heads = .full;
++        e.span = .whole;
+         try t.expectError(error.OutOfDeviceMemory, e.newSeq(4));
+         _ = try cuda.memory.setAllocationLimit(null);
+         try t.expectEqual(deny, Fake.allocations);
+@@ -121,6 +122,7 @@ test "Flash Next completion: failed asynchronous fill and an interrupted prefill
+         e.eos = 1;
+         e.round_graph = .{};
+         e.heads = .full;
++        e.span = .whole;
+         try t.expectError(error.NotReady, e.newSeq(4));
+         try t.expectEqual(Fake.allocations, Fake.frees);
+         if (Fake.early != 0) std.log.warn("completion control: allocs={d}, fills={d}, frees={d}, syncs={d}", .{ Fake.allocations, Fake.fills, Fake.frees, Fake.syncs });
+@@ -135,6 +137,7 @@ test "Flash Next completion: failed asynchronous fill and an interrupted prefill
+     e.eos = 1;
+     e.round_graph = .{};
+     e.heads = .full;
++    e.span = .whole;
+     var seq = try e.newSeq(4);
+     // Model a queued prefill kernel writing every owned sequence buffer before request refusal.
+     for (Fake.pending[1 .. Fake.allocations + 1]) |*pending| pending.* = true;
+diff --git a/zig/src/families/flashnext/cuda_span.zig b/zig/src/families/flashnext/cuda_span.zig
+index 45ffafba2..40e02aac2 100644
+--- a/zig/src/families/flashnext/cuda_span.zig
++++ b/zig/src/families/flashnext/cuda_span.zig
+@@ -1,7 +1,23 @@
+ //! A pipeline stage's layers [first, end) of the model; the stage holding layer 0 also embeds and runs the head.
+ const std = @import("std");
++const cuda = @import("cuda");
+ const wt = @import("cuda_prompt_wt.zig");
+ 
++/// A sequence's per-layer state arrays, each indexed by its own layer count (wt.linearIndex, wt.attnIndex).
++pub const Kind = enum {
++    linear,
++    attn,
++
++    pub fn count(k: Kind) usize {
++        return if (k == .linear) wt.linear_n else wt.attn_n;
++    }
++
++    /// The decoder layer of entry `i`: linear layers fill three of every four, attention the fourth.
++    pub fn layer(k: Kind, i: usize) usize {
++        return if (k == .linear) i + i / 3 else 4 * i + 3;
++    }
++};
++
+ pub const Span = struct {
+     first: usize = 0,
+     end: usize = wt.layers_n,
+@@ -40,6 +56,30 @@ pub const Span = struct {
+         return s.owns(layerOf(name) orelse return true);
+     }
+ 
++    /// Entries of a kind this stage holds.
++    pub fn held(s: Span, k: Kind) usize {
++        var n: usize = 0;
++        for (0..k.count()) |i| n += @intFromBool(s.owns(k.layer(i)));
++        return n;
++    }
++
++    /// One zeroed device buffer per entry of `k`: `len` bytes for this stage's own layers, none for the others'.
++    pub fn zeros(s: Span, gpa: std.mem.Allocator, driver: *cuda.Driver, stream: cuda.Stream, k: Kind, len: usize) ![]cuda.DeviceBuffer {
++        const out = try gpa.alloc(cuda.DeviceBuffer, k.count());
++        var made: usize = 0;
++        errdefer {
++            cuda.completion.drain(driver, stream, "Flash Next stage sequence fills did not drain before rollback");
++            for (out[0..made]) |*b| b.free();
++            gpa.free(out);
++        }
++        for (out, 0..) |*b, i| {
++            b.* = try cuda.DeviceBuffer.alloc(driver, if (s.owns(k.layer(i))) len else 0);
++            made += 1;
++            try b.fill8(0, stream.handle);
++        }
++        return out;
++    }
++
+     /// Rank `rank`'s layers at `stages` pipeline stages (1: the whole model), split at TF_FLASHNEXT_PP_SPLIT.
+     pub fn ofPlacement(stages: usize, rank: usize) !Span {
+         if (stages == 1) return .whole;
+@@ -91,6 +131,17 @@ test "a stage keeps its own layers' tensors and every tensor outside the decoder
+     try std.testing.expectError(error.FlashNextStagesOverTwo, Span.ofPlacement(3, 0));
+ }
+ 
++test "a stage holds its own layers' state entries, every entry once across the two" {
++    for (0..wt.linear_n) |i| try std.testing.expectEqual(i, wt.linearIndex(Kind.linear.layer(i)));
++    for (0..wt.attn_n) |i| try std.testing.expectEqual(i, wt.attnIndex(Kind.attn.layer(i)));
++    const a = try Span.ofRank(24, 0);
++    const b = try Span.ofRank(24, 1);
++    try std.testing.expectEqual(@as(usize, 18), a.held(.linear));
++    try std.testing.expectEqual(@as(usize, 6), b.held(.attn));
++    try std.testing.expectEqual(wt.linear_n, (try Span.ofRank(7, 0)).held(.linear) + (try Span.ofRank(7, 1)).held(.linear));
++    try std.testing.expectEqual(wt.attn_n, Span.whole.held(.attn));
++}
++
+ test "linear layers skip every fourth index and attention starts at 3" {
+     try std.testing.expect(wt.linearLayer(0));
+     try std.testing.expect(!wt.linearLayer(3));
+-- 
+2.56.0
+

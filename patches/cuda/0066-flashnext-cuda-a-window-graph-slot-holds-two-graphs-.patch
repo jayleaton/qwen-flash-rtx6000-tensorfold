@@ -1,0 +1,180 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jay Leaton <58495321+jayleaton@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 01:47:00 +0700
+Subject: [PATCH 66/76] flashnext cuda: a window graph slot holds two graphs,
+ so a kept window's swapped states replay instead of re-recording
+
+---
+ .../flashnext/cuda_mtp_graphs_test.zig        | 22 +++++++---
+ .../families/flashnext/cuda_window_graph.zig  | 42 +++++++++++++------
+ .../flashnext/cuda_window_graph_test.zig      | 22 +++++-----
+ 3 files changed, 58 insertions(+), 28 deletions(-)
+
+diff --git a/zig/src/families/flashnext/cuda_mtp_graphs_test.zig b/zig/src/families/flashnext/cuda_mtp_graphs_test.zig
+index 7cdd418be..76ff097f2 100644
+--- a/zig/src/families/flashnext/cuda_mtp_graphs_test.zig
++++ b/zig/src/families/flashnext/cuda_mtp_graphs_test.zig
+@@ -221,7 +221,7 @@ test "rank graphs: a group of heads with a collective attached runs as its graph
+     try t.expectEqual([5]usize{ 1, 0, 1, 1, 2 }, counts(e.graphs.head_many));
+ }
+ 
+-test "rank graphs: a rollback with a collective attached runs as its graph; swapped states update it in place" {
++test "rank graphs: a rollback with a collective attached runs as its graph; swapped states replay their own graph" {
+     var r: Rig = undefined;
+     r.init();
+     defer r.restore();
+@@ -232,10 +232,22 @@ test "rank graphs: a rollback with a collective attached runs as its graph; swap
+     const d: Draft = .{};
+     for (0..3) |_| try roll.graphed(&e, &s, &q, &d, 2, Replay{});
+     try t.expectEqual([5]usize{ 1, 0, 1, 1, 2 }, counts(e.graphs.rollback));
+-    // the round's verify swapped every state with the draft's spare (Draft.settle): the held graph takes them
+-    for (&q.state, 0..) |*b, i| b.ptr = 0x9000_0000 + i * 0x10000;
+-    for (0..2) |_| try roll.graphed(&e, &s, &q, &d, 2, Replay{});
+-    try t.expectEqual([5]usize{ 1, 1, 2, 1, 4 }, counts(e.graphs.rollback));
++    // each kept round swaps every state with the draft's spare (Draft.settle): the slot's two ways replay in turn
++    const own = q.state;
++    var spare = q.state;
++    for (&spare, 0..) |*b, i| b.ptr = 0x9000_0000 + i * 0x10000;
++    for (0..8) |round| {
++        q.state = if (round % 2 == 0) spare else own;
++        try roll.graphed(&e, &s, &q, &d, 2, Replay{});
++    }
++    try t.expectEqual([5]usize{ 2, 0, 8, 1, 10 }, counts(e.graphs.rollback));
++    // a new sequence on the same slot: each way recorded again and updated in place, then replayed
++    q.gen += 1;
++    for (0..4) |round| {
++        q.state = if (round % 2 == 0) spare else own;
++        try roll.graphed(&e, &s, &q, &d, 2, Replay{});
++    }
++    try t.expectEqual([5]usize{ 2, 2, 10, 1, 14 }, counts(e.graphs.rollback));
+ }
+ 
+ fn headKey(d: Draft, rows: usize, last: bool, scores: bool, input: u64, s: parts.Scratch, score_rows: u64) wg.HeadKey {
+diff --git a/zig/src/families/flashnext/cuda_window_graph.zig b/zig/src/families/flashnext/cuda_window_graph.zig
+index 12faa5467..48c348f9c 100644
+--- a/zig/src/families/flashnext/cuda_window_graph.zig
++++ b/zig/src/families/flashnext/cuda_window_graph.zig
+@@ -216,9 +216,11 @@ pub fn slotOf(key: anytype) @TypeOf(key) {
+ pub fn Cache(comptime K: type) type {
+     return struct {
+         const Self = @This();
+-        /// A held graph and the whole key it was last recorded for; the map holds it under its slot (slotOf).
++        /// A held graph and the whole key it was last recorded for.
+         const Held = struct { key: K, exec: cuda.graph.Exec };
+-        map: std.AutoHashMapUnmanaged(K, Held) = .empty,
++        /// A slot's two graphs, as Draft.settle swaps a sequence's states between two sets; `last`: the way run last.
++        const Ways = struct { ways: [2]?Held = .{ null, null }, last: u1 = 0 };
++        map: std.AutoHashMapUnmanaged(K, Ways) = .empty,
+         /// Slots run once eagerly and are captured the second time (a one-off pass would never pay its capture back).
+         seen: std.AutoHashMapUnmanaged(K, void) = .empty,
+         captures: u64 = 0,
+@@ -230,7 +232,7 @@ pub fn Cache(comptime K: type) type {
+ 
+         pub fn clear(c: *Self, gpa: std.mem.Allocator) void {
+             var it = c.map.valueIterator();
+-            while (it.next()) |h| h.exec.deinit();
++            while (it.next()) |w| for (&w.ways) |*h| if (h.*) |*held| held.exec.deinit();
+             c.map.clearAndFree(gpa);
+             c.seen.clearAndFree(gpa);
+         }
+@@ -239,16 +241,26 @@ pub fn Cache(comptime K: type) type {
+         pub fn run(c: *Self, gpa: std.mem.Allocator, stream: cuda.Stream, key: K, pass: anytype) !void {
+             if (c.off) return pass.run();
+             const slot = slotOf(key);
+-            if (c.map.getPtr(slot)) |h| {
+-                if (std.meta.eql(h.key, key)) {
++            if (c.map.getPtr(slot)) |w| {
++                for (&w.ways, 0..) |*h, i| if (h.*) |*held| if (std.meta.eql(held.key, key)) {
+                     c.replays += 1;
+-                    return h.exec.launchOn(stream);
++                    w.last = @intCast(i);
++                    if (c.replays % 4096 == 0) c.report();
++                    return held.exec.launchOn(stream);
++                };
++                // other buffers on this slot: the way not run last captured, or recorded again and updated in place
++                const i = ~w.last;
++                w.last = i;
++                if (w.ways[i]) |*held| {
++                    refresh(stream, pass, &held.exec) catch |err| return c.fail(err, pass);
++                    held.key = key;
++                    c.updates += 1;
++                    return held.exec.launchOn(stream);
+                 }
+-                // the same pass at another length, sequence or lane: recorded again, the held graph updated in place
+-                refresh(stream, pass, &h.exec) catch |err| return c.fail(err, pass);
+-                h.key = key;
+-                c.updates += 1;
+-                return h.exec.launchOn(stream);
++                const exec = capture(stream, pass) catch |err| return c.fail(err, pass);
++                w.ways[i] = .{ .key = key, .exec = exec };
++                c.captures += 1;
++                return w.ways[i].?.exec.launchOn(stream);
+             }
+             if (c.map.count() >= max_graphs or c.seen.count() >= 4 * max_graphs) c.clear(gpa);
+             if (!c.seen.contains(slot)) {
+@@ -257,12 +269,16 @@ pub fn Cache(comptime K: type) type {
+             }
+             var exec = capture(stream, pass) catch |err| return c.fail(err, pass);
+             errdefer exec.deinit();
+-            try c.map.put(gpa, slot, .{ .key = key, .exec = exec });
++            try c.map.put(gpa, slot, .{ .ways = .{ .{ .key = key, .exec = exec }, null } });
+             c.captures += 1;
+-            if (c.captures % 64 == 1) std.log.info("{s} graphs: {d} captured, {d} updated, {d} replayed, {d} held", .{ @typeName(K), c.captures, c.updates, c.replays, c.map.count() });
++            if (c.captures % 64 == 1) c.report();
+             try exec.launchOn(stream);
+         }
+ 
++        fn report(c: *const Self) void {
++            std.log.info("{s} graphs: {d} captured, {d} updated, {d} replayed, {d} slots", .{ @typeName(K), c.captures, c.updates, c.replays, c.map.count() });
++        }
++
+         /// The stream is out of capture again: this pass eagerly, and the ones after it.
+         fn fail(c: *Self, err: anyerror, pass: anytype) !void {
+             std.log.warn("{s} graphs off: capture failed ({s}), eager from here", .{ @typeName(K), @errorName(err) });
+diff --git a/zig/src/families/flashnext/cuda_window_graph_test.zig b/zig/src/families/flashnext/cuda_window_graph_test.zig
+index cdfb06c4d..54a09d7cc 100644
+--- a/zig/src/families/flashnext/cuda_window_graph_test.zig
++++ b/zig/src/families/flashnext/cuda_window_graph_test.zig
+@@ -73,7 +73,7 @@ fn expectAfter(c: *wg.Cache(wg.Key), stream: cuda.Stream, k: wg.Key, counts: [5]
+     try t.expectEqual(counts, [5]usize{ Fake.records, Fake.instantiates, Fake.updates, Fake.eager, Fake.launches });
+ }
+ 
+-test "window graphs: a held graph takes a new length or sequence in place; new launches get a new executable" {
++test "window graphs: a slot holds two graphs, the one run less recently updated in place; new launches get a new executable" {
+     var d: cuda.Driver = undefined;
+     d.api.cuStreamBeginCapture_v2 = Fake.begin;
+     d.api.cuStreamEndCapture = Fake.end;
+@@ -93,19 +93,21 @@ test "window graphs: a held graph takes a new length or sequence in place; new l
+     try expectAfter(&c, stream, key(1, 3, 7), .{ 0, 0, 0, 1, 0 }); // a new slot runs eagerly once
+     try expectAfter(&c, stream, key(1, 3, 7), .{ 1, 1, 0, 1, 1 }); // then is captured
+     try expectAfter(&c, stream, key(1, 3, 7), .{ 1, 1, 0, 1, 2 }); // and replayed
+-    try expectAfter(&c, stream, key(2, 3, 7), .{ 2, 1, 1, 1, 3 }); // new values (a length, a request, a lane): updated
+-    try expectAfter(&c, stream, key(3, 3, 7), .{ 3, 1, 2, 1, 4 });
+-    try expectAfter(&c, stream, key(3, 3, 7), .{ 3, 1, 2, 1, 5 });
++    try expectAfter(&c, stream, key(2, 3, 7), .{ 2, 2, 0, 1, 3 }); // other buffers (a kept window's swap): the second way
++    try expectAfter(&c, stream, key(1, 3, 7), .{ 2, 2, 0, 1, 4 }); // and back: each replays
++    try expectAfter(&c, stream, key(2, 3, 7), .{ 2, 2, 0, 1, 5 });
++    try expectAfter(&c, stream, key(3, 3, 7), .{ 3, 2, 1, 1, 6 }); // new values (a length, a request): the older way updated
++    try expectAfter(&c, stream, key(2, 3, 7), .{ 3, 2, 1, 1, 7 });
+     Fake.verdict = .topology_changed;
+-    try expectAfter(&c, stream, key(4, 3, 7), .{ 4, 2, 3, 1, 6 }); // other launches: a new executable, the old freed
++    try expectAfter(&c, stream, key(4, 3, 7), .{ 4, 3, 2, 1, 8 }); // other launches: a new executable, the old freed
+     try t.expectEqual(@as(usize, 1), Fake.destroyed);
+     Fake.verdict = .success;
+-    try expectAfter(&c, stream, key(4, 3, 7), .{ 4, 2, 3, 1, 7 });
+-    try expectAfter(&c, stream, key(4, 4, 7), .{ 4, 2, 3, 2, 7 }); // another row count is another slot
+-    try expectAfter(&c, stream, key(4, 3, 8), .{ 4, 2, 3, 3, 7 }); // and another shape
+-    try t.expectEqual([3]u64{ 1, 3, 3 }, [3]u64{ c.captures, c.updates, c.replays });
++    try expectAfter(&c, stream, key(4, 3, 7), .{ 4, 3, 2, 1, 9 });
++    try expectAfter(&c, stream, key(4, 4, 7), .{ 4, 3, 2, 2, 9 }); // another row count is another slot
++    try expectAfter(&c, stream, key(4, 3, 8), .{ 4, 3, 2, 3, 9 }); // and another shape
++    try t.expectEqual([3]u64{ 2, 2, 5 }, [3]u64{ c.captures, c.updates, c.replays });
+     c.clear(t.allocator);
+-    try t.expectEqual(@as(usize, 2), Fake.destroyed);
++    try t.expectEqual(@as(usize, 3), Fake.destroyed);
+ }
+ 
+ const Buf = struct { ptr: u64 };
+-- 
+2.56.0
+

@@ -1,0 +1,169 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jay Leaton <58495321+jayleaton@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 09:47:21 +0700
+Subject: [PATCH 67/76] flashnext cuda: draft chains of up to 24
+ (TF_FLASHNEXT_DRAFTS_GREEDY), and TF_FLASHNEXT_WINDOW_PAD pads a rank-link
+ window to one width
+
+---
+ docs/environment.md                             |  5 +++--
+ zig/src/families/flashnext/cuda_lanes.zig       |  8 ++++----
+ zig/src/families/flashnext/cuda_mtp.zig         | 16 ++++++++++++++--
+ zig/src/platform/environment.zig                |  5 +++--
+ zig/src/platform/environment_flashnext_test.zig |  4 ++--
+ zig/tests/fixtures/gradient-serving.tsv         |  4 ++--
+ 6 files changed, 28 insertions(+), 14 deletions(-)
+
+diff --git a/docs/environment.md b/docs/environment.md
+index f247955b5..818aaf5fb 100644
+--- a/docs/environment.md
++++ b/docs/environment.md
+@@ -161,11 +161,12 @@ stops the start with the variable, the supplied text and the accepted forms.
+ | `TF_FLASHNEXT_TABLE_WARM` | Exactly `0` or `1`; default off |
+ | `TF_FLASHNEXT_PROFILE` | Exactly `0` or `1`; default off |
+ | `TF_FLASHNEXT_VERIFY_HOST_LOGITS` | Exactly `0` or `1`; default off |
+-| `TF_FLASHNEXT_DRAFTS` | Whole draft count; default 6, then clamped to 1 through 15 |
+-| `TF_FLASHNEXT_DRAFTS_GREEDY` | Whole draft count; default 8, then clamped to 1 through 15 |
++| `TF_FLASHNEXT_DRAFTS` | Whole draft count; default 6, then clamped to 1 through 24 |
++| `TF_FLASHNEXT_DRAFTS_GREEDY` | Whole draft count; default 8, then clamped to 1 through 24 |
+ | `TF_FLASHNEXT_GREEDY_WIDE` | Whole round width; default 4 |
+ | `TF_FLASHNEXT_WINDOW_ROWS` | Whole row count; default the shared round's rows, capped by them |
+ | `TF_FLASHNEXT_SPLIT_ROWS` | Whole row count; `0` or unset takes the link's default (64, the shared round's rows). At `--tp 2`, a pass of more rows than this reduce-scatters its experts' rows and gathers the sums instead of one all-reduce. Give every rank the same value. |
++| `TF_FLASHNEXT_WINDOW_PAD` | Whole row count; default `0`, off. At `--tp 2` or `--pp 2`, a lone stream's verify window of fewer rows runs with its last token repeated up to this many (at most 32), so its window graphs see one width; the extra rows are never kept and the tokens are unchanged. |
+ | `TF_FLASHNEXT_PP_WINDOW_GRAPH` | Exactly `0` or `1`; default off. `1`: at `--pp 2` each stage's verify windows run as CUDA graphs with their hop captured, whatever `TF_FLASHNEXT_WINDOW_GRAPH` says; the draft head's graphs still follow `TF_FLASHNEXT_WINDOW_GRAPH`. Same kernels and bits as the eager pass. Give every rank the same value. |
+ | `TF_FLASHNEXT_TP_WINDOW_GRAPH` | Exactly `0` or `1`; default off. `1`: at `--tp 2` the drafted verify windows run as CUDA graphs on both ranks with their collectives captured, whatever `TF_FLASHNEXT_WINDOW_GRAPH` says; `TF_FLASHNEXT_PEER_SLOTS`' epoch moves to the device so a replay advances it. Same kernels and bits as the eager pass. Give every rank the same value. |
+ | `TF_FLASHNEXT_PEER_SLOTS` | Exactly `0` or `1`; default off. At `--tp 2` on one host, a pass of up to 128 rows exchanges its MoE slots by writing each rank's own experts' rows (and its half of the shared expert's) into the peer's mapped buffer, about half the bytes of the all-reduce or reduce-scatter, with the same sums. Refused across hosts and with `TF_FLASHNEXT_DECODE_GRAPH`. Give every rank the same value. |
+diff --git a/zig/src/families/flashnext/cuda_lanes.zig b/zig/src/families/flashnext/cuda_lanes.zig
+index 16a6499d3..e5c08ba65 100644
+--- a/zig/src/families/flashnext/cuda_lanes.zig
++++ b/zig/src/families/flashnext/cuda_lanes.zig
+@@ -196,8 +196,8 @@ pub fn Namespace(comptime Tri: type) type {
+             }
+ 
+             fn mainVerify(ptr: *anyopaque, q: *prompt.Seq, d: *mtp.Draft, ids: []const u32) anyerror!void {
+-                const self = of(ptr);
+-                return self.ranks.?.verify(Tri, self.tri(), q, d, ids);
++                var wide: [mtp.max_rows]u32 = undefined;
++                return of(ptr).ranks.?.verify(Tri, of(ptr).tri(), q, d, mtp.padded(&wide, ids, q.fed, q.cap));
+             }
+ 
+             fn mainRollback(ptr: *anyopaque, q: *prompt.Seq, d: *mtp.Draft, keep: usize) anyerror!void {
+@@ -226,12 +226,12 @@ pub fn Namespace(comptime Tri: type) type {
+                 return .{ .ptr = self, .proposal_head = if (self.head) |h| &h.service else null, .first_before_draft = mtp.firstEarly(), .vtable = if (self.ranks == null) &scoring_table else &ranked_table };
+             }
+ 
+-            /// With the head: chains of up to 16 rows cut by its confidence, copies of up to 32; else one-row rounds.
++            /// With the head: chains of up to 25 rows cut by its confidence, copies of up to 32; else one-row rounds.
+             pub fn facts(self: *const Cuda) lanes.Model {
+                 const drafting = self.head != null;
+                 return .{
+                     .exact_width = if (drafting) mtp.max_rows else 2,
+-                    .first_copy_rows = if (drafting) mtp.max_chain + 1 else 0,
++                    .first_copy_rows = if (drafting) mtp.first_copy_rows else 0,
+                     .gpu_tokens = false,
+                     .mtp = drafting,
+                     .speculate = drafting,
+diff --git a/zig/src/families/flashnext/cuda_mtp.zig b/zig/src/families/flashnext/cuda_mtp.zig
+index ec169772e..d0a96490a 100644
+--- a/zig/src/families/flashnext/cuda_mtp.zig
++++ b/zig/src/families/flashnext/cuda_mtp.zig
+@@ -28,7 +28,9 @@ const HcW = wt.HcW;
+ pub const Sampling = lanes.sampling.Sampling;
+ 
+ /// Drafts an MTP chain holds at most beside its pending token.
+-pub const max_chain: usize = 15;
++pub const max_chain: usize = 24;
++/// A lone stream's first copied window at most.
++pub const first_copy_rows: usize = 16;
+ /// Preserve the existing recipe unless an explicit depth is selected.
+ pub const default_depth: usize = 6;
+ /// A greedy stream's chain at most (TF_FLASHNEXT_DRAFTS_GREEDY): greedy drafts land more often, so a deeper chain pays.
+@@ -82,6 +84,15 @@ test "the stop rule: per draft above zero, the running product below it, every d
+ }
+ /// A verify window's rows at most: the pending token and a chain, or a copied continuation.
+ pub const max_rows: usize = 32;
++
++/// `ids` at `fed`, its last token repeated up to TF_FLASHNEXT_WINDOW_PAD rows when they fit `cap`.
++pub fn padded(buf: *[max_rows]u32, ids: []const u32, fed: usize, cap: usize) []const u32 {
++    const rows = @import("sys").environment.read(usize, "TF_FLASHNEXT_WINDOW_PAD", 0) catch 0;
++    if (rows <= ids.len or rows > max_rows or fed + rows > cap) return ids;
++    @memcpy(buf[0..ids.len], ids);
++    @memset(buf[ids.len..rows], ids[ids.len - 1]);
++    return buf[0..rows];
++}
+ /// A drafting round's rows at most: a shared verify's (TF_FLASHNEXT_WINDOW_ROWS lowers it; 0: each alone).
+ pub const round_rows: usize = 64;
+ /// qmm.split_for(2560, 2560): fc_embedding and fc_hidden sum K in four slices, in order.
+@@ -459,7 +470,8 @@ test "a masked row draws only allowed tokens, greedy the best of them" {
+ }
+ 
+ test "draft chains fit one verify window while the default stays six" {
+-    try std.testing.expectEqual(@as(usize, 16), max_chain + 1);
++    try std.testing.expectEqual(@as(usize, 25), max_chain + 1);
++    try std.testing.expectEqual(@as(usize, 16), first_copy_rows);
+     try std.testing.expectEqual(@as(usize, 32), max_rows);
+     try std.testing.expect(max_chain < max_rows and max_rows <= round_rows);
+     try std.testing.expectEqual(@as(usize, 6), default_depth);
+diff --git a/zig/src/platform/environment.zig b/zig/src/platform/environment.zig
+index ffffe20c5..dfd03a10e 100644
+--- a/zig/src/platform/environment.zig
++++ b/zig/src/platform/environment.zig
+@@ -230,10 +230,11 @@ pub const rules = [_]Rule{
+     .{ .name = "TF_FLASHNEXT_TABLE_WARM", .scope = .flashnext, .kind = .flag, .forms = "0 or 1 (default 0)" },
+     .{ .name = "TF_FLASHNEXT_PROFILE", .scope = .flashnext, .kind = .flag, .forms = "0 or 1 (default 0)" },
+     .{ .name = "TF_FLASHNEXT_VERIFY_HOST_LOGITS", .scope = .flashnext, .kind = .flag, .forms = "0 or 1 (default 0)" },
+-    .{ .name = "TF_FLASHNEXT_DRAFTS", .scope = .flashnext, .kind = .size, .forms = "a whole draft count from 0 to the native size maximum (default 6; clamped to 1 through 15)" },
+-    .{ .name = "TF_FLASHNEXT_DRAFTS_GREEDY", .scope = .flashnext, .kind = .size, .forms = "a whole draft count from 0 to the native size maximum (default 8; clamped to 1 through 15)" },
++    .{ .name = "TF_FLASHNEXT_DRAFTS", .scope = .flashnext, .kind = .size, .forms = "a whole draft count from 0 to the native size maximum (default 6; clamped to 1 through 24)" },
++    .{ .name = "TF_FLASHNEXT_DRAFTS_GREEDY", .scope = .flashnext, .kind = .size, .forms = "a whole draft count from 0 to the native size maximum (default 8; clamped to 1 through 24)" },
+     .{ .name = "TF_FLASHNEXT_GREEDY_WIDE", .scope = .flashnext, .kind = .size, .forms = "a whole round width from 0 to the native size maximum (default 4)" },
+     .{ .name = "TF_FLASHNEXT_WINDOW_ROWS", .scope = .flashnext, .kind = .size, .forms = "a whole row count from 0 to the native size maximum (default the shared round's rows; capped by them)" },
++    .{ .name = "TF_FLASHNEXT_WINDOW_PAD", .scope = .flashnext, .kind = .size, .forms = "a whole row count from 0 to the native size maximum (default 0: off; a lone drafted window narrower than this runs padded to it on the rank link)" },
+     .{ .name = "TF_FLASHNEXT_PP_WINDOW_GRAPH", .scope = .flashnext, .kind = .flag, .forms = "0 or 1 (default 0; 1: at --pp 2 the stage windows run as graphs); give every rank the same" },
+     .{ .name = "TF_FLASHNEXT_TP_WINDOW_GRAPH", .scope = .flashnext, .kind = .flag, .forms = "0 or 1 (default 0; 1: at --tp 2 the verify windows run as graphs on both ranks); give every rank the same" },
+     .{ .name = "TF_FLASHNEXT_PEER_SLOTS", .scope = .flashnext, .kind = .flag, .forms = "0 or 1 (default 0; 1: at --tp 2 on one host the MoE exchange writes each rank's slots into the peer's mapped buffer); give every rank the same" },
+diff --git a/zig/src/platform/environment_flashnext_test.zig b/zig/src/platform/environment_flashnext_test.zig
+index 1c11e073b..cdac355d7 100644
+--- a/zig/src/platform/environment_flashnext_test.zig
++++ b/zig/src/platform/environment_flashnext_test.zig
+@@ -33,13 +33,13 @@ fn check(name: []const u8, raw: []const u8, valid: bool) !void {
+     try t.expect(std.mem.endsWith(u8, why.?, e.rule(name).forms));
+ }
+ 
+-test "Flash Next strict env: the table holds all 46 settings: 31 switches, 11 integers, 1 real, 3 structured" {
++test "Flash Next strict env: the table holds all 47 settings: 31 switches, 12 integers, 1 real, 3 structured" {
+     var counts: [4]usize = @splat(0);
+     for (e.rules) |r| if (r.scope == .flashnext) {
+         try t.expect(std.mem.startsWith(u8, r.name, "TF_FLASHNEXT_"));
+         counts[@backingInt(group(r))] += 1;
+     };
+-    try t.expectEqual([4]usize{ 31, 11, 1, 3 }, counts);
++    try t.expectEqual([4]usize{ 31, 12, 1, 3 }, counts);
+ }
+ 
+ test "Flash Next strict env: unset and blank settings both read as the caller's default" {
+diff --git a/zig/tests/fixtures/gradient-serving.tsv b/zig/tests/fixtures/gradient-serving.tsv
+index e14c6f175..261148408 100644
+--- a/zig/tests/fixtures/gradient-serving.tsv
++++ b/zig/tests/fixtures/gradient-serving.tsv
+@@ -129,7 +129,7 @@ zig/src/families/flashnext/cuda_hc.zig	01f897ac65d6edd2cd6ac76d97cb4d96619c25ffa
+ zig/src/families/flashnext/cuda_head.zig	734cc1ccea8e99ce9a061273a2dd3042f32e4848b622b5de616aa4b6f546bdd4	raw	#3749: TF_FLASHNEXT_SHARD_HEAD read through platform/environment.zig, blank as unset
+ zig/src/families/flashnext/cuda_images.zig	5bd8a6c06cb69440522f4392794d9ef52b3760195b97d96f2316b1acac271bd4	raw
+ zig/src/families/flashnext/cuda_images_test.zig	df984d54d9de1bb732544785cddf82a124de2a7019041ed1f7483b2a4a2d7c99	raw
+-zig/src/families/flashnext/cuda_lanes.zig	e95c760a89dd5df368ab51fa695020b66d90bac2304d343fa45cb7532396b83f	raw	main 4f6017ced (marks inside the pass), fbca90714 (shared solo-chunk rule, #2391), 80e0fd72c (#2753: non-finite draft rows refused by name; finite rows unchanged), dfd9ac5ef4 (#2585: TF_FLASHNEXT_* read through platform/environment.zig, malformed text refused at startup; valid values keep their meaning), #1953: the ladder's values through snap_intermediate, #3308 (loader host test updates the named startup-refusal expectations; no runtime edit to this pinned file); #3135 (kept_disk renamed kept_view for the shared kept image; no served change), this change (the page pool opens with the load's device and io, for its arena mapped as pages are used; a new paged stream's first prompt step waits while the arena's thread maps its pieces; paging off: unchanged); F6: block-FP8 routed experts (Qwen's FP8 release) load a rank's whole experts and are admitted at --tp 2; the NVFP4 and affine paths keep their bytes
++zig/src/families/flashnext/cuda_lanes.zig	08156263df6edc1b81c60379aa1bb5ee7cd20c2b4fbf92df8b9cdcc2e404c3ca	raw	main 4f6017ced (marks inside the pass), fbca90714 (shared solo-chunk rule, #2391), 80e0fd72c (#2753: non-finite draft rows refused by name; finite rows unchanged), dfd9ac5ef4 (#2585: TF_FLASHNEXT_* read through platform/environment.zig, malformed text refused at startup; valid values keep their meaning), #1953: the ladder's values through snap_intermediate, #3308 (loader host test updates the named startup-refusal expectations; no runtime edit to this pinned file); #3135 (kept_disk renamed kept_view for the shared kept image; no served change), this change (the page pool opens with the load's device and io, for its arena mapped as pages are used; a new paged stream's first prompt step waits while the arena's thread maps its pieces; paging off: unchanged); F6: block-FP8 routed experts (Qwen's FP8 release) load a rank's whole experts and are admitted at --tp 2; the NVFP4 and affine paths keep their bytes; opt-in TF_FLASHNEXT_WINDOW_PAD pads a rank-link window; the first copy window keeps 16 rows
+ zig/src/families/flashnext/cuda_lanes_admission_test.zig	4b8052db793ba81f0e73e1b9bd77b1780bbc4fd550d90976d017da47e76faaa2	raw
+ zig/src/families/flashnext/cuda_lanes_load.zig	c1068b48fa62633235e383bb2cbe3c18d4291a9d93bb17f44a309f1124e99640	raw	main dfd9ac5ef4 (#2585: TF_FLASHNEXT_* read through platform/environment.zig, malformed text refused at startup; valid values keep their meaning), #3467: after load a shard drops its page cache except the n-gram ranges, and the sweep reaches nested shards; tensors and replies are unchanged, this change (the load's device and io handed to the page pool's arena; paging off: unchanged); opt-in TF_FLASHNEXT_DECODE_GRAPH no longer refused with the dense split; default serving unchanged; #2972: the first collective waits up to 10 minutes for the peer's load, and a peer that leaves ends the wait within seconds; F6: block-FP8 routed experts (Qwen's FP8 release) load a rank's whole experts and are admitted at --tp 2; the NVFP4 and affine paths keep their bytes; opt-in TF_FLASHNEXT_TP_WINDOW_GRAPH: --tp 2 verify windows as graphs, the peer epoch on the device; default serving unchanged
+ zig/src/families/flashnext/cuda_lanes_restore_test.zig	5d0ef1cac8d8704676505e50a7e46cc82a71803aadf7018d3da2136fdc71759c	raw	its rig names the collective's parent communicator; test only
+@@ -141,7 +141,7 @@ zig/src/families/flashnext/cuda_mixed_experts.zig	d0362f591e98c2d13581ae48fb75fb
+ zig/src/families/flashnext/cuda_mlp.zig	8224a28003487487e69eb669be11eaafafdb1ce0bc4c5e57024cef0a6a29e66f	raw
+ zig/src/families/flashnext/cuda_modelopt_experts.zig	54c3eb705e952a79ac903c55dd4b70370c3e0df1cab63058664bbcbba55a957a	raw	F6: block-FP8 routed experts (Qwen's FP8 release) load a rank's whole experts and are admitted at --tp 2; the NVFP4 and affine paths keep their bytes
+ zig/src/families/flashnext/cuda_moe.zig	87ba75343c1d228800ed9fcc6d933f1175df172c008e14a8c7a64ff7011bed44	raw
+-zig/src/families/flashnext/cuda_mtp.zig	1349889f35d942b527361f2a62928945885bd42087609368fe8f6bf6f4938a04	raw	main 80e0fd72c (#2753: non-finite draft rows refused by name; finite rows unchanged), dfd9ac5ef4 (#2585: TF_FLASHNEXT_* read through platform/environment.zig, malformed text refused at startup; valid values keep their meaning), #2927
++zig/src/families/flashnext/cuda_mtp.zig	30e94053a932ee9880c1a2c9d81a366d08ae64c6baff780e0666d87b499abc72	raw	main 80e0fd72c (#2753: non-finite draft rows refused by name; finite rows unchanged), dfd9ac5ef4 (#2585: TF_FLASHNEXT_* read through platform/environment.zig, malformed text refused at startup; valid values keep their meaning), #2927; chains of up to 24 drafts (TF_FLASHNEXT_DRAFTS*, clamp only); opt-in TF_FLASHNEXT_WINDOW_PAD
+ zig/src/families/flashnext/cuda_mtp_check.zig	35d9d0ad51171ca2d70a0458f90fe6a04dd5f759fd9f005593c9d1189fb7846d	raw	main dfd9ac5ef4 (#2585: TF_FLASHNEXT_* read through platform/environment.zig, malformed text refused at startup; valid values keep their meaning)
+ zig/src/families/flashnext/cuda_mtp_draft.zig	41628480a1071c4a58a229f5e8b42e26fcd030a046ca6796d2dcb2fedb8daf28	raw	main 80e0fd72c (#2753: non-finite draft rows refused by name; finite rows unchanged), dfd9ac5ef4 (#2585: TF_FLASHNEXT_* read through platform/environment.zig, malformed text refused at startup; valid values keep their meaning), 52479d3036 (#2585: a test of the blank TF_FLASHNEXT_KEEP_LATE reader)
+ zig/src/families/flashnext/cuda_mtp_load.zig	095c8b71f984a7810adb1fb5e6d13da4a9abdc438de08405b4ad82d3f51f56e9	raw
+-- 
+2.56.0
+
