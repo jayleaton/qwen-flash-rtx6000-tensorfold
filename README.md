@@ -108,15 +108,43 @@ Measured on a rented host with 2x RTX PRO 6000 Blackwell **Workstation Edition**
 
 ## Quick start
 
+**1. Get the recipe and the weights**
+
 ```bash
 git clone https://github.com/jayleaton/qwen-flash-rtx6000-tensorfold.git
 cd qwen-flash-rtx6000-tensorfold
 hf download Qwen/Qwen3.8-Flash-Next-FP8 --revision 7fb48d708ca6cd8eeed8f4db0433be18af96984f --local-dir flash-fp8
 scripts/verify-weights.sh flash-fp8                 # sha256 of every shard against config/weights
-scripts/build-engine.sh engine                      # pin + patches 0001-0076, tree checked, sm_120 server + libtfgrammar
-NUMA_NODE=0 scripts/serve.sh engine flash-fp8       # tp2-fast: rank 1 on GPU 1, rank 0 on GPU 0 serves port 8090
-PROFILE=pp2-prefill NUMA_NODE=0 scripts/serve.sh engine flash-fp8   # or another profile
 ```
+
+**2. Get the engine: prebuilt (fastest) or built from source**
+
+```bash
+# prebuilt: the measured binary from the release (glibc 2.28 or later)
+T=tensorfold-native-fa72a8b22f5f-sm120-x86_64
+gh release download rc-20261124 --repo jayleaton/qwen-flash-rtx6000-tensorfold --pattern "$T-linux-x86_64.tar.gz*"
+sha256sum -c "$T-linux-x86_64.tar.gz.sha256" && tar -xzf "$T-linux-x86_64.tar.gz" && mv "$T" engine
+
+# or build it: pin + patches 0001-0076, tree checked, sm_120 server + libtfgrammar
+scripts/build-engine.sh engine
+```
+
+**3. Serve: pick tp2 or pp2**
+
+```bash
+# tp2 (default, tp2-fast): the fastest single stream
+NUMA_NODE=0 scripts/serve.sh engine flash-fp8
+
+# pp2 (pp2-prefill): 2x the prefill on long prompts, the best 16-stream throughput
+PROFILE=pp2-prefill NUMA_NODE=0 scripts/serve.sh engine flash-fp8
+
+# coding agents (OpenCode and the like): 139,264-token window x 4 streams
+PROFILE=agent NUMA_NODE=0 scripts/serve.sh engine flash-fp8        # pp2
+PROFILE=agent-tp2 NUMA_NODE=0 scripts/serve.sh engine flash-fp8    # tp2
+```
+
+Rank 1 starts on GPU 1, then rank 0 on GPU 0 serves port 8090. Set `NUMA_NODE` to the node your GPUs sit on
+(`nvidia-smi topo -m`), or leave it out on a single-node host. Then:
 
 ```bash
 curl -s http://127.0.0.1:8090/v1/chat/completions -H 'Content-Type: application/json' \
@@ -136,9 +164,7 @@ curl -s http://127.0.0.1:8090/v1/chat/completions -H 'Content-Type: application/
 
 **Prebuilt:** the release carries `tensorfold-native-fa72a8b22f5f-sm120-x86_64-linux-x86_64.tar.gz`, sha256
 `a04c0568cc9bbadd52eea9b1f63da3512439af9c5226fcf033171dfa6f834a35`. It holds the server and libtfgrammar that this
-series builds, byte-identical to the measured binary, with TensorFold's and xgrammar's license notices. Unpack it and
-pass its directory to `scripts/serve.sh` in place of
-`engine` (glibc 2.28 or later).
+series builds, byte-identical to the measured binary, with TensorFold's and xgrammar's license notices.
 
 Each rank digests every checkpoint byte on first load (cached afterwards) to check both load the same weights.
 `TENSORFOLD_CHECKPOINT_SHA256`, set to the same 64 hex digits on both ranks, replaces that digest. To check the patch
@@ -170,8 +196,8 @@ series without building, run `scripts/fetch-engine.sh cuda DIR`.
     of a code reply matching, quality 214/228.
   - The other levers in 0047-0076 (`TF_FLASHNEXT_HIDDEN_SUM`, window graphs, `TF_FLASHNEXT_PP_SPEC`) are measured and
     not adopted.
-- **Lower power limits are not measured yet.** A 300 W limit could not be set on the test host; a host capped at 325 W
-  is next.
+- **Lower power limits are not measured yet.** A 300 W limit could not be set on the test host, and the one capped
+  host found had half the peer-to-peer bandwidth, so its numbers were not kept.
 - **Mixed lengths stall decode,** and `TF_FLASHNEXT_KEEP_LATE=1` is refused on FP8, as in stack E.
 
 More in [KNOWN-ISSUES](docs/KNOWN-ISSUES.md).

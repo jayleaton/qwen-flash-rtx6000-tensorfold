@@ -26,7 +26,9 @@ not found) follow one. Use `PROFILE=agent` (or `agent-tp2`), 139,264 tokens x 4 
 ## Lower power limits are not measured
 
 Every number here ran at the cards' 600 W limit. `nvidia-smi -pl 300` needs host privileges the test container did not
-have; a host whose cards are capped at 325 W is the next measurement.
+have. A host whose cards are capped at 325 W was tried, but its peer-to-peer link ran at 27 GB/s (PHB topology)
+against 53.8 GB/s on the measured host, which skews the TP2 rows, so its numbers were not kept. A capped host with
+full peer-to-peer bandwidth is the next measurement.
 
 ## Switches in the series that no profile uses
 

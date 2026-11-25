@@ -1,6 +1,6 @@
 # Changelog
 
-## rc-20261124 (not released)
+## 2026-11-25: rc-20261124
 
 - **Profiles.** `scripts/serve.sh` takes `PROFILE=` and reads `config/cuda/profiles/NAME.{args,env}` on top of stack E's
   `config/cuda/serve.env`; `config/cuda/serve.args` is gone, and the window, streams and `--tp 2` or `--pp 2` live in
