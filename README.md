@@ -122,7 +122,8 @@ scripts/verify-weights.sh flash-fp8                 # sha256 of every shard agai
 ```bash
 # prebuilt: the measured binary from the release (glibc 2.28 or later)
 T=tensorfold-native-fa72a8b22f5f-sm120-x86_64
-gh release download rc-20261124 --repo jayleaton/qwen-flash-rtx6000-tensorfold --pattern "$T-linux-x86_64.tar.gz*"
+U=https://github.com/jayleaton/qwen-flash-rtx6000-tensorfold/releases/download/rc-20261124
+curl -fLO "$U/$T-linux-x86_64.tar.gz" -fLO "$U/$T-linux-x86_64.tar.gz.sha256"
 sha256sum -c "$T-linux-x86_64.tar.gz.sha256" && tar -xzf "$T-linux-x86_64.tar.gz" && mv "$T" engine
 
 # or build it: pin + patches 0001-0076, tree checked, sm_120 server + libtfgrammar
