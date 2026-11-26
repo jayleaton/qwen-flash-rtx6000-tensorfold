@@ -1,0 +1,508 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jay Leaton <58495321+jayleaton@users.noreply.github.com>
+Date: Wed, 25 Nov 2026 15:42:07 +0700
+Subject: [PATCH 81/93] flashnext cuda: a chunk's steps in cuda_batch_steps.zig
+ and argmax in cuda_argmax.zig, keeping cuda_batch.zig and cuda_prompt.zig
+ under 600 lines; single-line comments for the prompt overlap
+
+---
+ zig/src/families/flashnext/cuda_argmax.zig    |  20 +++
+ zig/src/families/flashnext/cuda_batch.zig     | 120 +----------------
+ .../families/flashnext/cuda_batch_steps.zig   | 126 ++++++++++++++++++
+ .../families/flashnext/cuda_collective.zig    |   3 +-
+ .../families/flashnext/cuda_moe_exchange.zig  |   3 +-
+ .../families/flashnext/cuda_owner_slots.zig   |   6 +-
+ zig/src/families/flashnext/cuda_prompt.zig    |  14 +-
+ .../flashnext/cuda_prompt_overlap.zig         |  41 +++---
+ zig/tests/fixtures/gradient-serving.tsv       |   4 +-
+ 9 files changed, 178 insertions(+), 159 deletions(-)
+ create mode 100644 zig/src/families/flashnext/cuda_argmax.zig
+ create mode 100644 zig/src/families/flashnext/cuda_batch_steps.zig
+
+diff --git a/zig/src/families/flashnext/cuda_argmax.zig b/zig/src/families/flashnext/cuda_argmax.zig
+new file mode 100644
+index 000000000..ca0b16fe4
+--- /dev/null
++++ b/zig/src/families/flashnext/cuda_argmax.zig
+@@ -0,0 +1,20 @@
++//! The greedy token of one row of BF16 logits (cuda_prompt.zig's argmax).
++const std = @import("std");
++const weights = @import("cuda_prompt_wt.zig");
++const vocab = weights.vocab;
++const promote = weights.promote;
++
++/// The first index of the largest of `vocab` little-endian BF16 logits.
++pub fn argmax(raw: []const u8) u32 {
++    var best = promote(std.mem.readInt(u16, raw[0..2], .little));
++    var at: usize = 0;
++    var i: usize = 1;
++    while (i < vocab) : (i += 1) {
++        const v = promote(std.mem.readInt(u16, raw[2 * i ..][0..2], .little));
++        if (v > best) {
++            best = v;
++            at = i;
++        }
++    }
++    return @intCast(at);
++}
+diff --git a/zig/src/families/flashnext/cuda_batch.zig b/zig/src/families/flashnext/cuda_batch.zig
+index 4bf68015a..4032652da 100644
+--- a/zig/src/families/flashnext/cuda_batch.zig
++++ b/zig/src/families/flashnext/cuda_batch.zig
+@@ -23,6 +23,7 @@ const zs = @import("cuda_zero_slice.zig");
+ const ops = @import("cuda_batch_ops.zig");
+ const split_lane = @import("cuda_split_lane.zig");
+ const stage_hop = @import("cuda_batch_hop.zig");
++const steps = @import("cuda_batch_steps.zig");
+ 
+ const layers_n = wt.layers_n;
+ const linear_n = wt.linear_n;
+@@ -128,7 +129,7 @@ pub fn Pass(comptime Tri: type) type {
+         staged: bool = false,
+         /// This round's lanes take their attention in one launch a kernel (batch_lanes, TF_FLASHNEXT_ATTN_LANES).
+         lanes_attn: bool = false,
+-        /// TF_FLASHNEXT_PROMPT_OVERLAP: the expert exchange's own stream and events (cuda_prompt_overlap.zig); null: inline.
++        /// TF_FLASHNEXT_PROMPT_OVERLAP: the exchange's own stream and events (cuda_prompt_overlap.zig); null: inline.
+         side: ?*const @import("cuda_prompt_overlap.zig").Side = null,
+         /// The last exchange runs on `side`: the pass's stream waits for it before it reads the layer's sums.
+         side_wait: bool = false,
+@@ -511,119 +512,10 @@ pub fn Pass(comptime Tri: type) type {
+                 std.debug.print("batch: {d} rows at {d} in {d:.1} ms\n", .{ n, pos0, @as(f64, @floatFromInt(std.Io.Clock.awake.now(self.io).toNanoseconds() - t0)) / 1e6 });
+             };
+             var gather: Gather = undefined;
+-            defer self.joinGather();
+-            try self.begin(ids, pos0, &gather, self.seq.history[0..]);
+-            for (self.m.layers, stage_hop.first(self.m)..) |*lw, layer| try self.layerStep(lw, layer, ids, &gather);
+-            try self.end(logits_host);
+-        }
+-
+-        /// A chunk's checks, uploads, n-gram gather (after `history`) and first rows, before its layers.
+-        pub fn begin(self: *Self, ids: []const u32, pos0: usize, gather: *Gather, history: []i64) !void {
+-            const s = self.s;
+-            const n = ids.len;
+-            if (n == 0 or n > s.cap) return error.UnexpectedTensor;
+-            if (self.lanes.len > 0) {
+-                // shared rounds read every row's scores; a lane keeps its own rollback and hidden rows, nothing else
+-                if (self.hooks.logits != .all or self.hooks.keep != null or self.hooks.streams != 0 or self.hooks.moe_add != null) return error.UnexpectedTensor;
+-                try batch_lanes.checkLanes(self.lanes, n);
+-            } else if (pos0 + n > self.seq.cap) return error.UnexpectedTensor;
+-            self.rows = n;
+-            self.pos0 = pos0;
+-            self.pending = null;
+-            self.pending_f32 = false;
+-            self.side_wait = false;
+-            self.side_wait_out = false;
+-            // the gather writes the scratch's pinned rows, so the last pass's uploads must have read them first
+-            if (!self.prepared and !self.staged) try s.ready();
+-            gather.* = .{ .ngram = self.m.ngram, .history = history, .ids = ids, .emb = s.hostEmb(n), .xs = s.hostXs(n), .io = self.io, .lanes = self.lanes };
+-            self.gather_thread = if (self.prepared or self.staged or stage_hop.first(self.m) > 0) null else try std.Thread.spawn(.{}, Gather.main, .{gather});
+-            if (!self.staged) try self.stage(ids);
+-            try stage_hop.enter(self, n);
+-        }
+-
+-        pub fn joinGather(self: *Self) void {
+-            if (self.gather_thread) |th| th.join();
+-            self.gather_thread = null;
+-        }
+-
+-        /// The pass's stream waits for an exchange still running on the side stream.
+-        pub fn awaitSide(self: *Self) !void {
+-            if (self.side_wait_out) {
+-                self.side_wait_out = false;
+-                try self.stream.wait(self.side.?.done_out);
+-            }
+-            if (!self.side_wait) return;
+-            self.side_wait = false;
+-            try self.stream.wait(self.side.?.done);
+-        }
+-
+-        /// Layer `layer` (absolute index) over the chunk's rows.
+-        pub fn layerStep(self: *Self, lw: *const Layer, layer: usize, ids: []const u32, gather: *Gather) !void {
+-            try self.mixerStep(lw, layer, ids, gather);
+-            try self.mlpStep(lw, layer);
+-        }
+-
+-        /// A layer's first half: the n-gram block at its layer, the read-out, the DeltaNet or attention block and its
+-        /// out projection into part.
+-        pub fn mixerStep(self: *Self, lw: *const Layer, layer: usize, ids: []const u32, gather: *Gather) !void {
+-            const s = self.s;
+-            const n = self.rows;
+-            try self.awaitSide();
+-            const keep: LayerKeep = if (self.hooks.keep) |kp| kp.layers[layer] else .{};
+-            if (layer == ple_layer) {
+-                self.joinGather();
+-                if (gather.failed) |err| return err;
+-                if (Kernels.profile()) std.debug.print("batch: {d} rows' n-gram rows gathered on the host in {d:.1} ms\n", .{ n, @as(f64, @floatFromInt(gather.ns)) / 1e6 });
+-                if (!self.staged) {
+-                    try self.upload(s.ple_emb, std.mem.sliceAsBytes(gather.emb));
+-                    try self.upload(s.ple_xs, std.mem.sliceAsBytes(gather.xs));
+-                    if (!self.prepared) try s.uploaded();
+-                }
+-                if (self.pending != null) try self.writeback(0, n);
+-                try self.pleBlock(lw, ids);
+-            }
+-            if (hc.fuses(self, lw.attn_hc, n, keep.attn_hc)) {
+-                try hc.writebackNorm(self, lw.attn_hc, 0, n);
+-                try hc.readoutNative(self, lw.attn_hc, 0, n);
+-            } else {
+-                try self.writeback(0, n);
+-                try self.readoutKeep(lw.attn_hc, 0, n, keep.attn_hc);
+-            }
+-            self.zero_slices = zs.usable(self.s.part_zero, keep.mix_branch, self.m.collective != null, lw.out.native != null);
+-            if (lw.linear) {
+-                try self.gdnBlock(lw, layer, wt.linearIndex(layer), keep);
+-            } else {
+-                try self.attnBlockKeep(lw, wt.attnIndex(layer), keep);
+-            }
+-            if (keep.mix_branch != 0) try self.sumSlices(s.part, keep.mix_branch, true, n * dims, self.out_slices);
+-        }
+-
+-        /// A layer's second half: part written back, the read-out, the experts and their exchange.
+-        pub fn mlpStep(self: *Self, lw: *const Layer, layer: usize) !void {
+-            const s = self.s;
+-            const n = self.rows;
+-            try self.awaitSide();
+-            const keep: LayerKeep = if (self.hooks.keep) |kp| kp.layers[layer] else .{};
+-            const sl = zs.slices(self.zero_slices, s.cap, n, self.out_slices);
+-            self.zero_slices = false;
+-            if (hc.fuses(self, lw.mlp_hc, n, keep.mlp_hc)) {
+-                try self.tri.hcWritebackNorm(s.h, s.h, s.pss, s.part, s.inj, s.dummy, s.dummy, lw.mlp_hc.scale.ptr, s.norm, eps, sl.stride, n, dims, streams, 4, 1, 1, sl.count);
+-                try hc.readoutNative(self, lw.mlp_hc, 0, n);
+-            } else {
+-                try self.tri.hcWriteback(s.h, s.h, s.pss, s.part, "*fp32", s.inj, s.dummy, "*bf16", s.dummy, "*bf16", sl.stride, n, dims, streams, 4, 1, 1, sl.count);
+-                try self.readoutKeep(lw.mlp_hc, 0, n, keep.mlp_hc);
+-            }
+-            try self.moeBlockKeep(lw, keep);
+-            if (ep_log.on) try ep_log.layer(self, layer);
+-            try self.moeAdds(layer, keep);
+-            self.pending = layer;
+-        }
+-
+-        /// After the last layer: the head (or the next stage).
+-        pub fn end(self: *Self, logits_host: ?[]u8) !void {
+-            try self.awaitSide();
+-            try stage_hop.leave(self, logits_host);
+-            if (ep_log.on) try ep_log.window(self);
++            defer steps.joinGather(self);
++            try steps.begin(self, ids, pos0, &gather, self.seq.history[0..]);
++            for (self.m.layers, stage_hop.first(self.m)..) |*lw, layer| try steps.layerStep(self, lw, layer, ids, &gather);
++            try steps.end(self, logits_host);
+         }
+ 
+         pub fn complete(self: *Self) !void {
+diff --git a/zig/src/families/flashnext/cuda_batch_steps.zig b/zig/src/families/flashnext/cuda_batch_steps.zig
+new file mode 100644
+index 000000000..fcbe13308
+--- /dev/null
++++ b/zig/src/families/flashnext/cuda_batch_steps.zig
+@@ -0,0 +1,126 @@
++//! A batched pass's chunk in steps (cuda_batch.zig's Pass): begin, each layer's mixer and experts halves, end.
++const std = @import("std");
++const wt = @import("cuda_prompt_wt.zig");
++const parts = @import("cuda_batch_state.zig");
++const hc = @import("cuda_batch_hc.zig");
++const ep_log = @import("cuda_ep_log.zig");
++const zs = @import("cuda_zero_slice.zig");
++const stage_hop = @import("cuda_batch_hop.zig");
++const batch_lanes = @import("cuda_batch_lanes.zig");
++const Layer = @import("cuda_prompt_load.zig").Layer;
++const Gather = parts.Gather;
++const LayerKeep = parts.LayerKeep;
++const Kernels = parts.Kernels;
++const dims = wt.dims;
++const streams = wt.streams;
++const eps = wt.eps;
++const ple_layer = wt.ple_layer;
++
++/// A chunk's checks, uploads, n-gram gather (after `history`) and first rows, before its layers.
++pub fn begin(p: anytype, ids: []const u32, pos0: usize, gather: *Gather, history: []i64) !void {
++    const s = p.s;
++    const n = ids.len;
++    if (n == 0 or n > s.cap) return error.UnexpectedTensor;
++    if (p.lanes.len > 0) {
++        // shared rounds read every row's scores; a lane keeps its own rollback and hidden rows, nothing else
++        if (p.hooks.logits != .all or p.hooks.keep != null or p.hooks.streams != 0 or p.hooks.moe_add != null) return error.UnexpectedTensor;
++        try batch_lanes.checkLanes(p.lanes, n);
++    } else if (pos0 + n > p.seq.cap) return error.UnexpectedTensor;
++    p.rows = n;
++    p.pos0 = pos0;
++    p.pending = null;
++    p.pending_f32 = false;
++    p.side_wait = false;
++    p.side_wait_out = false;
++    // the gather writes the scratch's pinned rows, so the last pass's uploads must have read them first
++    if (!p.prepared and !p.staged) try s.ready();
++    gather.* = .{ .ngram = p.m.ngram, .history = history, .ids = ids, .emb = s.hostEmb(n), .xs = s.hostXs(n), .io = p.io, .lanes = p.lanes };
++    p.gather_thread = if (p.prepared or p.staged or stage_hop.first(p.m) > 0) null else try std.Thread.spawn(.{}, Gather.main, .{gather});
++    if (!p.staged) try p.stage(ids);
++    try stage_hop.enter(p, n);
++}
++
++/// Joins the chunk's n-gram gather thread, if one still runs.
++pub fn joinGather(p: anytype) void {
++    if (p.gather_thread) |th| th.join();
++    p.gather_thread = null;
++}
++
++/// The pass's stream waits for an exchange still running on the side stream.
++pub fn awaitSide(p: anytype) !void {
++    if (p.side_wait_out) {
++        p.side_wait_out = false;
++        try p.stream.wait(p.side.?.done_out);
++    }
++    if (!p.side_wait) return;
++    p.side_wait = false;
++    try p.stream.wait(p.side.?.done);
++}
++
++/// Layer `layer` (absolute index) over the chunk's rows.
++pub fn layerStep(p: anytype, lw: *const Layer, layer: usize, ids: []const u32, gather: *Gather) !void {
++    try mixerStep(p, lw, layer, ids, gather);
++    try mlpStep(p, lw, layer);
++}
++
++/// A layer's first half: the n-gram block at its layer, the read-out, the mixer and its out projection into part.
++pub fn mixerStep(p: anytype, lw: *const Layer, layer: usize, ids: []const u32, gather: *Gather) !void {
++    const s = p.s;
++    const n = p.rows;
++    try awaitSide(p);
++    const keep: LayerKeep = if (p.hooks.keep) |kp| kp.layers[layer] else .{};
++    if (layer == ple_layer) {
++        joinGather(p);
++        if (gather.failed) |err| return err;
++        if (Kernels.profile()) std.debug.print("batch: {d} rows' n-gram rows gathered on the host in {d:.1} ms\n", .{ n, @as(f64, @floatFromInt(gather.ns)) / 1e6 });
++        if (!p.staged) {
++            try p.upload(s.ple_emb, std.mem.sliceAsBytes(gather.emb));
++            try p.upload(s.ple_xs, std.mem.sliceAsBytes(gather.xs));
++            if (!p.prepared) try s.uploaded();
++        }
++        if (p.pending != null) try p.writeback(0, n);
++        try p.pleBlock(lw, ids);
++    }
++    if (hc.fuses(p, lw.attn_hc, n, keep.attn_hc)) {
++        try hc.writebackNorm(p, lw.attn_hc, 0, n);
++        try hc.readoutNative(p, lw.attn_hc, 0, n);
++    } else {
++        try p.writeback(0, n);
++        try p.readoutKeep(lw.attn_hc, 0, n, keep.attn_hc);
++    }
++    p.zero_slices = zs.usable(p.s.part_zero, keep.mix_branch, p.m.collective != null, lw.out.native != null);
++    if (lw.linear) {
++        try p.gdnBlock(lw, layer, wt.linearIndex(layer), keep);
++    } else {
++        try p.attnBlockKeep(lw, wt.attnIndex(layer), keep);
++    }
++    if (keep.mix_branch != 0) try p.sumSlices(s.part, keep.mix_branch, true, n * dims, p.out_slices);
++}
++
++/// A layer's second half: part written back, the read-out, the experts and their exchange.
++pub fn mlpStep(p: anytype, lw: *const Layer, layer: usize) !void {
++    const s = p.s;
++    const n = p.rows;
++    try awaitSide(p);
++    const keep: LayerKeep = if (p.hooks.keep) |kp| kp.layers[layer] else .{};
++    const sl = zs.slices(p.zero_slices, s.cap, n, p.out_slices);
++    p.zero_slices = false;
++    if (hc.fuses(p, lw.mlp_hc, n, keep.mlp_hc)) {
++        try p.tri.hcWritebackNorm(s.h, s.h, s.pss, s.part, s.inj, s.dummy, s.dummy, lw.mlp_hc.scale.ptr, s.norm, eps, sl.stride, n, dims, streams, 4, 1, 1, sl.count);
++        try hc.readoutNative(p, lw.mlp_hc, 0, n);
++    } else {
++        try p.tri.hcWriteback(s.h, s.h, s.pss, s.part, "*fp32", s.inj, s.dummy, "*bf16", s.dummy, "*bf16", sl.stride, n, dims, streams, 4, 1, 1, sl.count);
++        try p.readoutKeep(lw.mlp_hc, 0, n, keep.mlp_hc);
++    }
++    try p.moeBlockKeep(lw, keep);
++    if (ep_log.on) try ep_log.layer(p, layer);
++    try p.moeAdds(layer, keep);
++    p.pending = layer;
++}
++
++/// After the last layer: the head (or the next stage).
++pub fn end(p: anytype, logits_host: ?[]u8) !void {
++    try awaitSide(p);
++    try stage_hop.leave(p, logits_host);
++    if (ep_log.on) try ep_log.window(p);
++}
+diff --git a/zig/src/families/flashnext/cuda_collective.zig b/zig/src/families/flashnext/cuda_collective.zig
+index 395acf3db..75d44fed7 100644
+--- a/zig/src/families/flashnext/cuda_collective.zig
++++ b/zig/src/families/flashnext/cuda_collective.zig
+@@ -27,8 +27,7 @@ pub const Collective = struct {
+     release: ?struct { ctx: *anyopaque, run: *const fn (*anyopaque) void } = null,
+     /// TF_FLASHNEXT_PEER_SLOTS: the MoE exchange as owner-slot writes into the peer's mapped buffer (one host).
+     peer: ?@import("cuda_peer_slots.zig").PeerSlots = null,
+-    /// TF_FLASHNEXT_PROMPT_OVERLAP on one host: a blocking split with its own connections, whose collectives run on
+-    /// the prompt's side stream beside `comm`'s (null: none).
++    /// TF_FLASHNEXT_PROMPT_OVERLAP on one host: a blocking split for the prompt's side stream (null: none).
+     side: nccl.Comm = null,
+ 
+     /// `link` has completed the source/settings handshake; it stays owned by the caller.
+diff --git a/zig/src/families/flashnext/cuda_moe_exchange.zig b/zig/src/families/flashnext/cuda_moe_exchange.zig
+index cb1aeebf5..df659b4ad 100644
+--- a/zig/src/families/flashnext/cuda_moe_exchange.zig
++++ b/zig/src/families/flashnext/cuda_moe_exchange.zig
+@@ -53,8 +53,7 @@ pub fn plan(pass: anytype, o: Owner, n: usize) !?Owner {
+ /// y's slots, a rank's values and the other's +0, to their fp32 sum in moe_f32 on both ranks: the pending_f32 form.
+ pub fn run(pass: anytype, c: anytype, planned: ?Owner, n: usize) !void {
+     if (planned) |o| {
+-        // TF_FLASHNEXT_PROMPT_OVERLAP: the same launches and bytes on the side stream and communicator, after the
+-        // experts; the pass's next read of y, moe_act or moe_f32 waits for them (Pass.awaitSide)
++        // TF_FLASHNEXT_PROMPT_OVERLAP: the same launches on the side stream; reads of the sums wait (awaitSide)
+         if (@hasField(@TypeOf(pass.*), "side")) if (pass.side) |side| if (c.sideView()) |x| {
+             try side.fed.record(pass.stream);
+             try side.stream.wait(side.fed);
+diff --git a/zig/src/families/flashnext/cuda_owner_slots.zig b/zig/src/families/flashnext/cuda_owner_slots.zig
+index c5deeb493..05c20bf86 100644
+--- a/zig/src/families/flashnext/cuda_owner_slots.zig
++++ b/zig/src/families/flashnext/cuda_owner_slots.zig
+@@ -16,8 +16,7 @@ pub fn enabled() !bool {
+     return @import("sys").environment.read(bool, "TF_FLASHNEXT_OWNER_SLOTS", false);
+ }
+ 
+-/// TF_FLASHNEXT_OWNER_NOCLEAR as read at load: an owner-slot pass leaves y uncleared, since its pack and sum read
+-/// only the half rows this rank's experts and shared half wrote.
++/// TF_FLASHNEXT_OWNER_NOCLEAR as read at load: y uncleared, as pack and sum read only rows this rank wrote.
+ pub var no_clear = false;
+ 
+ pub fn noClearEnabled() !bool {
+@@ -91,8 +90,7 @@ pub fn plan(pass: anytype, b: Bufs, o: Owner, n: usize, h: usize) !void {
+     try b.ready.record(pass.stream);
+ }
+ 
+-/// After the experts, on `stream` (the pass's, or its side stream after the experts): rounds of packed half rows
+-/// each way, each round's own rows summed as fn_moe_sum would.
++/// After the experts, on `stream` (the pass's or its side stream): packed half rows each way, summed as fn_moe_sum.
+ pub fn exchange(pass: anytype, c: anytype, stream: cuda.Stream, b: Bufs, o: Owner, n: usize, h: usize) !void {
+     const s = pass.s;
+     try c.reached(b.ready);
+diff --git a/zig/src/families/flashnext/cuda_prompt.zig b/zig/src/families/flashnext/cuda_prompt.zig
+index d1ed567aa..4e4f65b86 100644
+--- a/zig/src/families/flashnext/cuda_prompt.zig
++++ b/zig/src/families/flashnext/cuda_prompt.zig
+@@ -38,19 +38,7 @@ const loadHc = weights.loadHc;
+ const stitch = weights.stitch;
+ const Layer = load.Layer;
+ const loadLayer = load.loadLayer;
+-pub fn argmax(raw: []const u8) u32 {
+-    var best = promote(std.mem.readInt(u16, raw[0..2], .little));
+-    var at: usize = 0;
+-    var i: usize = 1;
+-    while (i < vocab) : (i += 1) {
+-        const v = promote(std.mem.readInt(u16, raw[2 * i ..][0..2], .little));
+-        if (v > best) {
+-            best = v;
+-            at = i;
+-        }
+-    }
+-    return @intCast(at);
+-}
++pub const argmax = @import("cuda_argmax.zig").argmax;
+ /// `n` zeroed buffers, the fill on the compute stream: a legacy-stream memset returns before it lands.
+ pub fn zeros(gpa: std.mem.Allocator, driver: *cuda.Driver, stream: cuda.Stream, n: usize, len: usize) ![]cuda.DeviceBuffer {
+     const Zeroed = struct {
+diff --git a/zig/src/families/flashnext/cuda_prompt_overlap.zig b/zig/src/families/flashnext/cuda_prompt_overlap.zig
+index 715193071..44a5df704 100644
+--- a/zig/src/families/flashnext/cuda_prompt_overlap.zig
++++ b/zig/src/families/flashnext/cuda_prompt_overlap.zig
+@@ -1,12 +1,8 @@
+-//! A --tp 2 prompt chunk as two halves a layer apart: each half's expert exchange runs on a side stream and
+-//! communicator while the pass's stream computes the other half (TF_FLASHNEXT_PROMPT_OVERLAP).
+-//!
+-//! Half A (the chunk's first rows) runs each layer before half B, on the same stream, so B reads A's keys, values,
+-//! DeltaNet state and n-gram tail as the next chunk would. Every kernel and exchange is the one a chunk of that
+-//! half's rows launches, so each row's bits are its own; only when the exchange runs moves.
++//! TF_FLASHNEXT_PROMPT_OVERLAP: a --tp 2 prompt chunk as two halves, each exchange beside the other half's layer.
+ const std = @import("std");
+ const cuda = @import("cuda");
+ const batch = @import("cuda_batch.zig");
++const steps = @import("cuda_batch_steps.zig");
+ const parts = @import("cuda_batch_state.zig");
+ const owner = @import("cuda_owner_slots.zig");
+ const hidden_sum = @import("cuda_moe_hidden_sum.zig");
+@@ -19,8 +15,7 @@ pub fn enabled() !bool {
+     return @import("sys").environment.read(bool, "TF_FLASHNEXT_PROMPT_OVERLAP", false);
+ }
+ 
+-/// TF_FLASHNEXT_OVERLAP_OUTPROJ as read at load (with the overlap): each half's out projection, its two gathers and
+-/// matmul, also runs on the side stream and communicator, the halves' layers then interleaved by half layers.
++/// TF_FLASHNEXT_OVERLAP_OUTPROJ as read at load (with the overlap): out projections on the side stream too.
+ pub var outproj = false;
+ 
+ pub fn outprojEnabled() !bool {
+@@ -116,7 +111,7 @@ pub fn forward(e: anytype, p: anytype, seq: anytype, ids: []const u32, hooks: pa
+     return true;
+ }
+ 
+-/// One chunk as half A (`na` rows) then half B, layer by layer.
++/// A chunk as half A (`na` rows) then B, layer by layer: B reads A's state as the next chunk would; bits unchanged.
+ fn halves(p: anytype, pair: *Pair, ids: []const u32, pos0: usize, na: usize, logits_host: ?[]u8) !void {
+     const t0 = std.Io.Clock.awake.now(p.io).toNanoseconds();
+     var a = p.*;
+@@ -131,26 +126,26 @@ fn halves(p: anytype, pair: *Pair, ids: []const u32, pos0: usize, na: usize, log
+     for (&history, ids[na - history.len .. na]) |*h, v| h.* = v;
+     var ga: parts.Gather = undefined;
+     var gb: parts.Gather = undefined;
+-    defer a.joinGather();
+-    defer b.joinGather();
+-    try a.begin(ids[0..na], pos0, &ga, p.seq.history[0..]);
+-    try b.begin(ids[na..], pos0 + na, &gb, history[0..]);
++    defer steps.joinGather(&a);
++    defer steps.joinGather(&b);
++    try steps.begin(&a, ids[0..na], pos0, &ga, p.seq.history[0..]);
++    try steps.begin(&b, ids[na..], pos0 + na, &gb, history[0..]);
+     for (p.m.layers, 0..) |*lw, layer| {
+         if (outproj) {
+             // each half's out projection on the side stream runs under the other half's mixer or experts
+-            try a.mixerStep(lw, layer, ids[0..na], &ga);
+-            try b.mixerStep(lw, layer, ids[na..], &gb);
+-            try a.mlpStep(lw, layer);
+-            try b.mlpStep(lw, layer);
++            try steps.mixerStep(&a, lw, layer, ids[0..na], &ga);
++            try steps.mixerStep(&b, lw, layer, ids[na..], &gb);
++            try steps.mlpStep(&a, lw, layer);
++            try steps.mlpStep(&b, lw, layer);
+         } else {
+-            try a.layerStep(lw, layer, ids[0..na], &ga);
+-            try b.layerStep(lw, layer, ids[na..], &gb);
++            try steps.layerStep(&a, lw, layer, ids[0..na], &ga);
++            try steps.layerStep(&b, lw, layer, ids[na..], &gb);
+         }
+     }
+-    try a.end(null);
+-    try b.end(logits_host);
+-    a.joinGather();
+-    b.joinGather();
++    try steps.end(&a, null);
++    try steps.end(&b, logits_host);
++    steps.joinGather(&a);
++    steps.joinGather(&b);
+     @memcpy(p.seq.history[0..], history[0..]);
+     if (batch.Kernels.profile()) {
+         try p.complete();
+diff --git a/zig/tests/fixtures/gradient-serving.tsv b/zig/tests/fixtures/gradient-serving.tsv
+index 0c523360a..edd51647e 100644
+--- a/zig/tests/fixtures/gradient-serving.tsv
++++ b/zig/tests/fixtures/gradient-serving.tsv
+@@ -114,9 +114,11 @@ zig/src/cuda/tp_group.zig	1a2acbdf2de6b827218deb45df5b5845beecde4eb718a4e4b39665
+ zig/src/cuda/tp_watch.zig	19ed1d12bc56f804b5d207d04226e9f6131a517aaf7aec4c4b2d0bd5f468ace3	raw	main 13d7450fd (#2354), 7ead07c92 (bounded peer warm-up, #2512)
+ zig/src/cuda/triton.zig	256323865c6a4676b8b75aae9e32d2d9732cf2623efedb9462cf6f95302c3e83	raw
+ zig/src/cuda/vit.zig	72c4301251f50d0f25907f0d8ad03a943281b234c506a455e413627a3ffe09c0	raw
++zig/src/families/flashnext/cuda_argmax.zig	399a83890cd2fa5d30fdfb43aeb784890559856a2073e5bc1d08ee7f460fb26d	raw	argmax moved from cuda_prompt.zig unchanged
+ zig/src/families/flashnext/cuda_attn.zig	99dfe79f919a8599490f1cdba0bec20d6e73ccbeafe26d5848419a465fdfa0d0	raw
+ zig/src/families/flashnext/cuda_batch.zig	f1c5ab1478497ab2c0abdf77776dfed36fa9092579d4306e4320a32cfadf6910	raw	main 42ff6c510f (disk states keyed by the resolved prompt passes; serving unchanged); #XXXX: the scratch test's ceiling restated at the 3,072-row default; #3413 (TF_FLASHNEXT_READOUT_FUSED's prompt read-out; unchanged when unset)
+ zig/src/families/flashnext/cuda_batch_state.zig	7e940f58ec4ecba11a657983375e3cfec7492989c6246f037759b8051ce70129	raw	y and moe_f32 take one spare row for a --tp 2 prompt pass's padded rank block; replies unchanged; #XXXX: the default prompt chunk is 3,072 rows
++zig/src/families/flashnext/cuda_batch_steps.zig	12f8eb4960479f811282256f1501bf039e9a496ad39698f41554fdd780b92f19	raw	the chunk's steps moved from cuda_batch.zig; opt-in TF_FLASHNEXT_PROMPT_OVERLAP waits on the side stream; default serving unchanged
+ zig/src/families/flashnext/cuda_collective.zig	793d89e979fd6445bf9ae5b4e9b1503f4322ea9022b7eedf34ce816082570c57	raw	adds sumBlock, the in-place FP32 reduce-scatter with sum's peer check, deadline and abort; no served change on its own; collectives on a blocking split of the nonblocking communicator on one host, on the nonblocking communicator across hosts; NCCL_RUNTIME_CONNECT=0 when unset on one host; the same collectives and sums, replies unchanged; #2980
+ zig/src/families/flashnext/cuda_compare_main.zig	ade014dfec88f0b386076cdc093ea20710d7bf36c33ff566ca2caf472064695b	raw	main dfd9ac5ef4 (#2585: the TF_FLASHNEXT_* startup check), c274b45cc1 (the check through the flashnext module)
+ zig/src/families/flashnext/cuda_config.zig	836bd828bc10439721aca2bfaebc91eccfbdb8d02ae94d59c03e63b028c22a4f	raw	F6: block-FP8 routed experts (Qwen's FP8 release) load a rank's whole experts and are admitted at --tp 2; the NVFP4 and affine paths keep their bytes
+@@ -153,7 +155,7 @@ zig/src/families/flashnext/cuda_ple_nvfp4_test.zig	742bef48f8ddbf7257c18ad78911d
+ zig/src/families/flashnext/cuda_projection.zig	42e553d337ee5b2acd2146018a4db96bc471a5cc7bc2a87f567ace934b1b40d5	raw
+ zig/src/families/flashnext/cuda_projection_load.zig	335fb41717d28673c3d58e01627e61d37d5e14cf40722335677dc2d994c73916	raw
+ zig/src/families/flashnext/cuda_projection_load_test.zig	bcbd6ed2753c863916a2163d1cf72544429c776365702e860f52cd22449354a1	raw
+-zig/src/families/flashnext/cuda_prompt.zig	112e5016db7c9a9903193071e8e1a3779496c8a208c1121b6556371dbb93d639	raw	opt-in TF_FLASHNEXT_DECODE_GRAPH takes the dense split and leaves rounds with pockets eager; default serving unchanged (#2980); opt-in TF_FLASHNEXT_TP_WINDOW_GRAPH: --tp 2 verify windows as graphs, the peer epoch on the device; default serving unchanged; opt-in TF_FLASHNEXT_PROMPT_OVERLAP: --tp 2 prompt chunks as two halves, their expert exchanges on a side stream; default serving unchanged
++zig/src/families/flashnext/cuda_prompt.zig	0d68a37abf96896979ea6831ed1cc89b565c5ea09717573dc9354afb23b80df2	raw	opt-in TF_FLASHNEXT_DECODE_GRAPH takes the dense split and leaves rounds with pockets eager; default serving unchanged (#2980); opt-in TF_FLASHNEXT_TP_WINDOW_GRAPH: --tp 2 verify windows as graphs, the peer epoch on the device; default serving unchanged; opt-in TF_FLASHNEXT_PROMPT_OVERLAP: --tp 2 prompt chunks as two halves, their expert exchanges on a side stream; default serving unchanged; argmax moved to cuda_argmax.zig unchanged
+ zig/src/families/flashnext/cuda_prompt_load.zig	334d68cfca85c15c9d986d0c6b4f8f2a38569309b21bdac6d365935d73c115cd	raw
+ zig/src/families/flashnext/cuda_prompt_main.zig	2543cd166dc80cd97b1ca1ce930a6150f9d36b52ee231744606f83bf54f0669d	raw	main dfd9ac5ef4 (#2585: the TF_FLASHNEXT_* startup check), c274b45cc1 (the check through the flashnext module)
+ zig/src/families/flashnext/cuda_prompt_step.zig	e04030fb4a4fdb8780704a1bc0b5ba4b786159ab08a927fe32a636a893129d0c	raw
+-- 
+2.56.0
+

@@ -1,0 +1,94 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jay Leaton <58495321+jayleaton@users.noreply.github.com>
+Date: Thu, 26 Nov 2026 19:25:37 +0700
+Subject: [PATCH 88/93] flashnext cuda: the merge resolutions where the prompt
+ overlap and the small wins met
+
+The chunk's steps moved into cuda_batch_steps.zig with the prompt overlap, so the small wins' n-gram gather lives
+there as a Gather.Run held by the pass (begin, embedded after the hop's enter, join at the n-gram layer), both halves
+of an overlapped chunk go through it, the Flash Next environment test counts 64 settings and 47 switches, and the
+CHANGELOG keeps all three Unreleased bullets.
+---
+ CHANGELOG.md                                    |  4 ++--
+ zig/src/families/flashnext/cuda_batch_steps.zig | 12 ++++++------
+ zig/src/platform/environment_flashnext_test.zig |  4 ++--
+ 3 files changed, 10 insertions(+), 10 deletions(-)
+
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 6da18ca0e..05e0e770b 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -4,12 +4,12 @@ Each release's page on GitHub has its notes and measurements. See [the 1.0.0 rel
+ 
+ ## Unreleased
+ 
+-- Flash Next on CUDA: opt-in `TF_FLASHNEXT_PROMPT_OVERLAP` runs a `--tp 2` prompt chunk of at least 2,048 rows as two halves whose expert exchanges run on a side stream and NCCL communicator under the other half's layer, `TF_FLASHNEXT_OWNER_NOCLEAR` skips the owner-slot pass's zero fill of y, and `TF_FLASHNEXT_OVERLAP_OUTPROJ` moves the out projection's gathers to the side stream too; with all three, cold prefill is 42 to 45% faster at 8K, 32K and 128K on 2x RTX PRO 6000 with every token unchanged, at about 2.15 GiB more a rank (`--parallel 14` at a 49152-token window); default serving is unchanged (#1).
+-
+ - Flash Next CUDA: `--pp 2` serves the prompt cache, a state kept at a prompt chunk's mark taking the MTP head's deferred rows first. Each stage keeps its own layers' states (rank 0 also the MTP head's), saved, restored and dropped together over the rank wire as at `--tp 2`, so `--prompt-cache-gib` works as it does on one rank or at `--tp 2` and a returning conversation reuses its prefix. This changes `--pp 2`'s default: its prompt cache was off and a nonzero `--prompt-cache-gib` was refused, and it now takes the same default budget as one rank and `--tp 2` (`--prompt-cache-gib 0` turns it off). Replies are unchanged with or without the cache; `--spill-gib` and `--learn-conversations` are still refused under `--pp` (#2).
+ 
+ - Flash Next CUDA: three default-off switches trim a drafted round's host waits. `TF_FLASHNEXT_PLE_EARLY=1` reads a window's n-gram rows during its draft chain (both ranks at `--tp 2`), `TF_FLASHNEXT_PP_HEAD_SPLIT=1` splits a greedy verify's head between the two `--pp 2` stages, and `TF_FLASHNEXT_ROUND_TURN=1` takes the gather thread's start and the pick's blocking copy off the GPU's path. Replies are unchanged (#2).
+ 
++- Flash Next on CUDA: opt-in `TF_FLASHNEXT_PROMPT_OVERLAP` runs a `--tp 2` prompt chunk of at least 2,048 rows as two halves whose expert exchanges run on a side stream and NCCL communicator under the other half's layer, `TF_FLASHNEXT_OWNER_NOCLEAR` skips the owner-slot pass's zero fill of y, and `TF_FLASHNEXT_OVERLAP_OUTPROJ` moves the out projection's gathers to the side stream too; with all three, cold prefill is 42 to 45% faster at 8K, 32K and 128K on 2x RTX PRO 6000 with every token unchanged, at about 2.15 GiB more a rank (`--parallel 14` at a 49152-token window); default serving is unchanged (#1).
++
+ - Server: `/v1/metrics` reports a `tensorfold:open_connections` gauge, the client connections admitted over TCP or the Unix socket and not yet closed, including idle keep-alive ones (#3925). Thanks to @plotarmordev.
+ 
+ - Tools: served checks reject unexercised draft, seed, cache, cancellation and logit comparisons, covered by 11 served and constraint regression tests, and benchmark receipts name vacuous comparisons (#3772, refs #2460). Thanks to @jschmied.
+diff --git a/zig/src/families/flashnext/cuda_batch_steps.zig b/zig/src/families/flashnext/cuda_batch_steps.zig
+index fcbe13308..197f9dd4c 100644
+--- a/zig/src/families/flashnext/cuda_batch_steps.zig
++++ b/zig/src/families/flashnext/cuda_batch_steps.zig
+@@ -34,16 +34,17 @@ pub fn begin(p: anytype, ids: []const u32, pos0: usize, gather: *Gather, history
+     p.side_wait_out = false;
+     // the gather writes the scratch's pinned rows, so the last pass's uploads must have read them first
+     if (!p.prepared and !p.staged) try s.ready();
+-    gather.* = .{ .ngram = p.m.ngram, .history = history, .ids = ids, .emb = s.hostEmb(n), .xs = s.hostXs(n), .io = p.io, .lanes = p.lanes };
+-    p.gather_thread = if (p.prepared or p.staged or stage_hop.first(p.m) > 0) null else try std.Thread.spawn(.{}, Gather.main, .{gather});
++    gather.* = .{ .ngram = p.m.ngram, .history = history, .ids = ids, .emb = s.hostEmb(n), .xs = s.hostXs(n), .io = p.io, .lanes = p.lanes, .early = p.hooks.early };
++    p.gather_run = try Gather.Run.begin(gather, !(p.prepared or p.staged or stage_hop.first(p.m) > 0));
+     if (!p.staged) try p.stage(ids);
+     try stage_hop.enter(p, n);
++    if (p.gather_run) |*r| try r.embedded();
+ }
+ 
+ /// Joins the chunk's n-gram gather thread, if one still runs.
+ pub fn joinGather(p: anytype) void {
+-    if (p.gather_thread) |th| th.join();
+-    p.gather_thread = null;
++    if (p.gather_run) |*r| r.end();
++    p.gather_run = null;
+ }
+ 
+ /// The pass's stream waits for an exchange still running on the side stream.
+@@ -70,8 +71,7 @@ pub fn mixerStep(p: anytype, lw: *const Layer, layer: usize, ids: []const u32, g
+     try awaitSide(p);
+     const keep: LayerKeep = if (p.hooks.keep) |kp| kp.layers[layer] else .{};
+     if (layer == ple_layer) {
+-        joinGather(p);
+-        if (gather.failed) |err| return err;
++        if (p.gather_run) |*r| try r.join() else if (gather.failed) |err| return err;
+         if (Kernels.profile()) std.debug.print("batch: {d} rows' n-gram rows gathered on the host in {d:.1} ms\n", .{ n, @as(f64, @floatFromInt(gather.ns)) / 1e6 });
+         if (!p.staged) {
+             try p.upload(s.ple_emb, std.mem.sliceAsBytes(gather.emb));
+diff --git a/zig/src/platform/environment_flashnext_test.zig b/zig/src/platform/environment_flashnext_test.zig
+index c235c9cd1..78af80ead 100644
+--- a/zig/src/platform/environment_flashnext_test.zig
++++ b/zig/src/platform/environment_flashnext_test.zig
+@@ -33,13 +33,13 @@ fn check(name: []const u8, raw: []const u8, valid: bool) !void {
+     try t.expect(std.mem.endsWith(u8, why.?, e.rule(name).forms));
+ }
+ 
+-test "Flash Next strict env: the table holds all 61 settings: 44 switches, 12 integers, 2 reals, 3 structured" {
++test "Flash Next strict env: the table holds all 64 settings: 47 switches, 12 integers, 2 reals, 3 structured" {
+     var counts: [4]usize = @splat(0);
+     for (e.rules) |r| if (r.scope == .flashnext) {
+         try t.expect(std.mem.startsWith(u8, r.name, "TF_FLASHNEXT_"));
+         counts[@backingInt(group(r))] += 1;
+     };
+-    try t.expectEqual([4]usize{ 44, 12, 2, 3 }, counts);
++    try t.expectEqual([4]usize{ 47, 12, 2, 3 }, counts);
+ }
+ 
+ test "Flash Next strict env: unset and blank settings both read as the caller's default" {
+-- 
+2.56.0
+

@@ -1,0 +1,29 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jay Leaton <58495321+jayleaton@users.noreply.github.com>
+Date: Thu, 26 Nov 2026 13:33:55 +0700
+Subject: [PATCH 87/93] changelog: the --pp 2 prompt cache's default change,
+ and #2 on its Unreleased bullets
+
+---
+ CHANGELOG.md | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index fdc11ee45..6da18ca0e 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -6,9 +6,9 @@ Each release's page on GitHub has its notes and measurements. See [the 1.0.0 rel
+ 
+ - Flash Next on CUDA: opt-in `TF_FLASHNEXT_PROMPT_OVERLAP` runs a `--tp 2` prompt chunk of at least 2,048 rows as two halves whose expert exchanges run on a side stream and NCCL communicator under the other half's layer, `TF_FLASHNEXT_OWNER_NOCLEAR` skips the owner-slot pass's zero fill of y, and `TF_FLASHNEXT_OVERLAP_OUTPROJ` moves the out projection's gathers to the side stream too; with all three, cold prefill is 42 to 45% faster at 8K, 32K and 128K on 2x RTX PRO 6000 with every token unchanged, at about 2.15 GiB more a rank (`--parallel 14` at a 49152-token window); default serving is unchanged (#1).
+ 
+-- Flash Next CUDA: `--pp 2` serves the prompt cache, a state kept at a prompt chunk's mark taking the MTP head's deferred rows first. Each stage keeps its own layers' states (rank 0 also the MTP head's), saved, restored and dropped together over the rank wire as at `--tp 2`, so `--prompt-cache-gib` works as it does on one rank or at `--tp 2` and a returning conversation reuses its prefix. Replies are unchanged with or without the cache; `--spill-gib` and `--learn-conversations` are still refused under `--pp`.
++- Flash Next CUDA: `--pp 2` serves the prompt cache, a state kept at a prompt chunk's mark taking the MTP head's deferred rows first. Each stage keeps its own layers' states (rank 0 also the MTP head's), saved, restored and dropped together over the rank wire as at `--tp 2`, so `--prompt-cache-gib` works as it does on one rank or at `--tp 2` and a returning conversation reuses its prefix. This changes `--pp 2`'s default: its prompt cache was off and a nonzero `--prompt-cache-gib` was refused, and it now takes the same default budget as one rank and `--tp 2` (`--prompt-cache-gib 0` turns it off). Replies are unchanged with or without the cache; `--spill-gib` and `--learn-conversations` are still refused under `--pp` (#2).
+ 
+-- Flash Next CUDA: three default-off switches trim a drafted round's host waits. `TF_FLASHNEXT_PLE_EARLY=1` reads a window's n-gram rows during its draft chain (both ranks at `--tp 2`), `TF_FLASHNEXT_PP_HEAD_SPLIT=1` splits a greedy verify's head between the two `--pp 2` stages, and `TF_FLASHNEXT_ROUND_TURN=1` takes the gather thread's start and the pick's blocking copy off the GPU's path. Replies are unchanged.
++- Flash Next CUDA: three default-off switches trim a drafted round's host waits. `TF_FLASHNEXT_PLE_EARLY=1` reads a window's n-gram rows during its draft chain (both ranks at `--tp 2`), `TF_FLASHNEXT_PP_HEAD_SPLIT=1` splits a greedy verify's head between the two `--pp 2` stages, and `TF_FLASHNEXT_ROUND_TURN=1` takes the gather thread's start and the pick's blocking copy off the GPU's path. Replies are unchanged (#2).
+ 
+ - Server: `/v1/metrics` reports a `tensorfold:open_connections` gauge, the client connections admitted over TCP or the Unix socket and not yet closed, including idle keep-alive ones (#3925). Thanks to @plotarmordev.
+ 
+-- 
+2.56.0
+
