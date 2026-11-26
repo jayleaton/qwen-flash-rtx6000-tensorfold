@@ -1,0 +1,51 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jay Leaton <58495321+jayleaton@users.noreply.github.com>
+Date: Wed, 25 Nov 2026 15:57:48 +0700
+Subject: [PATCH 82/93] flashnext cuda: the collective's NCCL contract counts
+ the side split; the exchange and round-graph fixtures start with no side
+ communicator
+
+---
+ zig/src/families/flashnext/cuda_collective.zig        | 2 +-
+ zig/src/families/flashnext/cuda_moe_exchange_test.zig | 1 +
+ zig/src/families/flashnext/cuda_round_graph_test.zig  | 1 +
+ 3 files changed, 3 insertions(+), 1 deletion(-)
+
+diff --git a/zig/src/families/flashnext/cuda_collective.zig b/zig/src/families/flashnext/cuda_collective.zig
+index 75d44fed7..7e7f02b22 100644
+--- a/zig/src/families/flashnext/cuda_collective.zig
++++ b/zig/src/families/flashnext/cuda_collective.zig
+@@ -509,5 +509,5 @@ test "this file calls NCCL only to start, poll and abort, and for collectives NC
+         try std.testing.expect(known);
+         at = i + needle.len;
+     }
+-    try std.testing.expectEqual(@as(usize, 19), calls);
++    try std.testing.expectEqual(@as(usize, 20), calls);
+ }
+diff --git a/zig/src/families/flashnext/cuda_moe_exchange_test.zig b/zig/src/families/flashnext/cuda_moe_exchange_test.zig
+index c2358ab6e..84d0a1132 100644
+--- a/zig/src/families/flashnext/cuda_moe_exchange_test.zig
++++ b/zig/src/families/flashnext/cuda_moe_exchange_test.zig
+@@ -82,6 +82,7 @@ fn collective(pair: *[2]c_int, rank: usize, timeout_ms: u64) !Collective {
+     c.release = null;
+     c.comm = @ptrFromInt(0x1000);
+     c.parent = null;
++    c.side = null;
+     c.link = .{ .fd = pair[0] };
+     c.timeout_ms = timeout_ms;
+     c.rank = rank;
+diff --git a/zig/src/families/flashnext/cuda_round_graph_test.zig b/zig/src/families/flashnext/cuda_round_graph_test.zig
+index 59780712d..6c09f90df 100644
+--- a/zig/src/families/flashnext/cuda_round_graph_test.zig
++++ b/zig/src/families/flashnext/cuda_round_graph_test.zig
+@@ -105,6 +105,7 @@ fn collective(pair: *[2]c_int) !Collective {
+     c.release = null;
+     c.comm = @ptrFromInt(0x1000);
+     c.parent = null;
++    c.side = null;
+     c.link = .{ .fd = pair[0] };
+     c.timeout_ms = 1000;
+     c.lib.api.ncclAllReduce = Fake.allReduce;
+-- 
+2.56.0
+

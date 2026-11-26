@@ -1,0 +1,45 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jay Leaton <58495321+jayleaton@users.noreply.github.com>
+Date: Thu, 26 Nov 2026 17:03:43 +0700
+Subject: [PATCH 91/93] flashnext cuda: an early n-gram window served at --tp 2
+ rank 1 starts the next one from its history
+
+Early.serve dropped the held rows but kept the rolled history, so rank 1's extend for a window after
+the same history skipped begin and read the window's first rows after the old chain's tail. The ranks
+then ran that window on different n-gram rows. The host test serves a window, extends one after the
+same history and checks its rows against Ngram.rows.
+---
+ zig/src/families/flashnext/cuda_ple_early.zig | 11 +++++++++++
+ 1 file changed, 11 insertions(+)
+
+diff --git a/zig/src/families/flashnext/cuda_ple_early.zig b/zig/src/families/flashnext/cuda_ple_early.zig
+index f32e7cc6f..8c302b2b8 100644
+--- a/zig/src/families/flashnext/cuda_ple_early.zig
++++ b/zig/src/families/flashnext/cuda_ple_early.zig
+@@ -85,6 +85,7 @@ pub const Early = struct {
+     pub fn serve(e: *Early, g: anytype, history: []i64, ids: []const u32, emb: []u16, xs: []f32) !void {
+         const m = e.covered(history, ids);
+         e.n = 0;
++        e.after = e.history;
+         if (m == 0) return g.rows(history, ids, emb, xs);
+         const w = e.width;
+         if (emb.len != ids.len * w or xs.len != ids.len * (w / 32)) return error.UnexpectedTensor;
+@@ -154,5 +155,15 @@ test "early n-gram rows: every held prefix, a moved history and a changed token
+     try std.testing.expectEqualSlices(u16, &ref, &got);
+     try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(&ref_xs), std.mem.sliceAsBytes(&got_xs));
+     try std.testing.expectEqualSlices(i64, &ref_hist, &hist);
++    // a served window followed by one after the same history (rank 1's extend) reads it as a fresh begin would
++    e.begin(&.{5});
++    for (ids[0..4]) |t| e.add(&g, t);
++    hist = .{5};
++    try e.serve(&g, &hist, ids[0..4], got[0 .. 4 * w], got_xs[0..4]);
++    e.extend(&g, &.{5}, ids[0..3]);
++    hist = .{5};
++    try e.serve(&g, &hist, &ids, &got, &got_xs);
++    try std.testing.expectEqualSlices(u16, &want, &got);
++    try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(&want_xs), std.mem.sliceAsBytes(&got_xs));
+     try std.testing.expectEqual(@as(usize, 32), w);
+ }
+-- 
+2.56.0
+

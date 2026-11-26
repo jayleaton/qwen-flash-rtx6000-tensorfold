@@ -1,0 +1,62 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jay Leaton <58495321+jayleaton@users.noreply.github.com>
+Date: Thu, 26 Nov 2026 11:28:09 +0700
+Subject: [PATCH 86/93] flashnext cuda: under --pp 2 a prompt state kept at a
+ chunk's mark takes the MTP head's deferred rows first, so it no longer fails
+ NotAtMark
+
+---
+ CHANGELOG.md                                   | 2 +-
+ zig/src/families/flashnext/cuda_batch_hop.zig  | 9 +++++++++
+ zig/src/families/flashnext/cuda_lanes_snap.zig | 2 ++
+ 3 files changed, 12 insertions(+), 1 deletion(-)
+
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index deaccd7ba..fdc11ee45 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -6,7 +6,7 @@ Each release's page on GitHub has its notes and measurements. See [the 1.0.0 rel
+ 
+ - Flash Next on CUDA: opt-in `TF_FLASHNEXT_PROMPT_OVERLAP` runs a `--tp 2` prompt chunk of at least 2,048 rows as two halves whose expert exchanges run on a side stream and NCCL communicator under the other half's layer, `TF_FLASHNEXT_OWNER_NOCLEAR` skips the owner-slot pass's zero fill of y, and `TF_FLASHNEXT_OVERLAP_OUTPROJ` moves the out projection's gathers to the side stream too; with all three, cold prefill is 42 to 45% faster at 8K, 32K and 128K on 2x RTX PRO 6000 with every token unchanged, at about 2.15 GiB more a rank (`--parallel 14` at a 49152-token window); default serving is unchanged (#1).
+ 
+-- Flash Next CUDA: `--pp 2` serves the prompt cache. Each stage keeps its own layers' states (rank 0 also the MTP head's), saved, restored and dropped together over the rank wire as at `--tp 2`, so `--prompt-cache-gib` works as it does on one rank or at `--tp 2` and a returning conversation reuses its prefix. Replies are unchanged with or without the cache; `--spill-gib` and `--learn-conversations` are still refused under `--pp`.
++- Flash Next CUDA: `--pp 2` serves the prompt cache, a state kept at a prompt chunk's mark taking the MTP head's deferred rows first. Each stage keeps its own layers' states (rank 0 also the MTP head's), saved, restored and dropped together over the rank wire as at `--tp 2`, so `--prompt-cache-gib` works as it does on one rank or at `--tp 2` and a returning conversation reuses its prefix. Replies are unchanged with or without the cache; `--spill-gib` and `--learn-conversations` are still refused under `--pp`.
+ 
+ - Flash Next CUDA: three default-off switches trim a drafted round's host waits. `TF_FLASHNEXT_PLE_EARLY=1` reads a window's n-gram rows during its draft chain (both ranks at `--tp 2`), `TF_FLASHNEXT_PP_HEAD_SPLIT=1` splits a greedy verify's head between the two `--pp 2` stages, and `TF_FLASHNEXT_ROUND_TURN=1` takes the gather thread's start and the pick's blocking copy off the GPU's path. Replies are unchanged.
+ 
+diff --git a/zig/src/families/flashnext/cuda_batch_hop.zig b/zig/src/families/flashnext/cuda_batch_hop.zig
+index e673d9e48..85e8b3f37 100644
+--- a/zig/src/families/flashnext/cuda_batch_hop.zig
++++ b/zig/src/families/flashnext/cuda_batch_hop.zig
+@@ -198,6 +198,15 @@ test "rank 0 posts a late chunk's receive before the next send and absorbs it af
+     try leave(&zero, null); // the late receive, this send, its absorb, then this chunk back and the head
+     try std.testing.expectEqualStrings("GGLGATH", log.ops[0..log.n]);
+     log.n = 0;
++    // a kept state at a late chunk's mark: its rows received and absorbed now, once, and the next pass finds none
++    zero.hooks = .{ .logits = .none, .streams = 9, .stage = .{ .late = absorb } };
++    try leave(&zero, null);
++    try settle(hop);
++    try settle(hop);
++    zero.hooks = .{ .logits = .last, .streams = 9 };
++    try leave(&zero, null);
++    try std.testing.expectEqualStrings("GLAGTH", log.ops[0..log.n]);
++    log.n = 0;
+     zero.hooks = .{ .logits = .all, .streams = 9, .stage = .{ .split = true } };
+     try leave(&zero, null); // sent alone, then back and the head once rank 0 rejoins
+     try rejoin(&zero);
+diff --git a/zig/src/families/flashnext/cuda_lanes_snap.zig b/zig/src/families/flashnext/cuda_lanes_snap.zig
+index 29770da41..4114c12cf 100644
+--- a/zig/src/families/flashnext/cuda_lanes_snap.zig
++++ b/zig/src/families/flashnext/cuda_lanes_snap.zig
+@@ -88,6 +88,8 @@ pub fn Snaps(comptime Cuda: type) type {
+                 return x;
+             };
+             if (l.seq.fed != at) return error.NotAtMark;
++            // under --pp a chunk's head rows wait for the next pass: a state at its mark takes them now
++            if (l.draft) |*d| if (d.late_ids.len != 0) try @import("cuda_batch_hop.zig").settle(self.engine.hop orelse return error.NotAtMark);
+             // pending DeltaNet rows into the states first: a snapshot holds them as they stand
+             if (l.draft) |*d| try self.ops().flushLate(&l.seq, d);
+             if (self.ranks) |r| return try r.save(&l.seq, if (l.draft) |*d| d else null);
+-- 
+2.56.0
+

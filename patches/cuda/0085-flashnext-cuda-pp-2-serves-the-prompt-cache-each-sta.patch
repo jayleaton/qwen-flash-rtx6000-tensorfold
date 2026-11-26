@@ -1,0 +1,450 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jay Leaton <58495321+jayleaton@users.noreply.github.com>
+Date: Thu, 26 Nov 2026 00:17:07 +0700
+Subject: [PATCH 85/93] flashnext cuda: --pp 2 serves the prompt cache, each
+ stage keeping its own layers' states
+
+Snapshots size, save and restore a pipeline stage's own linear and attention layers (cuda_snap.stageBytes), and rank 0
+drives rank 1's copy over the existing save/restore/drop frames, so --prompt-cache-gib under --pp 2 follows the same
+rule as one rank or --tp 2. --spill-gib and --learn-conversations stay refused under --pp.
+---
+ CHANGELOG.md                                  |  2 +
+ zig/src/families/flashnext/cuda_disk.zig      |  4 +-
+ zig/src/families/flashnext/cuda_lanes.zig     |  2 +
+ .../families/flashnext/cuda_lanes_snap.zig    |  6 +-
+ .../flashnext/cuda_paging_snap_test.zig       | 47 +++++++++++++--
+ .../families/flashnext/cuda_rank_engine.zig   |  4 +-
+ zig/src/families/flashnext/cuda_snap.zig      | 60 +++++++++++--------
+ zig/src/native/cuda_family_memory.zig         | 16 ++++-
+ zig/src/native/cuda_refusal.zig               |  8 ++-
+ 9 files changed, 110 insertions(+), 39 deletions(-)
+
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index c2417fe94..deaccd7ba 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -6,6 +6,8 @@ Each release's page on GitHub has its notes and measurements. See [the 1.0.0 rel
+ 
+ - Flash Next on CUDA: opt-in `TF_FLASHNEXT_PROMPT_OVERLAP` runs a `--tp 2` prompt chunk of at least 2,048 rows as two halves whose expert exchanges run on a side stream and NCCL communicator under the other half's layer, `TF_FLASHNEXT_OWNER_NOCLEAR` skips the owner-slot pass's zero fill of y, and `TF_FLASHNEXT_OVERLAP_OUTPROJ` moves the out projection's gathers to the side stream too; with all three, cold prefill is 42 to 45% faster at 8K, 32K and 128K on 2x RTX PRO 6000 with every token unchanged, at about 2.15 GiB more a rank (`--parallel 14` at a 49152-token window); default serving is unchanged (#1).
+ 
++- Flash Next CUDA: `--pp 2` serves the prompt cache. Each stage keeps its own layers' states (rank 0 also the MTP head's), saved, restored and dropped together over the rank wire as at `--tp 2`, so `--prompt-cache-gib` works as it does on one rank or at `--tp 2` and a returning conversation reuses its prefix. Replies are unchanged with or without the cache; `--spill-gib` and `--learn-conversations` are still refused under `--pp`.
++
+ - Flash Next CUDA: three default-off switches trim a drafted round's host waits. `TF_FLASHNEXT_PLE_EARLY=1` reads a window's n-gram rows during its draft chain (both ranks at `--tp 2`), `TF_FLASHNEXT_PP_HEAD_SPLIT=1` splits a greedy verify's head between the two `--pp 2` stages, and `TF_FLASHNEXT_ROUND_TURN=1` takes the gather thread's start and the pick's blocking copy off the GPU's path. Replies are unchanged.
+ 
+ - Server: `/v1/metrics` reports a `tensorfold:open_connections` gauge, the client connections admitted over TCP or the Unix socket and not yet closed, including idle keep-alive ones (#3925). Thanks to @plotarmordev.
+diff --git a/zig/src/families/flashnext/cuda_disk.zig b/zig/src/families/flashnext/cuda_disk.zig
+index 9314069a4..1ba7beb71 100644
+--- a/zig/src/families/flashnext/cuda_disk.zig
++++ b/zig/src/families/flashnext/cuda_disk.zig
+@@ -81,7 +81,7 @@ pub fn View(comptime F: type) type {
+ 
+         /// A kept state's memory for `at` tokens with the head's rows if this server drafts, filled by `scatter`.
+         pub fn blank(c: *Target, at: u32) !*State {
+-            return snap.prepare(c.gpa, c.engine.driver, c.engine.keptOn(), at, .{ 0, 0 }, c.head != null, .full);
++            return snap.prepare(c.gpa, c.engine.driver, c.engine.keptOn(), at, .{ 0, 0 }, c.head != null, .full, .whole);
+         }
+ 
+         /// A state from a stream that did not draft lacks the head's rows this server's parts name: it stays off disk.
+@@ -152,7 +152,7 @@ test "the image's parts are cuda_snap.move's pieces in its order: sizes, offsets
+         defer parts.deinit(a);
+         try partsOf(at, head, &parts, a);
+         try std.testing.expectEqual(@as(u64, words), parts.items[0].bytes);
+-        const o = snap.order(at, head, .full);
++        const o = snap.order(at, head, .full, .whole);
+         var i: usize = 1;
+         var off: u64 = words; // the image's offset; move's buffer offset is this less the words
+         var moved: u64 = 0;
+diff --git a/zig/src/families/flashnext/cuda_lanes.zig b/zig/src/families/flashnext/cuda_lanes.zig
+index 97f733ea6..d4fcf1e55 100644
+--- a/zig/src/families/flashnext/cuda_lanes.zig
++++ b/zig/src/families/flashnext/cuda_lanes.zig
+@@ -39,6 +39,8 @@ pub fn Namespace(comptime Tri: type) type {
+         pub const snap_save = snaps.save;
+         pub const snap_restore = snaps.restore;
+         pub const snap_drop = snaps.drop;
++        /// Under --pp each stage keeps its own layers' states (cuda_snap.stageBytes): the cache serves as on one rank.
++        pub const stage_states = true;
+         /// A discrete card's freed pinned buffers: in the cache's budget, taken by the next state of their size.
+         pub const snap_spare = snaps.spare;
+         pub const snap_trim = snaps.trim;
+diff --git a/zig/src/families/flashnext/cuda_lanes_snap.zig b/zig/src/families/flashnext/cuda_lanes_snap.zig
+index 8c1cb520d..29770da41 100644
+--- a/zig/src/families/flashnext/cuda_lanes_snap.zig
++++ b/zig/src/families/flashnext/cuda_lanes_snap.zig
+@@ -26,7 +26,7 @@ pub fn Snaps(comptime Cuda: type) type {
+             const inpass = forms.in_pass and self.ranks == null and l.seq.media == null and forms.gdn_fused;
+             for (s.reuse.marks) |m| if (m > at and m < stop0) {
+                 if (inpass and n < parts.max_marks) {
+-                    if (snap.prepare(self.gpa, self.engine.driver, self.engine.keptOn(), m, historyAt(l.seq.history, ids, at, m), l.draft != null, l.seq.heads)) |p| {
++                    if (snap.prepare(self.gpa, self.engine.driver, self.engine.keptOn(), m, historyAt(l.seq.history, ids, at, m), l.draft != null, l.seq.heads, self.engine.span)) |p| {
+                         l.prepared[n] = p;
+                         marks[n] = .{ .at = m, .base = p.buf.ptr };
+                         n += 1;
+@@ -58,7 +58,7 @@ pub fn Snaps(comptime Cuda: type) type {
+         }
+ 
+         pub fn bytes(ptr: *anyopaque, at: u32) u64 {
+-            return snap.keptBytes(at, of(ptr).head != null, of(ptr).engine.heads, of(ptr).engine.kept != null);
++            return snap.keptBytes(at, of(ptr).head != null, of(ptr).engine.heads, of(ptr).engine.span, of(ptr).engine.kept != null);
+         }
+ 
+         /// The freed pinned buffers kept for the next host state (none on an integrated GPU).
+@@ -91,7 +91,7 @@ pub fn Snaps(comptime Cuda: type) type {
+             // pending DeltaNet rows into the states first: a snapshot holds them as they stand
+             if (l.draft) |*d| try self.ops().flushLate(&l.seq, d);
+             if (self.ranks) |r| return try r.save(&l.seq, if (l.draft) |*d| d else null);
+-            return try snap.save(self.gpa, self.engine.driver, self.engine.keptOn(), self.stream, &l.seq, if (l.draft) |*d| d else null);
++            return try snap.save(self.gpa, self.engine.driver, self.engine.keptOn(), self.stream, &l.seq, if (l.draft) |*d| d else null, self.engine.span);
+         }
+ 
+         pub fn restore(ptr: *anyopaque, owner: ?*anyopaque, saved: *anyopaque) anyerror!void {
+diff --git a/zig/src/families/flashnext/cuda_paging_snap_test.zig b/zig/src/families/flashnext/cuda_paging_snap_test.zig
+index 901d5d15f..658d90f95 100644
+--- a/zig/src/families/flashnext/cuda_paging_snap_test.zig
++++ b/zig/src/families/flashnext/cuda_paging_snap_test.zig
+@@ -82,7 +82,7 @@ test "paged snapshots: save and restore keep contiguous order across partial shu
+     f.ids = .{ 7, 2, 11, 0 };
+     f.init(&d);
+     var seq = f.seq(&d);
+-    const kept = try snap.save(std.testing.allocator, &d, null, stream, &seq, null);
++    const kept = try snap.save(std.testing.allocator, &d, null, stream, &seq, null, .whole);
+     defer snap.drop(std.testing.allocator, stream, kept);
+     const saved = Fake.copies;
+     const n = Fake.n;
+@@ -128,7 +128,7 @@ test "paged snapshots: a failed copy drains before freeing the snapshot destinat
+     var seq = f.seq(&d);
+     Fake.fail_copy = 5;
+     Fake.fail_wait = true;
+-    try std.testing.expectError(error.NotReady, snap.save(std.testing.allocator, &d, null, stream, &seq, null));
++    try std.testing.expectError(error.NotReady, snap.save(std.testing.allocator, &d, null, stream, &seq, null, .whole));
+     try std.testing.expect(!Fake.pending and !Fake.early_free);
+ }
+ 
+@@ -139,7 +139,7 @@ test "paged snapshots: drop requires context proof when its stream wait fails" {
+     f.ids = .{ 7, 2, 11, 0 };
+     f.init(&d);
+     var seq = f.seq(&d);
+-    const kept = try snap.save(std.testing.allocator, &d, null, stream, &seq, null);
++    const kept = try snap.save(std.testing.allocator, &d, null, stream, &seq, null, .whole);
+     Fake.pending = true;
+     Fake.fail_wait = true;
+     snap.drop(std.testing.allocator, stream, kept);
+@@ -160,7 +160,7 @@ test "paged snapshots: the pooled MTP head occupies the thirteenth layer with th
+     var head = try Draft.initIn(std.testing.allocator, &d, 200, 8, 16, &p, 0xa000_0000, Draft.runBytes(8, 16));
+     defer head.deinit();
+     head.len = seq.fed;
+-    const kept = try snap.save(std.testing.allocator, &d, null, stream, &seq, &head);
++    const kept = try snap.save(std.testing.allocator, &d, null, stream, &seq, &head, .whole);
+     defer snap.drop(std.testing.allocator, stream, kept);
+     const saved = Fake.copies;
+     const n = Fake.n;
+@@ -195,3 +195,42 @@ test "paged snapshots: the pooled MTP head occupies the thirteenth layer with th
+     for (saved[0..n], Fake.copies[0..n]) |a, b| try std.testing.expectEqual([3]u64{ a[1], a[0], a[2] }, b);
+     try std.testing.expectEqual(@as(usize, 150), head.len);
+ }
++
++test "a pipeline stage's state holds its own layers only, and restores them in the order it saved them" {
++    var d = Fake.driver();
++    const stream: cuda.Stream = .{ .d = &d, .handle = null };
++    const Span = @import("cuda_span.zig").Span;
++    const stages = [2]Span{ try Span.ofRank(24, 0), try Span.ofRank(24, 1) };
++    const tail = wt.ple_tail_n * wt.wide * 2;
++    try std.testing.expectEqual(snap.bytes(150, false, .full) + tail, snap.stageBytes(150, false, .full, stages[0]) + snap.stageBytes(150, false, .full, stages[1]));
++    const sp = stages[1];
++    var lin: [2][wt.linear_n]cuda.DeviceBuffer = undefined;
++    var att: [4][wt.attn_n]cuda.DeviceBuffer = undefined;
++    for (&lin, 0..) |*arr, k| for (arr, 0..) |*b, i| {
++        const own = sp.owns(@import("cuda_span.zig").Kind.linear.layer(i));
++        b.* = .{ .d = &d, .ptr = if (own) 0x10_0000 * (k + 1) + i * 0x1000 else 0, .len = 0, .borrowed = true };
++    };
++    for (&att, 0..) |*arr, k| for (arr, 0..) |*b, i| {
++        const own = sp.owns(@import("cuda_span.zig").Kind.attn.layer(i));
++        b.* = .{ .d = &d, .ptr = if (own) 0x100_0000 * (k + 1) + i * 0x1000 else 0, .len = 0, .borrowed = true };
++    };
++    var seq: prompt.Seq = .{ .conv = &lin[0], .state = &lin[1], .kc = &att[0], .vc = &att[1], .ikc = &att[2], .pooled = &att[3], .tail = .{ .d = &d, .ptr = 0x9000_0000, .len = 0, .borrowed = true }, .history = .{ 5, 9 }, .fed = 150, .logits = &.{}, .cap = 200 };
++    const kept = try snap.save(std.testing.allocator, &d, null, stream, &seq, null, sp);
++    defer snap.drop(std.testing.allocator, stream, kept);
++    const saved = Fake.copies;
++    const n = Fake.n;
++    var off: u64 = 0;
++    for (saved[0..n]) |c| {
++        try std.testing.expectEqual(kept.buf.ptr + off, c[0]);
++        try std.testing.expect(c[1] != 0); // no layer another stage holds
++        off += c[2];
++    }
++    try std.testing.expectEqual(@as(u64, snap.stageBytes(150, false, .full, sp)), off);
++    try std.testing.expectEqual(sp, kept.span);
++    seq.fed = 0;
++    Fake.n = 0;
++    try snap.restore(stream, &seq, null, kept);
++    try std.testing.expectEqual(n, Fake.n);
++    for (saved[0..n], Fake.copies[0..n]) |s, r| try std.testing.expectEqual([3]u64{ s[1], s[0], s[2] }, r);
++    try std.testing.expectEqual(@as(usize, 150), seq.fed);
++}
+diff --git a/zig/src/families/flashnext/cuda_rank_engine.zig b/zig/src/families/flashnext/cuda_rank_engine.zig
+index a64d32998..94fd3d762 100644
+--- a/zig/src/families/flashnext/cuda_rank_engine.zig
++++ b/zig/src/families/flashnext/cuda_rank_engine.zig
+@@ -304,7 +304,7 @@ pub const Session = struct {
+ 
+     /// The leader's copy, the head's rows in it with `d`; the peer has no head, and first flushes its pending rows.
+     pub fn save(s: *Session, q: *prompt.Seq, d: ?*mtp.Draft) !*snaps.Snap {
+-        const kept = try snaps.save(s.gpa, s.engine.driver, s.engine.keptOn(), s.engine.stream.*, q, d);
++        const kept = try snaps.save(s.gpa, s.engine.driver, s.engine.keptOn(), s.engine.stream.*, q, d, s.engine.span);
+         errdefer snaps.drop(s.gpa, s.engine.stream.*, kept);
+         kept.rank_id = s.next_object;
+         s.next_object = std.math.add(u64, s.next_object, 1) catch return error.BadRankFrame;
+@@ -448,7 +448,7 @@ pub const Session = struct {
+                     const ops: mtp.Ops(Tri) = .{ .e = s.engine, .tri = tri, .h = undefined };
+                     try ops.flushLate(q, w); // the state holds them as the leader's does
+                 }
+-                const kept = try snaps.save(s.gpa, s.engine.driver, s.engine.keptOn(), s.engine.stream.*, q, null);
++                const kept = try snaps.save(s.gpa, s.engine.driver, s.engine.keptOn(), s.engine.stream.*, q, null, s.engine.span);
+                 errdefer snaps.drop(s.gpa, s.engine.stream.*, kept);
+                 try s.saved.put(s.gpa, h.arg, kept);
+             },
+diff --git a/zig/src/families/flashnext/cuda_snap.zig b/zig/src/families/flashnext/cuda_snap.zig
+index 4be95e4c2..8d48034e7 100644
+--- a/zig/src/families/flashnext/cuda_snap.zig
++++ b/zig/src/families/flashnext/cuda_snap.zig
+@@ -8,6 +8,7 @@ const Draft = @import("cuda_mtp_draft.zig").Draft;
+ const pages = @import("cuda_pages.zig");
+ const sizes = @import("cuda_seq_bytes.zig");
+ const Heads = @import("cuda_heads.zig").Heads;
++const Span = @import("cuda_span.zig").Span;
+ 
+ const index_row = wt.index_dim * 2;
+ const tail_bytes = wt.ple_tail_n * wt.wide * 2;
+@@ -27,7 +28,12 @@ fn attnBytes(at: usize, h: Heads) usize {
+ 
+ /// Bytes a state at the model's heads `h` after `at` tokens takes: fixed DeltaNet pieces, attention by token.
+ pub fn bytes(at: usize, head: bool, h: Heads) usize {
+-    const own = wt.linear_n * (sizes.convBytes(h) + sizes.stateBytes(h)) + wt.attn_n * attnBytes(at, h) + tail_bytes;
++    return stageBytes(at, head, h, .whole);
++}
++
++/// `bytes` for a pipeline stage `sp`: its own layers' pieces, the n-gram tail, and the head's cache with `head`.
++pub fn stageBytes(at: usize, head: bool, h: Heads, sp: Span) usize {
++    const own = sp.held(.linear) * (sizes.convBytes(h) + sizes.stateBytes(h)) + sp.held(.attn) * attnBytes(at, h) + tail_bytes;
+     return own + if (head) attnBytes(at, head_heads) else 0;
+ }
+ 
+@@ -35,8 +41,8 @@ pub fn bytes(at: usize, head: bool, h: Heads) usize {
+ pub const host_grain: usize = 32 << 20;
+ 
+ /// Bytes a state's storage takes: in pinned host memory (`host`), `bytes` rounded up to `host_grain`.
+-pub fn keptBytes(at: usize, head: bool, h: Heads, host: bool) usize {
+-    const n = bytes(at, head, h);
++pub fn keptBytes(at: usize, head: bool, h: Heads, sp: Span, host: bool) usize {
++    const n = stageBytes(at, head, h, sp);
+     return if (host) std.mem.alignForward(usize, n, host_grain) else n;
+ }
+ 
+@@ -54,6 +60,8 @@ pub const Snap = struct {
+     head: bool,
+     /// The model's heads its pieces hold (the saved sequence's): a sequence of other heads cannot take it.
+     heads: Heads = .full,
++    /// The stage whose layers its pieces hold (a pipeline stage's own, else the whole model).
++    span: Span = .whole,
+ };
+ 
+ /// Where a kept state's pieces sit in its buffer (move's order) for a pass's marks (Hooks.marks): whole heads only.
+@@ -110,12 +118,12 @@ const Way = enum { save, restore, rows };
+ /// A piece `move` copies: `layers` buffers of `n` bytes, rows of `row` bytes (0: whole) a `per`-position block each.
+ pub const Piece = struct { layers: usize, n: usize, row: usize = 0, per: usize = 1 };
+ 
+-/// `move`'s pieces in order at `at` and the model's heads `h` (the disk image's at full): DeltaNet, attention, tail.
+-pub fn order(at: usize, head: bool, h: Heads) struct { p: [11]Piece, len: usize } {
++/// `move`'s pieces in order at `at`, heads `h` and stage `sp` (the disk image's whole): DeltaNet, attention, tail.
++pub fn order(at: usize, head: bool, h: Heads, sp: Span) struct { p: [11]Piece, len: usize } {
+     var o: [11]Piece = undefined;
+-    o[0] = .{ .layers = wt.linear_n, .n = sizes.convBytes(h) };
+-    o[1] = .{ .layers = wt.linear_n, .n = sizes.stateBytes(h) };
+-    o[2..6].* = attnOrder(wt.attn_n, at, h);
++    o[0] = .{ .layers = sp.held(.linear), .n = sizes.convBytes(h) };
++    o[1] = .{ .layers = sp.held(.linear), .n = sizes.stateBytes(h) };
++    o[2..6].* = attnOrder(sp.held(.attn), at, h);
+     o[6] = .{ .layers = 1, .n = tail_bytes };
+     if (head) o[7..11].* = attnOrder(1, at, head_heads);
+     return .{ .p = o, .len = if (head) 11 else 7 };
+@@ -132,17 +140,21 @@ fn attnOrder(layers: usize, at: usize, h: Heads) [4]Piece {
+ }
+ 
+ /// Each piece of the sequence (and the head's cache) to or from the buffer at `base`; .rows: the attention rows only.
+-fn move(stream: cuda.Stream, seq: *prompt.Seq, d: ?*Draft, base: u64, at: usize, way: Way) !void {
++fn move(stream: cuda.Stream, seq: *prompt.Seq, d: ?*Draft, base: u64, at: usize, sp: Span, way: Way) !void {
+     const dr = stream.d;
+     var off: u64 = 0;
+-    const o = order(at, d != null, seq.heads);
++    const o = order(at, d != null, seq.heads, sp);
++    if (seq.paged != null and !sp.isWhole()) return error.SnapShape; // a stage's caches are its own buffers, never pages
+     var bufs: [11][]cuda.DeviceBuffer = undefined;
+     bufs[0..7].* = .{ seq.conv, seq.state, seq.kc, seq.vc, seq.ikc, seq.pooled, (&seq.tail)[0..1] };
+     if (d) |h| bufs[7..11].* = .{ (&h.kc)[0..1], (&h.vc)[0..1], (&h.ikc)[0..1], (&h.pooled)[0..1] };
+     for (o.p[0..o.len], bufs[0..o.len], 0..) |p, layers, pi| {
+-        if (layers.len != p.layers) return error.SnapShape;
++        // a stage's arrays keep an empty buffer for every layer another stage holds
++        const kind: ?@import("cuda_span.zig").Kind = if (pi < 2) .linear else if (pi < 6) .attn else null;
++        if (layers.len != if (kind) |k| k.count() else p.layers) return error.SnapShape;
+         for (layers, 0..) |b, layer| {
+             if (p.n == 0) continue;
++            if (kind) |k| if (!sp.owns(k.layer(layer))) continue;
+             if (way == .rows and (pi < 2 or pi == 6)) {
+                 off += p.n;
+                 continue;
+@@ -173,27 +185,27 @@ fn move(stream: cuda.Stream, seq: *prompt.Seq, d: ?*Draft, base: u64, at: usize,
+             off += p.n;
+         }
+     }
+-    std.debug.assert(off == bytes(at, d != null, seq.heads));
++    std.debug.assert(off == stageBytes(at, d != null, seq.heads, sp));
+ }
+ 
+ /// A copy of `seq` (and of the head's cache, with `d`) as it stands after `seq.fed` tokens.
+-pub fn save(gpa: std.mem.Allocator, driver: *const cuda.Driver, spares: ?*cuda.HostSpares, stream: cuda.Stream, seq: *prompt.Seq, d: ?*Draft) !*Snap {
++pub fn save(gpa: std.mem.Allocator, driver: *const cuda.Driver, spares: ?*cuda.HostSpares, stream: cuda.Stream, seq: *prompt.Seq, d: ?*Draft, sp: Span) !*Snap {
+     const at = seq.fed;
+     if (d) |h| if (h.len != at or h.drafted != 0) return error.NotAtMark;
+-    const snap = try prepare(gpa, driver, spares, at, seq.history, d != null, seq.heads);
++    const snap = try prepare(gpa, driver, spares, at, seq.history, d != null, seq.heads, sp);
+     errdefer release(gpa, snap);
+     errdefer cuda.completion.drain(driver, stream, "a failed snapshot save did not drain");
+-    try move(stream, seq, d, snap.buf.ptr, at, .save);
++    try move(stream, seq, d, snap.buf.ptr, at, sp, .save);
+     try stream.synchronize();
+     return snap;
+ }
+ 
+ /// A kept state for position `at` that a pass running past it fills (Hooks.marks); `finish` adds the attention rows.
+-pub fn prepare(gpa: std.mem.Allocator, driver: *const cuda.Driver, spares: ?*cuda.HostSpares, at: usize, history: [2]i64, head: bool, heads: Heads) !*Snap {
++pub fn prepare(gpa: std.mem.Allocator, driver: *const cuda.Driver, spares: ?*cuda.HostSpares, at: usize, history: [2]i64, head: bool, heads: Heads, sp: Span) !*Snap {
+     const snap = try gpa.create(Snap);
+     errdefer gpa.destroy(snap);
+-    const buf, const pinned = try room(driver, bytes(at, head, heads), spares);
+-    snap.* = .{ .buf = buf, .host = pinned, .spares = if (pinned != null) spares else null, .at = at, .history = history, .head = head, .heads = heads };
++    const buf, const pinned = try room(driver, stageBytes(at, head, heads, sp), spares);
++    snap.* = .{ .buf = buf, .host = pinned, .spares = if (pinned != null) spares else null, .at = at, .history = history, .head = head, .heads = heads, .span = sp };
+     return snap;
+ }
+ 
+@@ -201,7 +213,7 @@ pub fn prepare(gpa: std.mem.Allocator, driver: *const cuda.Driver, spares: ?*cud
+ pub fn finish(stream: cuda.Stream, seq: *prompt.Seq, d: ?*Draft, snap: *Snap) !void {
+     if (seq.fed < snap.at) return error.NotAtMark;
+     if (d) |h| if (!snap.head or h.len < snap.at) return error.NotAtMark;
+-    try move(stream, seq, d, snap.buf.ptr, snap.at, .rows);
++    try move(stream, seq, d, snap.buf.ptr, snap.at, snap.span, .rows);
+ }
+ 
+ /// `seq` (and the head's cache, with `d`) becomes `snap`'s state; refused before any copy when it cannot hold it.
+@@ -210,7 +222,7 @@ pub fn restore(stream: cuda.Stream, seq: *prompt.Seq, d: ?*Draft, snap: *const S
+     if (!snap.heads.eql(seq.heads)) return error.SnapShape;
+     if (d) |h| if (!snap.head or snap.at > h.cap) return error.NoHeadState;
+     // a state with the head's rows serves a stream without drafts too: those rows stay in the buffer
+-    try move(stream, seq, d, snap.buf.ptr, snap.at, .restore);
++    try move(stream, seq, d, snap.buf.ptr, snap.at, snap.span, .restore);
+     try stream.synchronize();
+     seq.history = snap.history;
+     seq.fed = snap.at;
+@@ -240,7 +252,7 @@ test "a state at a rank's half of the heads: half the conv windows, states and K
+     try std.testing.expectEqual(@as(usize, 12 * (2 * 256 * 2 + 128 * 2)), bytes(1, false, h) - bytes(0, false, h));
+     // the head's cache keeps its two KV heads beside the model's one
+     try std.testing.expectEqual(@as(usize, 12 * (2 * 256 * 2 + 128 * 2) + (2 * 2 * 256 * 2 + 128 * 2)), bytes(1, true, h) - bytes(0, true, h));
+-    const o = order(8, true, h);
++    const o = order(8, true, h, .whole);
+     try std.testing.expectEqual(@as(usize, 3 * 5120 * 2), o.p[0].n);
+     try std.testing.expectEqual(@as(usize, 24 * 128 * 128 * 4), o.p[1].n);
+     for (o.p[2..4]) |p| try std.testing.expectEqual(@as(usize, 512), p.row);
+@@ -316,7 +328,7 @@ test "a discrete card keeps states in mapped pinned host memory, pinned once for
+         var spares: cuda.HostSpares = .{ .mapped = true };
+         const kept_on = if (host) &spares else null;
+         const before = cuda.usage(false).device;
+-        const kept = try prepare(std.testing.allocator, &d, kept_on, 8, .{ 1, 2 }, true, .full);
++        const kept = try prepare(std.testing.allocator, &d, kept_on, 8, .{ 1, 2 }, true, .full, .whole);
+         // the device copies reach the state at buf.ptr either way: the host's mapped address, or its device buffer
+         try std.testing.expectEqual(@as(u64, if (host) 0x6000_0000 else 0x8000_0000), kept.buf.ptr);
+         try std.testing.expectEqual(bytes(8, true, .full), kept.buf.len);
+@@ -324,9 +336,9 @@ test "a discrete card keeps states in mapped pinned host memory, pinned once for
+         try std.testing.expectEqual(before + if (host) 0 else kept.buf.len, cuda.usage(false).device);
+         drop(std.testing.allocator, stream, kept);
+         // a later state of the same band takes the freed buffer: no second pin
+-        const again = try prepare(std.testing.allocator, &d, kept_on, 100, .{ 1, 2 }, true, .full);
++        const again = try prepare(std.testing.allocator, &d, kept_on, 100, .{ 1, 2 }, true, .full, .whole);
+         drop(std.testing.allocator, stream, again);
+-        try std.testing.expectEqual(if (host) keptBytes(100, true, .full, true) else 0, spares.bytes());
++        try std.testing.expectEqual(if (host) keptBytes(100, true, .full, .whole, true) else 0, spares.bytes());
+         spares.deinit();
+         const c = Placing.counts;
+         const dev: usize = if (host) 0 else 2;
+diff --git a/zig/src/native/cuda_family_memory.zig b/zig/src/native/cuda_family_memory.zig
+index 1a7e139cf..da434f850 100644
+--- a/zig/src/native/cuda_family_memory.zig
++++ b/zig/src/native/cuda_family_memory.zig
+@@ -84,12 +84,17 @@ pub fn room(comptime F: type, ptr: *anyopaque, local: u64) !u64 {
+     return local;
+ }
+ 
++/// Whether each pipeline stage keeps its own layers' prompt states, so --pp serves the prompt cache as --tp does.
++pub fn stageStates(comptime F: type) bool {
++    return @hasDecl(F, "stage_states") and F.stage_states;
++}
++
+ /// `o` with the family's own prompt-cache budget (`prompt_cache_gib`) when --prompt-cache-gib is not given.
+ pub fn familyOpen(comptime F: type, o: api.Open) api.Open {
+     if (o.prompt_cache_gib != null) return o;
+     var q = o;
+-    // pipeline stages keep no prompt states yet: no cache unless asked for, which `cuda_refusal.family` refuses
+-    if (o.pp != 1) q.prompt_cache_gib = 0 else if (comptime @hasDecl(F, "prompt_cache_gib")) q.prompt_cache_gib = F.prompt_cache_gib else return o;
++    // stages without their own prompt states keep no cache unless asked for, which `cuda_refusal.family` refuses
++    if (o.pp != 1 and !stageStates(F)) q.prompt_cache_gib = 0 else if (comptime @hasDecl(F, "prompt_cache_gib")) q.prompt_cache_gib = F.prompt_cache_gib else return o;
+     return q;
+ }
+ 
+@@ -129,6 +134,13 @@ test "a family's own prompt-cache budget applies only where the operator set non
+     try std.testing.expectEqual(@as(?f64, 1), familyOpen(Own, unset).prompt_cache_gib);
+     const off: api.Open = .{ .dir = "d", .model_type = "m", .prompt_cache_gib = 0 };
+     try std.testing.expectEqual(@as(?f64, 0), familyOpen(Own, off).prompt_cache_gib);
++    // --pp: no cache on stages without their own states; stages that keep them follow the same rule as one rank
++    const Staged = struct {
++        pub const stage_states = true;
++    };
++    const staged: api.Open = .{ .dir = "d", .model_type = "m", .pp = 2 };
++    try std.testing.expectEqual(@as(?f64, 0), familyOpen(Plain, staged).prompt_cache_gib);
++    try std.testing.expectEqual(@as(?f64, null), familyOpen(Staged, staged).prompt_cache_gib);
+ }
+ 
+ test {
+diff --git a/zig/src/native/cuda_refusal.zig b/zig/src/native/cuda_refusal.zig
+index 007ab3265..08019d5ab 100644
+--- a/zig/src/native/cuda_refusal.zig
++++ b/zig/src/native/cuda_refusal.zig
+@@ -42,6 +42,7 @@ pub const no_ranks = "this CUDA family has no tensor-parallel ranks: serve witho
+ pub const no_stages = "--pp: this CUDA family has no pipeline stages: serve with --pp 1";
+ pub const two_stages = "--pp: pipeline stages run on two ranks: serve with --pp 2";
+ pub const stage_states = "--pp: pipeline stages keep no prompt states yet: serve without --prompt-cache-gib, --spill-gib and --learn-conversations";
++pub const stage_disk = "--pp: pipeline stages keep no prompt states on disk: serve without --spill-gib and --learn-conversations";
+ 
+ /// --tp for a family that opens outside `family()` (Fish, Qwen4, LFM2): refused, never ignored.
+ pub fn unranked(o: api.Open) ?[]const u8 {
+@@ -60,7 +61,8 @@ pub fn family(comptime F: type, o: api.Open) ?[]const u8 {
+     const ranked = @hasDecl(F, "Options") and @hasField(F.Options, "rank");
+     if (o.pp != 1 and !(@hasDecl(F, "Options") and @hasField(F.Options, "pp"))) return no_stages;
+     if (o.pp > 2) return two_stages;
+-    if (o.pp != 1 and ((o.prompt_cache_gib orelse 0) > 0 or o.spill != .off or o.learn_conversations)) return stage_states;
++    if (o.pp != 1 and (o.spill != .off or o.learn_conversations)) return if (@import("cuda_family_memory.zig").stageStates(F)) stage_disk else stage_states;
++    if (o.pp != 1 and (o.prompt_cache_gib orelse 0) > 0 and !@import("cuda_family_memory.zig").stageStates(F)) return stage_states;
+     if (o.tp != 1 and !ranked) return no_ranks;
+     // ahead of the drafter's and --learn-conversations' refusals (--spill-gib sets that flag), on a line of its own
+     if (o.spill == .evicted and F != nemotron.native and @import("cuda_disk.zig").keptDisk(F) == null) return "--spill-gib keeps evicted states on disk for Nemotron, the Qwen hybrids, Flash Next, Gemma 4, Dory and Spark2.5 only on CUDA: serve this model without it";
+@@ -408,6 +410,8 @@ test "--pp: a family without stages, more than two stages and stage prompt state
+     const fnx = @import("flashnext").native;
+     try std.testing.expect(family(fnx, .{ .dir = "d", .model_type = "m", .pp = 2, .prompt_cache_gib = 0 }) == null);
+     try std.testing.expectEqualStrings(two_stages, family(fnx, .{ .dir = "d", .model_type = "m", .pp = 3, .prompt_cache_gib = 0 }).?);
+-    try std.testing.expectEqualStrings(stage_states, family(fnx, .{ .dir = "d", .model_type = "m", .pp = 2, .prompt_cache_gib = 4 }).?);
++    // Flash Next's stages keep their own layers' states: the cache serves, the disk spill does not
++    try std.testing.expect(family(fnx, .{ .dir = "d", .model_type = "m", .pp = 2, .prompt_cache_gib = 4 }) == null);
++    try std.testing.expectEqualStrings(stage_disk, family(fnx, .{ .dir = "d", .model_type = "m", .pp = 2, .prompt_cache_gib = 4, .learn_conversations = true }).?);
+     try std.testing.expectEqualStrings(no_stages, unranked(.{ .dir = "d", .model_type = "qwen4", .pp = 2 }).?);
+ }
+-- 
+2.56.0
+

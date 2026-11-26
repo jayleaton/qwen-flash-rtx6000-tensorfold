@@ -1,0 +1,114 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jay Leaton <58495321+jayleaton@users.noreply.github.com>
+Date: Wed, 25 Nov 2026 15:04:49 +0700
+Subject: [PATCH 78/93] flashnext cuda: an owner-slot prompt pass skips the
+ zero fill of its expert rows behind TF_FLASHNEXT_OWNER_NOCLEAR
+
+---
+ docs/environment.md                             | 1 +
+ zig/src/families/flashnext/cuda_lanes_load.zig  | 1 +
+ zig/src/families/flashnext/cuda_moe_native.zig  | 7 +++++--
+ zig/src/families/flashnext/cuda_owner_slots.zig | 8 ++++++++
+ zig/src/platform/environment.zig                | 1 +
+ zig/src/platform/environment_flashnext_test.zig | 4 ++--
+ 6 files changed, 18 insertions(+), 4 deletions(-)
+
+diff --git a/docs/environment.md b/docs/environment.md
+index 287dd2786..48966eb39 100644
+--- a/docs/environment.md
++++ b/docs/environment.md
+@@ -143,6 +143,7 @@ stops the start with the variable, the supplied text and the accepted forms.
+ | `TF_FLASHNEXT_GDN_FUSED` | Exactly `0` or `1`; default on |
+ | `TF_FLASHNEXT_GDN_SPLIT` | Exactly `0` or `1`; default off. `1` runs a fused prompt pass's DeltaNet chain over two blocks a value head when the device has an SM for each block, with the same bits |
+ | `TF_FLASHNEXT_OWNER_SLOTS` | Exactly `0` or `1`; default off. `1`: a `--tp 2` prompt pass over 64 rows outside a capture sends each rank only the half rows of the slots it owns, with the same bits; both ranks must agree |
++| `TF_FLASHNEXT_OWNER_NOCLEAR` | Exactly `0` or `1`; default off. `1`: a pass on the owner-slot exchange skips the zero fill of its expert rows `y` (11 slots of 2,560 FP32 a row, about 0.9 GB a layer at 8,192 rows): its pack and sum read only the half rows this rank's experts and shared half wrote, so the bits are the same. Inert without `TF_FLASHNEXT_OWNER_SLOTS`. |
+ | `TF_FLASHNEXT_HIDDEN_SUM` | Exactly `0` or `1`; default off. `1` sums the MoE slots in owner order on every CUDA path, which changes tokens once against `0`, and at `--tp 2` with the shared expert split exchanges one hidden-size row a layer (TP2 keeps TP1's bits); read at load, both ranks must agree, and it keys the kept prompt states |
+ | `TF_FLASHNEXT_ROUTE_FUSED` | Exactly `0` or `1`; default off. `1`: a MoE layer's pass of up to 16 rows on our glue runs its router in two launches instead of four: the logits over 8 experts a block (the same tiles and sums), then top-k, the rank's own picks and the expert plan in one block, with the same bits; read at load, the ranks need not agree |
+ | `TF_FLASHNEXT_GDN_LANES` | Exactly `0` or `1`; default on |
+diff --git a/zig/src/families/flashnext/cuda_lanes_load.zig b/zig/src/families/flashnext/cuda_lanes_load.zig
+index 75f18099d..97e5babba 100644
+--- a/zig/src/families/flashnext/cuda_lanes_load.zig
++++ b/zig/src/families/flashnext/cuda_lanes_load.zig
+@@ -49,6 +49,7 @@ pub fn open(comptime F: type, gpa: std.mem.Allocator, io: std.Io, ctx: *const cu
+     // both ranks of --tp 2 must agree on these: the rank identity carries them
+     @import("cuda_moe_hidden_sum.zig").on = try @import("cuda_moe_hidden_sum.zig").enabled();
+     @import("cuda_owner_slots.zig").on = try @import("cuda_owner_slots.zig").enabled();
++    @import("cuda_owner_slots.zig").no_clear = try @import("cuda_owner_slots.zig").noClearEnabled();
+     @import("cuda_peer_slots.zig").gather_on = try @import("cuda_peer_slots.zig").gatherEnabled();
+     @import("cuda_outproj_ksplit.zig").on = try @import("cuda_outproj_ksplit.zig").enabled();
+     const driver: *cuda.Driver = @constCast(ctx.d);
+diff --git a/zig/src/families/flashnext/cuda_moe_native.zig b/zig/src/families/flashnext/cuda_moe_native.zig
+index ab27ba73a..95ed78811 100644
+--- a/zig/src/families/flashnext/cuda_moe_native.zig
++++ b/zig/src/families/flashnext/cuda_moe_native.zig
+@@ -25,11 +25,14 @@ pub fn run(self: anytype, native: *const mixed.Owned, n: usize, pairs: usize, pl
+     const y_bytes = exchange.clearedRows(native.world, n) * slots * dims * 4;
+     // the hidden-size exchange reads only the slots this rank writes, so it needs no cleared y
+     const hidden = hidden_sum.applies(native.world, native.split_shared);
+-    if (zs.clearsY(native.world, native.rank) and !hidden) try self.stream.d.check(self.stream.d.api.cuMemsetD8Async(s.y, 0, y_bytes, self.stream.handle), "cuMemsetD8Async");
+     const split = !hidden and native.world != 1 and exchange.rowSplit(native.world, n);
+     // a pass the peer's mapped buffer takes (TF_FLASHNEXT_PEER_SLOTS) keeps it, ahead of the owner-slot exchange
+     const via_peer = native.world != 1 and peer.PeerSlots.fits(n) and if (self.m.collective) |c| c.peer != null else false;
+-    const planned = if (split and !via_peer and @import("cuda_owner_slots.zig").on and !hidden_sum.on) try exchange.plan(self, .{ .first = owned.first, .count = owned.count, .split = native.split_shared, .rank = native.rank }, n) else null;
++    const owner = @import("cuda_owner_slots.zig");
++    const planned = if (split and !via_peer and owner.on and !hidden_sum.on) try exchange.plan(self, .{ .first = owned.first, .count = owned.count, .split = native.split_shared, .rank = native.rank }, n) else null;
++    // an owner-slot pass reads only the half rows written below (TF_FLASHNEXT_OWNER_NOCLEAR)
++    const uncleared = planned != null and owner.no_clear;
++    if (zs.clearsY(native.world, native.rank) and !hidden and !uncleared) try self.stream.d.check(self.stream.d.api.cuMemsetD8Async(s.y, 0, y_bytes, self.stream.handle), "cuMemsetD8Async");
+     const side = try shared.fork(self, native, n);
+     switch (owned.format) {
+         .nvfp4 => {
+diff --git a/zig/src/families/flashnext/cuda_owner_slots.zig b/zig/src/families/flashnext/cuda_owner_slots.zig
+index 2c1ba9e0d..c5deeb493 100644
+--- a/zig/src/families/flashnext/cuda_owner_slots.zig
++++ b/zig/src/families/flashnext/cuda_owner_slots.zig
+@@ -16,6 +16,14 @@ pub fn enabled() !bool {
+     return @import("sys").environment.read(bool, "TF_FLASHNEXT_OWNER_SLOTS", false);
+ }
+ 
++/// TF_FLASHNEXT_OWNER_NOCLEAR as read at load: an owner-slot pass leaves y uncleared, since its pack and sum read
++/// only the half rows this rank's experts and shared half wrote.
++pub var no_clear = false;
++
++pub fn noClearEnabled() !bool {
++    return @import("sys").environment.read(bool, "TF_FLASHNEXT_OWNER_NOCLEAR", false);
++}
++
+ /// The rank's experts and shared split: what decides which half rows of each pair it owns.
+ pub const Owner = struct { first: usize, count: usize, split: bool, rank: usize };
+ 
+diff --git a/zig/src/platform/environment.zig b/zig/src/platform/environment.zig
+index f04af20c9..97bccdbe6 100644
+--- a/zig/src/platform/environment.zig
++++ b/zig/src/platform/environment.zig
+@@ -211,6 +211,7 @@ pub const rules = [_]Rule{
+     .{ .name = "TF_FLASHNEXT_GDN_FUSED", .scope = .flashnext, .kind = .flag, .forms = "0 or 1 (default 1)" },
+     .{ .name = "TF_FLASHNEXT_GDN_SPLIT", .scope = .flashnext, .kind = .flag, .forms = "0 or 1 (default 0)" },
+     .{ .name = "TF_FLASHNEXT_OWNER_SLOTS", .scope = .flashnext, .kind = .flag, .forms = "0 or 1 (default 0)" },
++    .{ .name = "TF_FLASHNEXT_OWNER_NOCLEAR", .scope = .flashnext, .kind = .flag, .forms = "0 or 1 (default 0; 1: an owner-slot prompt pass skips the zero fill of its expert rows)" },
+     .{ .name = "TF_FLASHNEXT_HIDDEN_SUM", .scope = .flashnext, .kind = .flag, .forms = "0 or 1 (default 0)" },
+     .{ .name = "TF_FLASHNEXT_ROUTE_FUSED", .scope = .flashnext, .kind = .flag, .forms = "0 or 1 (default 0)" },
+     .{ .name = "TF_FLASHNEXT_GDN_LANES", .scope = .flashnext, .kind = .flag, .forms = "0 or 1 (default 1)" },
+diff --git a/zig/src/platform/environment_flashnext_test.zig b/zig/src/platform/environment_flashnext_test.zig
+index 2a4492ab3..01b5f4f49 100644
+--- a/zig/src/platform/environment_flashnext_test.zig
++++ b/zig/src/platform/environment_flashnext_test.zig
+@@ -33,13 +33,13 @@ fn check(name: []const u8, raw: []const u8, valid: bool) !void {
+     try t.expect(std.mem.endsWith(u8, why.?, e.rule(name).forms));
+ }
+ 
+-test "Flash Next strict env: the table holds all 59 settings: 42 switches, 12 integers, 2 reals, 3 structured" {
++test "Flash Next strict env: the table holds all 60 settings: 43 switches, 12 integers, 2 reals, 3 structured" {
+     var counts: [4]usize = @splat(0);
+     for (e.rules) |r| if (r.scope == .flashnext) {
+         try t.expect(std.mem.startsWith(u8, r.name, "TF_FLASHNEXT_"));
+         counts[@backingInt(group(r))] += 1;
+     };
+-    try t.expectEqual([4]usize{ 42, 12, 2, 3 }, counts);
++    try t.expectEqual([4]usize{ 43, 12, 2, 3 }, counts);
+ }
+ 
+ test "Flash Next strict env: unset and blank settings both read as the caller's default" {
+-- 
+2.56.0
+
