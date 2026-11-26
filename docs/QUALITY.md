@@ -1,5 +1,50 @@
 # Quality
 
+## Exactness of patches 0077-0093 (2026-11-26)
+
+On the host and build in [PERFORMANCE](PERFORMANCE.md#patches-0077-0093-2026-11-26):
+- **The arms and cold 128K:** every cell of every arm hashes equal to R, R equals the recipe on all 8 keys, and every
+  128K reply is `9a3c5d245425`.
+- **OpenCode replay** (62 turns, greedy, 320 tokens a turn): the token ids of every `--pp 2` arm, with or without the
+  cache and the round switches, and of `tp2-fast` with the cache, equal the 0076 `pp2-prefill`'s and the ids pinned from
+  an earlier run, on every turn. There were 0 `NotAtMark` warnings.
+- **Mixed traffic:** every decoder reply on `tp2-fast`, the 0076 `pp2-prefill` and the new `pp2-prefill` equals its
+  solo reply, and every solo reply equals `tp2-fast`'s.
+- **Soak of `tp2-overlap` with the prompt cache, 15 minutes:** STABLE.
+  - 4 probes and 64 load rounds.
+  - Probe hashes constant and equal to the recipe's (`153389030f94`, `147305861125`, `ddadf33e7860`).
+  - 0 failed requests, no rank exit, no engine errors, code x1 mean 378.2 with 0.0% drift.
+  - The new `pp2-prefill` was not soaked: the run's budget guard dropped it. The same levers with the cache were
+    STABLE in a 10-minute soak on an earlier build, before 0086 and with a since-dropped switch on as well.
+
+**`tp2-overlap` before the fix:**
+- **Agent:** one OpenCode turn (of 24, one workflow at a time) parted from the reference at token 276.
+- **Mixed:** one decoder's lone reply parted at token 127 in 5 of 10 runs.
+- **The cause:** after serving a window's early n-gram rows, rank 1 kept the old chain's rolled history. When the next
+  window started after the same two tokens, it read that window's first rows with the stale history, so the ranks ran
+  the window on different rows.
+  - Only lone streams use the early rows, and only rank 1 at `--tp 2` reads them this way.
+  - `--pp 2` is not affected, and neither is `tp2-fast`, which does not set `TF_FLASHNEXT_PLE_EARLY`.
+- **The fix, 0091:** `serve` restarts the rolled history.
+- **Its host test:** serves a window, extends one after the same history and compares the rows with the n-gram
+  table's own read. It fails on the tree before 0091 and passes after it.
+
+**The GPU check** (2x RTX PRO 6000 Workstation Edition, 600 W, NODE, peer-to-peer 52.6 / 52.3 GB/s). Each arm's
+replies were compared with the run above, pinned:
+
+| arm | build | prediction | result |
+| --- | --- | --- | --- |
+| `tp2-fast` + early rows, x16 | before 0091 | the lone decoder's reply parts at token 127, the other 7 equal | met |
+| `tp2-fast` + the overlap (no early rows), x14 | before 0091 | all 8 lone replies equal | met |
+| `tp2-overlap`, x14 | 0093 | all 8 lone replies and the 32K-prompt scenario's replies equal | met |
+| `tp2-overlap` + cache, x14 | 0093 | the 24 OpenCode turns equal the pinned ids | met: the turn at 276 now hashes `44e419eaaaa3`, as on `tp2-fast` |
+
+- **What it shows:**
+  - the early rows alone reproduce the fault before the fix;
+  - the overlap alone is exact;
+  - the fix ends both failures.
+- **Quality suite:** not rerun on 0093. Every profile's tokens equal RC-tp2's, so its 213/228 stands for them.
+
 ## Soaks of `tp2-fast` and `pp2-prefill` (2026-11-24)
 
 Each profile for 30 minutes on the Workstation Edition host in [PERFORMANCE](PERFORMANCE.md):

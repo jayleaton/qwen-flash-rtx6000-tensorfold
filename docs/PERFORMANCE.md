@@ -6,6 +6,78 @@ peer-to-peer read and write OK, 38.9 GiB/s each way), 2x Xeon 6520P, driver 620.
 `Qwen/Qwen3.8-Flash-Next-FP8@7fb48d70`, `--tp 2`, ranks on 127.0.0.1, each under
 `numactl --cpunodebind=0 --preferred=0`.
 
+## Patches 0077-0093 (2026-11-26)
+
+- **Host:** a rented host with 2x RTX PRO 6000 Blackwell Workstation Edition (600 W, one NUMA node, topology NODE,
+  peer-to-peer 53.8 / 53.5 GB/s).
+  - AMD Threadripper PRO 7965WX (24 cores), governor `schedutil`, driver 615.71.09, NCCL 2.32.6.
+  - Both ranks under `numactl --cpunodebind=0`, on 127.0.0.1.
+- **Build:** the series to `0090` (tree of `fp8/combined-improvements` a87951e4a), before rank 1's early-row fix (0091).
+- **Cells:** as in the section below, with `--prompt-cache-gib 0`, 2 cells an arm in one A-B-B-A sitting
+  (R C CO PF PK PK PF CO C R), then C at 16 streams once.
+- **Arms:**
+  - R is the 0076 recipe's `--tp 2` (stack E + RC-tp2);
+  - C is `tp2-fast` and CO is `tp2-overlap`, both at 14 streams;
+  - C16 is `tp2-fast` as shipped, at 16 streams;
+  - PF is the 0076 `pp2-prefill` and PK is PF + the three round switches, the new `pp2-prefill`.
+  - C is served at 14 streams like CO, so the x16 rows compare like with like. Its clients still run at 1 and 16.
+
+| tok/s | cold 8K | cold 32K | code x1 | chat x1 | code x16 | chat x16 |
+| --- | --- | --- | --- | --- | --- | --- |
+| R (x16) | 6,513 | 6,614 | 351.4 | 241.5 | 1,087.1 | 984.7 |
+| C = `tp2-fast` (x14) | 6,529 | 6,634 | 364.8 | 256.1 | 1,012.2 | 804.0 |
+| C16 = `tp2-fast` (x16, as shipped) | 6,529 | 6,623 | 365.1 | 257.1 | 1,155.8 | 1,072.5 |
+| **CO = `tp2-overlap`** (x14) | **9,026** (+38.3%) | **9,343** (+40.8%) | **375.7** (+3.0%) | **263.0** (+2.7%) | 1,018.6 (+0.6%) | 804.8 (+0.1%) |
+| PF = 0076 `pp2-prefill` | 8,146 | 12,595 | 300.1 | 207.4 | 1,198.7 | 1,182.2 |
+| **PK = `pp2-prefill`** | 8,142 | 12,596 | **310.6** (+3.5%) | **213.0** (+2.7%) | **1,212.6** (+1.2%) | **1,198.6** (+1.4%) |
+
+- **The table:**
+  - code and chat x1 are `bench_openai`'s one-stream greedy rows;
+  - CO's percentages are against C, and PK's against PF;
+  - every arm's hashes equal R's, and R's equal the recipe's.
+- **Time to first token:** CO cuts C's from 1.25 to 0.91 s at 8K and from 4.94 to 3.51 s at 32K.
+- **Cold 128K,** at `--context 139264 --parallel 4`, A-B-B-A, 2 cells an arm, `--prompt-cache-gib 0`:
+
+  | arm | TTFT s | tok/s |
+  | --- | --- | --- |
+  | R | 20.58 | 6,368 |
+  | C | 20.54 | 6,381 |
+  | **CO** | **14.89** | **8,801** (+37.9%) |
+  | PF | 9.51 | 13,777 |
+  | PK | 9.49 | 13,805 (+0.2%) |
+
+  Every reply's hash is the recipe's `9a3c5d245425`.
+- **The prompt cache under `--pp 2`,** replaying the captured OpenCode sessions (24 turns one workflow at a time, 38
+  turns five workflows at once, greedy, 320 tokens a turn) at 49,152 x 16:
+
+  | arm | x1 tok/s | x5 tok/s | prompt tokens cached x1 / x5 |
+  | --- | --- | --- | --- |
+  | PF, no cache | 106.1 | 104.3 | 0% / 0% |
+  | PF + cache | 141.1 | 209.2 | 74% / 82% |
+  | **PK + cache** (`pp2-prefill`) | **144.2** | **209.7** | 74% / 82% |
+  | `tp2-fast` + cache | 140.9 | 213.0 | 74% / 82% |
+  | `tp2-overlap` + cache (x14) | 152.7 | 225.7 | 74% / 82% |
+
+  The tok/s are tokens over wall time. With the cache, `--pp 2` caches as much as `--tp 2` and doubles its x5
+  throughput.
+- **Mixed traffic** (decoders while 8K and 32K cold prompts arrive, no cache, one cell an arm):
+
+  | scenario, arm | long prompts' TTFT s | round gap p50 while one prefills, ms | aggregate tok/s |
+  | --- | --- | --- | --- |
+  | M1 (4 decoders; 8K then 32K), `tp2-fast` | 1.33, 5.38 | 496 | 239.7 |
+  | M1, `tp2-overlap` | 1.05, 4.17 | 381 | 270.4 |
+  | M1, 0076 `pp2-prefill` | 1.13, 4.53 | 420 | 228.2 |
+  | M1, `pp2-prefill` | 1.14, 4.60 | 419 | 229.8 |
+  | M2 (8 decoders; a burst of 8K, 8K, 32K, 32K), `tp2-fast` | 1.33, 2.70, 8.67, 13.63 | 505 | 234.4 |
+  | M2, `tp2-overlap` | 1.06, 2.17, 6.90, 10.81 | 397 | 270.2 |
+  | M3 (1 decoder; a 32K prompt 3 s in), `tp2-fast` | 5.20 | 485 | 109.6 |
+  | M3, `tp2-overlap` | 4.08 | 390 | 128.2 |
+
+  Decoders still keep only 2-8% of their speed while a long prompt prefills, on every profile.
+- **After the fix:** `tp2-overlap`'s numbers above come from the build before rank 1's early-row fix (0091). The fix
+  changes no reads or launches, so its speed is expected to be the same, but it was not remeasured.
+  The fix's GPU check is in [QUALITY](QUALITY.md#exactness-of-patches-0077-0093-2026-11-26).
+
 ## The profiles (2026-11-24, patches to 0076)
 
 - **Host:** a rented host with 2x RTX PRO 6000 Blackwell Workstation Edition (600 W, one NUMA node, topology NODE,
