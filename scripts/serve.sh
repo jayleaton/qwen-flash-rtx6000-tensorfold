@@ -7,7 +7,8 @@
 # takes PORT+1 for its own port. When either the script is stopped or rank 0 exits, both ranks are stopped.
 #   GPUS=0,1        the CUDA devices of rank 0 and rank 1
 #   PROFILE=NAME    config/cuda/profiles/NAME.{args,env} (default tp2-fast): tp2-fast, pp2-prefill, agent, agent-tp2,
-#                   stack-e; NAME.args holds the window, streams and --tp 2 or --pp 2, NAME.env the levers on top
+#                   stack-e, tp2-overlap (opt-in); NAME.args holds the window, streams and --tp 2 or --pp 2,
+#                   NAME.env the levers on top
 #   NAME=flash      the served model name
 #   NUMA_NODE=N     run both ranks under numactl --cpunodebind=N --preferred=N (the node the GPUs sit on)
 #   LOG_DIR=DIR     where rank 1 logs (default ENGINE_DIR); rank 0 logs to the terminal
